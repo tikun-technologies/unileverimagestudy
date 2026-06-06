@@ -7,7 +7,8 @@ import logging
 
 from app.models.user_model import User
 from app.schemas.user_schema import UserRegister, UserUpdate, PasswordChange, UserResponse, OAuthData
-from app.core.security import get_password_hash, verify_password, create_token_pair, refresh_access_token, generate_password_reset_token
+from app.services.user_billing import build_user_response, create_tokens_for_user, refresh_access_token_for_user
+from app.core.security import get_password_hash, verify_password, generate_password_reset_token
 from app.services.email_service import email_service
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,8 @@ class UserService:
             user = self.authenticate_user(email, password)
             if not user:
                 return None
-            tokens = create_token_pair(user.id, user.email)
-            user_response = UserResponse.from_orm(user)
+            tokens = create_tokens_for_user(self.db, user)
+            user_response = build_user_response(self.db, user)
             return {"user": user_response, "tokens": tokens}
         except Exception:
             logger.exception("Token generation failed during authentication for %s", email)
@@ -84,6 +85,9 @@ class UserService:
             # Link any pending project or study invitations
             self._link_pending_invitations(db_user)
 
+            from app.services.billing import BillingService
+            BillingService(self.db).get_or_create_profile(db_user)
+
             logger.info("User created successfully: user_id=%s email=%s", db_user.id, db_user.email)
         except Exception:
             logger.exception("Create user DB error for email=%s", user_data.email)
@@ -97,10 +101,10 @@ class UserService:
         user = self.create_user(user_data)
         
         # Create JWT tokens
-        tokens = create_token_pair(user.id, user.email)
+        tokens = create_tokens_for_user(self.db, user)
         
         # Convert user to response schema
-        user_response = UserResponse.from_orm(user)
+        user_response = build_user_response(self.db, user)
         
         return {
             "user": user_response,
@@ -199,12 +203,8 @@ class UserService:
         ).offset(skip).limit(limit).all()
 
     def refresh_user_tokens(self, refresh_token: str) -> Optional[dict]:
-        """Refresh access token using refresh token"""
-        new_tokens = refresh_access_token(refresh_token)
-        if not new_tokens:
-            return None
-        
-        return new_tokens
+        """Refresh access token using refresh token (re-loads plan from DB)."""
+        return refresh_access_token_for_user(self.db, refresh_token)
     
     def request_password_reset(self, email: str) -> bool:
         """
@@ -377,6 +377,9 @@ class UserService:
             
             # Link any pending project or study invitations
             self._link_pending_invitations(db_user)
+
+            from app.services.billing import BillingService
+            BillingService(self.db).get_or_create_profile(db_user)
             
             logger.info("OAuth user created successfully: user_id=%s email=%s", db_user.id, db_user.email)
             return db_user
@@ -403,8 +406,8 @@ class UserService:
         if existing_user:
             # User exists - login them
             logger.info("OAuth login for existing user: %s", oauth_data.email)
-            tokens = create_token_pair(existing_user.id, existing_user.email)
-            user_response = UserResponse.from_orm(existing_user)
+            tokens = create_tokens_for_user(self.db, existing_user)
+            user_response = build_user_response(self.db, existing_user)
             return {
                 "user": user_response,
                 "tokens": tokens,
@@ -414,8 +417,8 @@ class UserService:
             # User doesn't exist - create new user
             logger.info("OAuth login creating new user: %s", oauth_data.email)
             new_user = self.create_user_from_oauth(oauth_data)
-            tokens = create_token_pair(new_user.id, new_user.email)
-            user_response = UserResponse.from_orm(new_user)
+            tokens = create_tokens_for_user(self.db, new_user)
+            user_response = build_user_response(self.db, new_user)
             return {
                 "user": user_response,
                 "tokens": tokens,

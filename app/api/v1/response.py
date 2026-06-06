@@ -14,9 +14,12 @@ from sqlalchemy import select, text
 
 from app.core.cache import RedisCache, invalidate_study_cache
 from app.core.dependencies import get_current_active_user
+from app.core.plan_dependencies import get_billing_context
 from app.core.domain import is_unilever_domain, FRAGRANCE_QUESTION_ID
 from app.db.session import get_db
 from app.models.user_model import User
+from app.schemas.billing_schema import UserBillingSummary
+from app.services.plan_enforcement import enforce_analysis_export, enforce_live_participant_access_by_study_id
 from app.models.study_model import Study, StudyMember
 from app.schemas.response_schema import (
     StudyResponseOut, StudyResponseDetail, StudyResponseListItem,
@@ -51,6 +54,8 @@ async def start_study(
     Start a new study session for a participant.
     This endpoint is public and doesn't require authentication.
     """
+    enforce_live_participant_access_by_study_id(db, request.study_id)
+
     # Extract client information
     ip_address = http_request.client.host if http_request.client else None
     user_agent = http_request.headers.get("user-agent")
@@ -190,6 +195,9 @@ async def submit_synthetic_respondent(
     else:
         study_id = request.study_id
         payload = request.payload
+    if study_id is None or payload is None:
+        raise HTTPException(status_code=400, detail="study_id and payload are required.")
+    enforce_live_participant_access_by_study_id(db, study_id)
     result = service.submit_synthetic_respondent(study_id, payload)
     
     # Invalidate analytics caches
@@ -1039,7 +1047,7 @@ async def export_response_detailed(
 async def export_study_flattened_csv(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Export a flattened CSV where each row is a respondent-task with columns:
@@ -1065,10 +1073,10 @@ async def export_study_flattened_csv(
 async def export_study_analysis(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
-    Export a comprehensive Excel report with regression analysis, segmentation, and clustering.
+    Export the full study Excel report (basic export; available on all plans).
     """
     # Verify user owns the study
     from app.services import study as study_service
@@ -1231,11 +1239,13 @@ async def export_study_analysis(
 async def export_study_analysis_json(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Export a comprehensive JSON report with regression analysis, segmentation, and clustering.
     """
+    enforce_analysis_export(billing)
     # Verify user owns the study
     from app.services import study as study_service
     from app.models.study_model import Study
@@ -1709,6 +1719,7 @@ async def get_preview_study_info(
     """
     Replica of the respondent info API for previewing a study.
     Always uses respondent_id=1 and works even for draft studies.
+    No live-participant billing gate — preview is for study owners on any plan.
     """
     # Check cache first
     cache_key = f"respondent_study_info:{study_id}:1"
@@ -1737,6 +1748,7 @@ async def get_respondent_study_info(
     This endpoint is public and doesn't require authentication.
     """
     if not skip_cache:
+        enforce_live_participant_access_by_study_id(db, study_id)
         cache_key = f"respondent_study_info:{study_id}:{respondent_id}"
         cached_data = RedisCache.get(cache_key)
         if cached_data:

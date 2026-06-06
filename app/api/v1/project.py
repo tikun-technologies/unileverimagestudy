@@ -16,9 +16,12 @@ from fastapi.responses import StreamingResponse, Response
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_active_user
+from app.core.plan_dependencies import get_billing_context
 from app.core.cache import RedisCache
 from app.db.session import get_db, SessionLocal
 from app.models.user_model import User
+from app.schemas.billing_schema import UserBillingSummary
+from app.services.plan_enforcement import enforce_analysis_export, enforce_share_study
 from app.schemas.project_schema import (
     ProjectCreate, ProjectUpdate, ProjectOut, ProjectListItem,
     ProjectMemberInvite, ProjectMemberOut, ProjectMemberUpdate,
@@ -46,11 +49,13 @@ def invite_project_member_endpoint(
     payload: ProjectMemberInvite,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Invite a user to a project by email.
     User will automatically get access to all studies in the project.
     """
+    enforce_share_study(billing)
     member = project_member_service.invite_member(
         db=db,
         project_id=project_id,
@@ -357,6 +362,7 @@ def flattened_project_csv_endpoint(
     project_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Export an Excel file (.xlsx) with two sheets:
@@ -364,6 +370,7 @@ def flattened_project_csv_endpoint(
     2. Range Sheet: Dependent Variable, Low, High, Average for each classification question and category-image column.
     Studies are ordered by product_id. Any project member (viewer/editor/admin) can download.
     """
+    enforce_analysis_export(billing)
     studies = project_service.get_project_studies_for_export(
         db=db,
         project_id=project_id,
@@ -574,11 +581,13 @@ def export_project_zip_endpoint(
     project_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Start a background job to export project as ZIP containing per-study Excel reports and mega_sheet.xlsx.
     Returns a job_id that can be polled for status and download URL.
     """
+    enforce_analysis_export(billing)
     import uuid as uuid_module
     from app.models.job_model import Job, JobStatus
     from app.tasks.celery_jobs import export_project_zip_celery
@@ -607,6 +616,7 @@ def export_project_zip_sync_endpoint(
     project_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     [Legacy/Debug] Synchronous export - may timeout for large projects.
@@ -615,6 +625,7 @@ def export_project_zip_sync_endpoint(
     mega_sheet.xlsx: Raw Data (sorted by product_id), Product Data, Range Sheet.
     Target: <30s for 100 studies, <60s for 200 studies.
     """
+    enforce_analysis_export(billing)
     studies = project_service.get_project_studies_for_export(
         db=db,
         project_id=project_id,
@@ -974,6 +985,7 @@ def export_completed_panelists_endpoint(
     payload: ExportCompletedPanelistsRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Export completed panelists from all studies in a project as CSV.
@@ -987,6 +999,7 @@ def export_completed_panelists_endpoint(
     Returns:
         StreamingResponse with CSV data
     """
+    enforce_analysis_export(billing)
     from fastapi import HTTPException
     from sqlalchemy import text, and_
     from datetime import datetime
@@ -1096,6 +1109,7 @@ def export_abandoned_responses_endpoint(
     payload: ExportAbandonedResponsesRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Export abandoned responses from all studies in a project as CSV.
@@ -1110,6 +1124,7 @@ def export_abandoned_responses_endpoint(
     Returns:
         StreamingResponse with CSV data
     """
+    enforce_analysis_export(billing)
     from fastapi import HTTPException
     from sqlalchemy import text
     from datetime import datetime

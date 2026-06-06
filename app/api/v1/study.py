@@ -11,8 +11,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.core.dependencies import get_current_active_user
+from app.core.plan_dependencies import get_billing_context
 from app.db.session import get_db
 from app.models.user_model import User
+from app.schemas.billing_schema import UserBillingSummary
+from app.services.plan_enforcement import (
+    enforce_ai_respondent_limit,
+    enforce_live_participant_access,
+    enforce_share_study,
+    enforce_structure_limits,
+)
 from app.models.study_model import Study, StudyMember
 from app.schemas.study_schema import (
     StudyCreate, StudyUpdate, StudyOut, StudyListItem, StudyLaunchOut,
@@ -21,6 +29,7 @@ from app.schemas.study_schema import (
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest
 )
 from app.services import study as study_service
+from app.services.billing import BillingService
 from app.services.response import StudyResponseService
 from app.services.task_generation_adapter import generate_grid_tasks, generate_layer_tasks
 from app.services.study_member_service import study_member_service
@@ -277,7 +286,15 @@ def create_study_endpoint(
     payload: StudyCreate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
+    enforce_structure_limits(
+        billing,
+        study_type=payload.study_type,
+        categories=payload.categories,
+        elements=payload.elements,
+        study_layers=payload.study_layers,
+    )
     # Use settings.BASE_URL as default for share URL generation
     study = study_service.create_study(
         db=db,
@@ -292,7 +309,7 @@ def create_study_endpoint(
         ar = (study.audience_segmentation or {}).get('aspect_ratio')
         out = StudyOut.model_validate(study).model_dump()
         out['aspect_ratio'] = ar
-        return out
+        return _with_live_access_fields(db, study, out)
     except Exception:
         return study
 
@@ -346,6 +363,16 @@ def copy_study_endpoint(
     Send project_id in the body to associate the copy with a project; otherwise the copy is standalone.
     """
     body = payload or CopyStudyRequest()
+    source = study_service.get_study(db=db, study_id=study_id, owner_id=current_user.id)
+    from app.services.billing import BillingService
+    billing = BillingService(db).get_billing_summary(current_user)
+    enforce_structure_limits(
+        billing,
+        study_type=source.study_type,
+        categories=source.categories,
+        elements=source.elements,
+        study_layers=source.layers,
+    )
     new_study = study_service.copy_study(
         db=db,
         study_id=study_id,
@@ -360,7 +387,7 @@ def copy_study_endpoint(
         ar = (study.audience_segmentation or {}).get('aspect_ratio')
         out = StudyOut.model_validate(study).model_dump()
         out['aspect_ratio'] = ar
-        return out
+        return _with_live_access_fields(db, study, out)
     except Exception:
         return study
 
@@ -414,7 +441,8 @@ def list_studies_endpoint(
     # Short 15-second Redis cache to "debounce" heavy dashboard loads
     # while still feeling "live" to the user.
     status_str = status_filter.value if status_filter else "all"
-    cache_key = f"user_studies_list:{current_user.id}:{status_str}:{page}:{per_page}"
+    billing_summary = BillingService(db).get_billing_summary(current_user)
+    cache_key = f"user_studies_list:{current_user.id}:{billing_summary.plan}:{status_str}:{page}:{per_page}"
     cached_data = RedisCache.get(cache_key)
     if cached_data:
         return [StudyListItem.model_validate(d) for d in cached_data]
@@ -466,6 +494,7 @@ def list_studies_endpoint(
         for r in study_members
     }
     enriched: List[StudyListItem] = []
+    billing_service = BillingService(db)
     for row in rows:
         # Extract values from denormalized counters (no JOINs needed!)
         total_calc = int(row.total_responses_calc or 0)
@@ -483,6 +512,7 @@ def list_studies_endpoint(
             current_user.id,
         )
         
+        access = billing_service.study_live_access_status(row)
         enriched.append(StudyListItem(
             id=row.id,
             title=row.title,
@@ -503,6 +533,10 @@ def list_studies_endpoint(
             completion_rate=(completed_calc / total_calc * 100) if total_calc else 0,
             abandonment_rate=(abandoned_calc / total_calc * 100) if total_calc else 0,
             user_role=user_role,
+            live_participants_paid=bool(access["paid"]),
+            live_participants_allowed=bool(access["allowed"]),
+            live_participants_included_by_plan=bool(access["included_by_plan"]),
+            live_participants_unlocked=bool(access["allowed"]),
         ))
 
     # Cache for 15 seconds to debounce dashboard loads (store JSON-serializable dicts)
@@ -523,6 +557,7 @@ def simulate_ai_respondents_endpoint(
     max_panelist_workers: int = Query(10, ge=1, le=50, description="Number of panelists to run in parallel (AI phase); same as standalone main.py max_workers=10"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """
     Simulate AI respondents for a study: generate panelists (gender, age, classification answers),
@@ -552,6 +587,8 @@ def simulate_ai_respondents_endpoint(
             N = 0
     if N <= 0:
         raise HTTPException(status_code=400, detail="Could not determine number of respondents (set audience_segmentation.number_of_respondents or ensure tasks have numeric keys).")
+
+    enforce_ai_respondent_limit(db, current_user.id, billing, N)
 
     from app.services.synthetic_simulation_service import get_max_panelist_combinations
     max_combinations = get_max_panelist_combinations(db, study_id)
@@ -652,6 +689,7 @@ def get_study_endpoint(
     out = StudyOut.model_validate(study).model_dump()
     # Ensure aspect_ratio is present
     out['aspect_ratio'] = ar
+    out = _with_live_access_fields(db, study, out)
 
     # Load tasks through TaskService so normalized rows win and legacy JSON is only fallback.
     from app.services.task_service import TaskService
@@ -767,6 +805,7 @@ def get_study_preview_endpoint(
     out['user_role'] = user_role
     # Ensure aspect_ratio is present
     out['aspect_ratio'] = ar
+    out = _with_live_access_fields(db, study, out)
 
     # Load tasks through TaskService so preview uses the same source as runtime.
     from app.services.task_service import TaskService
@@ -933,6 +972,10 @@ def get_study_public_endpoint(
     Get study information for public access (no authentication required).
     Handles different study statuses with appropriate messaging.
     """
+    study_row = db.scalar(select(Study).where(Study.id == study_id))
+    if study_row:
+        enforce_live_participant_access(db, study_row)
+
     cache_key = f"study_config:public:{study_id}"
     cached_data = RedisCache.get(cache_key)
     if cached_data:
@@ -980,6 +1023,10 @@ def get_study_public_details_endpoint(
     Returns full study information including elements, layers, and classification questions.
     Only returns studies that are active and have a share_token.
     """
+    study_row = db.scalar(select(Study).where(Study.id == study_id))
+    if study_row:
+        enforce_live_participant_access(db, study_row)
+
     cache_key = f"study_config:public_details:{study_id}"
     cached_data = RedisCache.get(cache_key)
     if cached_data:
@@ -995,6 +1042,7 @@ def get_study_public_details_endpoint(
         ar = (study.audience_segmentation or {}).get('aspect_ratio')
         out = StudyOut.model_validate(study).model_dump()
         out['aspect_ratio'] = ar
+        out = _with_live_access_fields(db, study, out)
         from app.services.task_service import TaskService
         task_service = TaskService(db)
         out['tasks'] = task_service.get_all_tasks_as_dict(study_id) or None
@@ -1023,6 +1071,8 @@ def get_study_share_details_endpoint(
         "study_type": info.get("study_type"),
         "status": info.get("status"),
         "share_url": info.get("share_url"),
+        "user_plan": info.get("user_plan"),
+        "live_participants_paid": bool(info.get("live_participants_paid")),
     }
 
 
@@ -1032,6 +1082,7 @@ def update_study_endpoint(
     payload: StudyUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     # Debug logging
     import logging
@@ -1049,6 +1100,17 @@ def update_study_endpoint(
             logger.info(f"Status: {payload.status}")
         if payload.title:
             logger.info(f"Title length: {len(payload.title)}")
+
+        if payload.categories is not None or payload.elements is not None or payload.study_layers is not None:
+            existing = study_service.get_study(db=db, study_id=study_id, owner_id=current_user.id)
+            study_type = payload.study_type or existing.study_type
+            enforce_structure_limits(
+                billing,
+                study_type=study_type,
+                categories=payload.categories if payload.categories is not None else existing.categories,
+                elements=payload.elements if payload.elements is not None else existing.elements,
+                study_layers=payload.study_layers if payload.study_layers is not None else existing.layers,
+            )
         
         result = study_service.update_study(
             db=db, study_id=study_id, owner_id=current_user.id, payload=payload
@@ -1061,7 +1123,9 @@ def update_study_endpoint(
         _invalidate_project_public_studies_cache(getattr(result, "project_id", None))
         
         logger.info(f"Study {study_id} updated successfully")
-        return result
+        out = StudyOut.model_validate(result).model_dump()
+        out["aspect_ratio"] = (result.audience_segmentation or {}).get("aspect_ratio")
+        return _with_live_access_fields(db, result, out)
         
     except HTTPException as e:
         logger.error(f"HTTPException in PUT /studies/{study_id}: {e.detail} (status: {e.status_code})")
@@ -1087,6 +1151,16 @@ def delete_study_endpoint(
     return None
 
 
+def _with_live_access_fields(db: Session, study: Any, out: Dict[str, Any]) -> Dict[str, Any]:
+    access = BillingService(db).study_live_access_status(study)
+    out["live_participants_paid"] = bool(access["paid"])
+    out["live_participants_allowed"] = bool(access["allowed"])
+    out["live_participants_included_by_plan"] = bool(access["included_by_plan"])
+    # Backwards-compatible field for existing frontend code: effective access, not only $10 paid.
+    out["live_participants_unlocked"] = bool(access["allowed"])
+    return out
+
+
 @router.post("/{study_id}/status", response_model=StudyOut)
 def change_status_endpoint(
     study_id: UUID,
@@ -1101,7 +1175,9 @@ def change_status_endpoint(
     invalidate_study_cache(study_id)
     _invalidate_user_studies_list_cache(current_user.id)
     _invalidate_project_public_studies_cache(project_id)
-    return result
+    out = StudyOut.model_validate(result).model_dump()
+    out["aspect_ratio"] = (result.audience_segmentation or {}).get("aspect_ratio")
+    return _with_live_access_fields(db, result, out)
 
 
 @router.post("/{study_id}/regenerate-tasks", response_model=RegenerateTasksResponse)
@@ -1109,7 +1185,16 @@ def regenerate_tasks_endpoint(
     study_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
+    study = study_service.get_study(db=db, study_id=study_id, owner_id=current_user.id)
+    enforce_structure_limits(
+        billing,
+        study_type=study.study_type,
+        categories=study.categories,
+        elements=study.elements,
+        study_layers=study.layers,
+    )
     generator: Dict[str, Any] = {
         "grid": generate_grid_tasks,
         "layer": generate_layer_tasks,
@@ -1138,8 +1223,10 @@ def invite_study_member_endpoint(
     payload: StudyMemberInvite,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
     """Invite a new member to the study by email."""
+    enforce_share_study(billing)
     return study_member_service.invite_member(
         db=db, study_id=study_id, inviter=current_user, payload=payload
     )
@@ -1235,6 +1322,7 @@ def share_url_endpoint(
     current_user: User = Depends(get_current_active_user),
 ):
     study = study_service.get_study(db=db, study_id=study_id, owner_id=current_user.id)
+    enforce_live_participant_access(db, study)
     return {"share_token": study.share_token, "share_url": study.share_url}
 
 
@@ -1243,7 +1331,15 @@ def generate_tasks_from_body_endpoint(
     payload: GenerateTasksRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
+    billing: UserBillingSummary = Depends(get_billing_context),
 ):
+    enforce_structure_limits(
+        billing,
+        study_type=payload.study_type,
+        categories=payload.categories,
+        elements=payload.elements,
+        study_layers=payload.study_layers,
+    )
     # Check if we should use async processing for large studies
     number_of_respondents = payload.audience_segmentation.number_of_respondents if payload.audience_segmentation else 0
     
@@ -1725,7 +1821,9 @@ def update_and_launch_study_endpoint(
     _invalidate_user_studies_list_cache(current_user.id)
     _invalidate_project_public_studies_cache(previous_project_id)
     _invalidate_project_public_studies_cache(getattr(study, "project_id", None))
-    return study
+    out = StudyOut.model_validate(study).model_dump()
+    out["aspect_ratio"] = (study.audience_segmentation or {}).get("aspect_ratio")
+    return _with_live_access_fields(db, study, out)
 
 
 @router.get("/simulate-ai-respondents/status/{job_id}")

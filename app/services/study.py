@@ -12,6 +12,7 @@ from sqlalchemy import select, func, desc, and_, or_
 from fastapi import HTTPException, status
 import logging
 
+from app.models.billing_model import UserBillingProfile
 from app.models.study_model import Study, StudyElement, StudyLayer, LayerImage, StudyClassificationQuestion, StudyCategory, StudyMember
 from app.models.response_model import StudyResponse
 from app.schemas.study_schema import (
@@ -1057,16 +1058,31 @@ def get_study_share_details(db: Session, study_id: UUID) -> Optional[Dict[str, A
             Study.study_type,
             Study.status,
             Study.share_url,
-        ).where(Study.id == study_id)
+            Study.live_participants_paid,
+            UserBillingProfile.plan,
+            UserBillingProfile.subscription_status,
+        )
+        .outerjoin(UserBillingProfile, UserBillingProfile.user_id == Study.creator_id)
+        .where(Study.id == study_id)
     ).first()
     if not row:
         return None
+    raw_plan = getattr(row.plan, "value", row.plan) or "free"
+    raw_status = getattr(row.subscription_status, "value", row.subscription_status) or "none"
+    if raw_plan == "enterprise":
+        user_plan = "enterprise"
+    elif raw_plan == "pro" and raw_status in ("active", "trialing"):
+        user_plan = "pro"
+    else:
+        user_plan = "free"
     return {
         "id": row.id,
         "title": row.title,
         "study_type": row.study_type,
         "status": row.status,
         "share_url": row.share_url,
+        "user_plan": user_plan,
+        "live_participants_paid": bool(row.live_participants_paid),
     }
 
 def list_studies(
@@ -1100,6 +1116,8 @@ def list_studies(
             Study.product_keys,
             Study.product_id,
             Study.audience_segmentation,  # Needed for respondents_target extraction
+            Study.live_participants_paid,
+            Study.live_participants_unlocked,
         )
         .outerjoin(StudyMember, and_(StudyMember.study_id == Study.id, StudyMember.user_id == owner_id))
         .where(

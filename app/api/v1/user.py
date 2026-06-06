@@ -17,8 +17,9 @@ from app.services.user import (
     refresh_user_tokens, UserService, request_password_reset,
     reset_password, get_user_by_reset_token, oauth_login
 )
+from app.services.user_billing import build_user_response, refresh_access_token_for_user
 from app.core.dependencies import get_current_user, get_current_active_user
-from app.core.security import verify_token, refresh_access_token
+from app.core.security import verify_token
 from app.models.user_model import User
 
 router = APIRouter()
@@ -109,10 +110,10 @@ async def refresh_tokens(token_data: TokenRefresh, db: Session = Depends(get_db)
 
 
 @router.post("/validate-token", response_model=ValidateTokenResponse)
-async def validate_token(request: ValidateTokenRequest):
+async def validate_token(request: ValidateTokenRequest, db: Session = Depends(get_db)):
     """
-    Fast token validation (no DB) - validates access token, optionally refreshes if expired.
-    Returns in ~10ms.
+    Fast token validation - validates access token, optionally refreshes if expired.
+    Plan is read from the JWT payload (refreshed from DB when a new access token is issued).
     """
     payload = verify_token(request.access_token, "access")
     if payload:
@@ -120,9 +121,11 @@ async def validate_token(request: ValidateTokenRequest):
             valid=True,
             user_id=payload.get("sub"),
             email=payload.get("email"),
+            plan=payload.get("plan"),
+            subscription_status=payload.get("subscription_status"),
         )
     if request.refresh_token:
-        refreshed = refresh_access_token(request.refresh_token)
+        refreshed = refresh_access_token_for_user(db, request.refresh_token)
         if refreshed:
             sub = verify_token(refreshed["access_token"], "access")
             return ValidateTokenResponse(
@@ -130,6 +133,8 @@ async def validate_token(request: ValidateTokenRequest):
                 access_token=refreshed["access_token"],
                 user_id=sub.get("sub") if sub else None,
                 email=sub.get("email") if sub else None,
+                plan=sub.get("plan") if sub else None,
+                subscription_status=sub.get("subscription_status") if sub else None,
             )
     return ValidateTokenResponse(
         valid=False,
@@ -138,11 +143,14 @@ async def validate_token(request: ValidateTokenRequest):
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(current_user: User = Depends(get_current_active_user)):
+async def get_current_user_profile(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
     """
     Get current user profile information
     """
-    return UserResponse.from_orm(current_user)
+    return build_user_response(db, current_user)
 
 
 @router.put("/me", response_model=UserResponse)

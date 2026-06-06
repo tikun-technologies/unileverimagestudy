@@ -67,6 +67,16 @@ class Study(Base):
     # Optional product ID (e.g. for station/product linking)
     product_id = Column(String(100), nullable=True)
 
+    # Billing: True only after the creator pays the one-time $10 unlock for this study.
+    live_participants_paid = Column(
+        Boolean, nullable=False, server_default=expression.false(), default=False
+    )
+    # Backwards-compatible effective unlock flag. New code should prefer
+    # live_participants_paid plus the creator's current plan.
+    live_participants_unlocked = Column(
+        Boolean, nullable=False, server_default=expression.false(), default=False
+    )
+
     # Relations
     # Use lazy="noload" for heavy relationships to prevent accidental loading
     # Load explicitly with selectinload/joinedload when needed

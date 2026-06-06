@@ -127,4 +127,26 @@ class Settings(BaseSettings):
     MERGE_STUDY_A: str | None = None
     MERGE_STUDY_B: str | None = None
 
+    # Stripe / Billing
+    STRIPE_SECRET_KEY: str | None = None
+    STRIPE_WEBHOOK_SECRET: str | None = None
+    STRIPE_PRO_PRICE_ID: str | None = None
+    STRIPE_ENTERPRISE_PRICE_ID: str | None = None
+    BILLING_CURRENCY: str = "usd"
+    PLATFORM_BASE_FEE_CENTS: int = 1000
+    PRO_MONTHLY_FEE_CENTS: int = 9900
+    PRO_WAIVE_PLATFORM_FEE: bool = False
+
+    # Plan limits — grid/text/hybrid use categories + elements; layer uses layers + images per layer
+    FREE_AI_RESPONDENT_LIMIT: int = 50
+    FREE_MAX_CATEGORIES: int = 4
+    FREE_MAX_ELEMENTS_PER_CATEGORY: int = 4
+    FREE_MAX_LAYERS: int = 4
+    FREE_MAX_IMAGES_PER_LAYER: int = 4
+    PRO_AI_RESPONDENT_LIMIT: int = 999999
+    PRO_MAX_CATEGORIES: int = 8
+    PRO_MAX_ELEMENTS_PER_CATEGORY: int = 8
+    PRO_MAX_LAYERS: int = 8
+    PRO_MAX_IMAGES_PER_LAYER: int = 8
+
 settings = Settings()

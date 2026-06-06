@@ -3,6 +3,8 @@ from typing import Optional
 from datetime import datetime
 import uuid
 
+from app.schemas.billing_schema import PlanLimitsOut, PlanType, SubscriptionStatus
+
 
 class UserLogin(BaseModel):
     """Schema for user login - accepts email only"""
@@ -35,6 +37,10 @@ class UserResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_login: Optional[datetime]
+    plan: PlanType = "free"
+    subscription_status: SubscriptionStatus = "none"
+    billing_limits: Optional[PlanLimitsOut] = None
+    has_active_subscription: bool = False
 
     class Config:
         from_attributes = True
@@ -95,6 +101,8 @@ class ValidateTokenResponse(BaseModel):
     access_token: Optional[str] = None
     user_id: Optional[str] = None
     email: Optional[str] = None
+    plan: Optional[PlanType] = None
+    subscription_status: Optional[SubscriptionStatus] = None
     error: Optional[str] = None
 
 

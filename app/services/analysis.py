@@ -1188,11 +1188,11 @@ class StudyAnalysisService:
             
             if mode == "TOP":
                 ratings = g[self.RATING_COL].to_numpy()
-                Y = np.where(ratings > 4, 100.0, 0.0)
+                Y = np.where(ratings >= 4, 100.0, 0.0)
                 Y = Y + self.rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
             elif mode == "BOTTOM":
                 ratings = g[self.RATING_COL].to_numpy()
-                Y = np.where(ratings < 2, 100.0, 0.0)
+                Y = np.where(ratings <= 2, 100.0, 0.0)
                 Y = Y + self.rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
             else: # RESPONSE
                 # Cap at 7s

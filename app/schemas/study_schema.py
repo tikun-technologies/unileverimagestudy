@@ -28,6 +28,8 @@ class AudienceSegmentation(BaseModel):
     age_distribution: Optional[Dict[str, float]] = None
     # Allow aspect ratio to be sent inside segmentation as well
     aspect_ratio: Optional[str] = None
+    # ai_only = up to plan AI limit; cint / real_panel = live participants ($10 unlock on Free; Cint fees separate)
+    respondent_source: Optional[Literal["ai_only", "cint", "real_panel", "live_panel"]] = None
 
 class StudyElementIn(BaseModel):
     element_id: UUID  # UUID instead of string
@@ -260,6 +262,10 @@ class StudyListItem(BaseModel):
     user_role: Optional[str] = None  # current user's role for this study (admin/editor/viewer)
     product_keys: Optional[List[ProductKey]] = None
     product_id: Optional[str] = None
+    live_participants_paid: bool = False
+    live_participants_allowed: bool = False
+    live_participants_included_by_plan: bool = False
+    live_participants_unlocked: bool = False
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -348,6 +354,10 @@ class StudyOut(BaseModel):
     total_responses: int
     completed_responses: int
     abandoned_responses: int
+    live_participants_paid: bool = False
+    live_participants_allowed: bool = False
+    live_participants_included_by_plan: bool = False
+    live_participants_unlocked: bool = False
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
