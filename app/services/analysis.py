@@ -260,9 +260,18 @@ class StudyAnalysisService:
                                     coef_threshold_R, self.blue_fill, round_vals=False)
 
         # 5h. Intercepts Sheets
-        self._create_intercepts_sheet(wb, "(T) Intercepts", intercepts_T["df"], coef_threshold_T, self.green_fill)
-        self._create_intercepts_sheet(wb, "(B) Intercepts", intercepts_B["df"], coef_threshold_B, self.red_fill)
-        self._create_intercepts_sheet(wb, "(R) Intercepts", intercepts_R["df"], coef_threshold_R, self.blue_fill)
+        self._create_intercepts_sheet(
+            wb, "(T) Intercepts", intercepts_T["df"], coef_threshold_T, self.green_fill,
+            intercept=intercepts_T.get("intercept"), t_intercept=intercepts_T.get("t_intercept"),
+        )
+        self._create_intercepts_sheet(
+            wb, "(B) Intercepts", intercepts_B["df"], coef_threshold_B, self.red_fill,
+            intercept=intercepts_B.get("intercept"), t_intercept=intercepts_B.get("t_intercept"),
+        )
+        self._create_intercepts_sheet(
+            wb, "(R) Intercepts", intercepts_R["df"], coef_threshold_R, self.blue_fill,
+            intercept=intercepts_R.get("intercept"), t_intercept=intercepts_R.get("t_intercept"),
+        )
 
         # Save to BytesIO
         output = io.BytesIO()
@@ -565,9 +574,18 @@ class StudyAnalysisService:
         )
         
         # 5j. Intercepts Sheets
-        result["(T) Intercepts"] = self._build_intercepts_json(intercepts_T["df"], coef_threshold_T)
-        result["(B) Intercepts"] = self._build_intercepts_json(intercepts_B["df"], coef_threshold_B)
-        result["(R) Intercepts"] = self._build_intercepts_json(intercepts_R["df"], coef_threshold_R)
+        result["(T) Intercepts"] = self._build_intercepts_json(
+            intercepts_T["df"], coef_threshold_T,
+            intercept=intercepts_T.get("intercept"), t_intercept=intercepts_T.get("t_intercept"),
+        )
+        result["(B) Intercepts"] = self._build_intercepts_json(
+            intercepts_B["df"], coef_threshold_B,
+            intercept=intercepts_B.get("intercept"), t_intercept=intercepts_B.get("t_intercept"),
+        )
+        result["(R) Intercepts"] = self._build_intercepts_json(
+            intercepts_R["df"], coef_threshold_R,
+            intercept=intercepts_R.get("intercept"), t_intercept=intercepts_R.get("t_intercept"),
+        )
         
         return result
 
@@ -1162,22 +1180,23 @@ class StudyAnalysisService:
         
         return result
 
-    def _build_intercepts_json(self, df, threshold):
+    def _build_intercepts_json(self, df, threshold, intercept=None, t_intercept=None):
         result = {
             "threshold": float(threshold) if threshold is not None else None,
+            "intercept": float(intercept) if intercept is not None else None,
+            "t_intercept": float(t_intercept) if t_intercept is not None else None,
             "data": []
         }
-        
+
         for _, row in df.iterrows():
             row_data = {
                 "element": str(row["element"]),
-                "beta_no_intercept": float(row["beta_no_intercept"]),
                 "beta_with_intercept": float(row["beta_with_intercept"]),
                 "t_with_intercept": float(row["t_with_intercept"]),
                 "t_above_2": float(row["t_with_intercept"]) >= 2.0
             }
             result["data"].append(row_data)
-        
+
         return result
 
     # --- Regression Helpers ---
@@ -1188,27 +1207,32 @@ class StudyAnalysisService:
             
             if mode == "TOP":
                 ratings = g[self.RATING_COL].to_numpy()
-                Y = np.where(ratings > 4, 100.0, 0.0)
+                Y = np.where(ratings >= 4, 100.0, 0.0)
                 Y = Y + self.rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
             elif mode == "BOTTOM":
                 ratings = g[self.RATING_COL].to_numpy()
-                Y = np.where(ratings < 2, 100.0, 0.0)
+                Y = np.where(ratings <= 2, 100.0, 0.0)
                 Y = Y + self.rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
             else: # RESPONSE
                 # Cap at 7s
                 rt = g[self.RESPONSE_TIME_COL].clip(upper=7.0).to_numpy()
                 Y = rt
 
-            # Regress
-            beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
-            
-            # Calc R2
-            Y_hat = X @ beta
+            # Regress with intercept
+            n = X.shape[0]
+            X_design = np.column_stack([np.ones(n), X])
+            beta_full, _, _, _ = np.linalg.lstsq(X_design, Y, rcond=None)
+            intercept = float(beta_full[0])
+            beta = beta_full[1:]
+
+            # R2 (with intercept)
+            Y_hat = X_design @ beta_full
             sse = float(np.sum((Y - Y_hat) ** 2))
-            sst = float(np.sum(Y ** 2))
+            y_mean = float(np.mean(Y))
+            sst = float(np.sum((Y - y_mean) ** 2))
             r2 = np.nan if sst == 0 else 1.0 - sse / sst
-            
-            row = {"Panelist": pid, f"R2_{mode}": r2}
+
+            row = {"Panelist": pid, f"R2_{mode}": r2, f"Intercept_{mode}": intercept}
             for col_name, b in zip(element_cols, beta):
                 row[col_name] = b
             rows.append(row)
@@ -1230,21 +1254,17 @@ class StudyAnalysisService:
             rt_all = df[self.RESPONSE_TIME_COL].clip(upper=7.0).to_numpy()
             Y_all = rt_all
 
-        # No intercept
-        beta_no, _, _, _ = np.linalg.lstsq(X_all, Y_all, rcond=None)
-        
-        # With intercept (for t-values)
         n, p = X_all.shape
         X_design = np.column_stack([np.ones(n), X_all])
         beta_full, _, _, _ = np.linalg.lstsq(X_design, Y_all, rcond=None)
-        
-        # Stats
+
+        # Stats (with intercept)
         Y_hat = X_design @ beta_full
         e = Y_all - Y_hat
         sse = float(np.sum(e ** 2))
         dof = n - X_design.shape[1]
         sigma2 = sse / dof
-        
+
         try:
             if dof <= 0:
                 t_vals = np.zeros_like(beta_full)
@@ -1257,22 +1277,28 @@ class StudyAnalysisService:
                 t_vals = np.nan_to_num(t_vals, nan=0.0, posinf=0.0, neginf=0.0)
         except Exception:
             t_vals = np.zeros_like(beta_full)
-            
+
+        intercept = float(beta_full[0])
+        t_intercept = float(t_vals[0])
         beta_with = beta_full[1:]
         t_elements = t_vals[1:]
-        
+
         pooled_df = pd.DataFrame({
             "element": element_cols,
-            "beta_no_intercept": beta_no,
             "beta_with_intercept": beta_with,
-            "t_with_intercept": t_elements
+            "t_with_intercept": t_elements,
         })
-        
-        # Threshold
+
+        # Threshold from intercept-model coefficients
         mask = t_elements >= 2.0
-        threshold = float(np.min(beta_no[mask])) if np.any(mask) else None
-        
-        return {"df": pooled_df, "threshold": threshold}
+        threshold = float(np.min(beta_with[mask])) if np.any(mask) else None
+
+        return {
+            "df": pooled_df,
+            "threshold": threshold,
+            "intercept": intercept,
+            "t_intercept": t_intercept,
+        }
 
     # --- Grouping Helpers ---
     def _normalize_gender(self, val):
@@ -1820,29 +1846,34 @@ class StudyAnalysisService:
                 f = f'AND({col_let}{first_val}<>"",{col_let}{first_val}>={threshold})'
                 ws.conditional_formatting.add(f"{col_let}{first_val}:{col_let}{last_val}", FormulaRule(formula=[f], fill=fill))
 
-    def _create_intercepts_sheet(self, wb, name, df, threshold, fill):
+    def _create_intercepts_sheet(self, wb, name, df, threshold, fill, intercept=None, t_intercept=None):
         ws = wb.create_sheet(name)
-        
+
         # Headers
         for i, col in enumerate(df.columns, 1):
             ws.cell(row=1, column=i, value=col).font = self.bold_font
-            
+
         # Data
         for r_idx, row in enumerate(df.itertuples(index=False), 2):
             for c_idx, val in enumerate(row, 1):
                 ws.cell(row=r_idx, column=c_idx, value=val)
-                
+
+        data_last_row = ws.max_row
         self._autofit_all_cols(ws)
-        
+
+        footer_row = data_last_row + 2
+        if intercept is not None:
+            ws.cell(row=footer_row, column=1, value="Intercept").font = self.bold_font
+            ws.cell(row=footer_row, column=2, value=intercept)
+            footer_row += 1
+        if t_intercept is not None:
+            ws.cell(row=footer_row, column=1, value="t_intercept").font = self.bold_font
+            ws.cell(row=footer_row, column=2, value=t_intercept)
+            footer_row += 1
         if threshold is not None:
-            last = ws.max_row
-            ws.cell(row=last+2, column=1, value="Threshold").font = self.bold_font
-            ws.cell(row=last+2, column=2, value=threshold)
-            
-            # Conditional formatting on t-value column (assumed index 4)
-            # Actually logic in v2 was on t_with_intercept >= 2.0
-            # Let's just highlight rows where t >= 2?
-            # v2 logic: ws_T_int.conditional_formatting.add(f"D2:D{last_T_raw}", rule_t_T)
-            # D is 4th column.
-            rule = CellIsRule(operator="greaterThanOrEqual", formula=["2.0"], fill=fill)
-            ws.conditional_formatting.add(f"D2:D{ws.max_row}", rule)
+            ws.cell(row=footer_row, column=1, value="Threshold").font = self.bold_font
+            ws.cell(row=footer_row, column=2, value=threshold)
+
+        # Highlight rows where t_with_intercept >= 2 (column C)
+        rule = CellIsRule(operator="greaterThanOrEqual", formula=["2.0"], fill=fill)
+        ws.conditional_formatting.add(f"C2:C{data_last_row}", rule)

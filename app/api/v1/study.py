@@ -8,17 +8,19 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Query, HTTPException, status, Body, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, desc, delete
+from sqlalchemy.exc import IntegrityError
 
 from app.core.dependencies import get_current_active_user
 from app.db.session import get_db
 from app.models.user_model import User
-from app.models.study_model import Study, StudyMember
+from app.models.study_model import Study, StudyMember, StudySavedDesign
 from app.schemas.study_schema import (
     StudyCreate, StudyUpdate, StudyOut, StudyListItem, StudyLaunchOut,
     ChangeStatusPayload, RegenerateTasksResponse, ValidateTasksResponse, StudyStatus,
     GenerateTasksRequest, GenerateTasksResult, StudyPublicMinimal, StudyBasicDetails, StudyBasicDetailsV2, SimulateAIRespondentsRequest,
-    StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest
+    StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
+    StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest
 )
 from app.services import study as study_service
 from app.services.response import StudyResponseService
@@ -1128,6 +1130,150 @@ def validate_tasks_endpoint(
     current_user: User = Depends(get_current_active_user),
 ):
     return study_service.validate_tasks(db=db, study_id=study_id, owner_id=current_user.id)
+
+
+# ---------- Saved Design Configurations ----------
+
+def _normalize_saved_design_name(name: str) -> str:
+    return " ".join((name or "").strip().split()).casefold()
+
+
+def _saved_design_to_out(design: StudySavedDesign) -> Dict[str, Any]:
+    return {
+        "id": design.id,
+        "study_id": design.study_id,
+        "created_by_id": design.created_by_id,
+        "name": design.name,
+        "design_type": design.design_type,
+        "study_type": design.study_type,
+        "metric": design.metric,
+        "segment_label": design.segment_label,
+        "selection_count": design.selection_count,
+        "total_coefficient": design.total_coefficient,
+        "configuration": design.configuration or {},
+        "created_at": design.created_at,
+        "updated_at": design.updated_at,
+    }
+
+
+@router.post("/{study_id}/saved-designs", response_model=StudySavedDesignOut, status_code=status.HTTP_201_CREATED)
+def create_saved_design_endpoint(
+    study_id: UUID,
+    payload: StudySavedDesignCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+
+    normalized_name = _normalize_saved_design_name(payload.name)
+    design_type = payload.design_type or "configurator"
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="Design name is required")
+
+    existing_id = db.scalar(
+        select(StudySavedDesign.id).where(
+            StudySavedDesign.study_id == study_id,
+            StudySavedDesign.design_type == design_type,
+            StudySavedDesign.normalized_name == normalized_name,
+        )
+    )
+    if existing_id:
+        raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
+
+    configuration = payload.configuration.model_dump(exclude_none=True)
+    segment = configuration.get("segment") or {}
+    selected_elements = configuration.get("selected_elements") or []
+    selected_by_category = configuration.get("selected_by_category") or {}
+    selection_count = len(selected_elements) if isinstance(selected_elements, list) else len(selected_by_category)
+
+    design = StudySavedDesign(
+        study_id=study_id,
+        created_by_id=current_user.id,
+        name=payload.name,
+        normalized_name=normalized_name,
+        design_type=design_type,
+        study_type=payload.configuration.study_type,
+        metric=payload.configuration.metric,
+        segment_label=segment.get("label") if isinstance(segment, dict) else None,
+        selection_count=selection_count,
+        total_coefficient=payload.configuration.total_coefficient,
+        configuration=configuration,
+    )
+
+    db.add(design)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
+
+    db.refresh(design)
+    return _saved_design_to_out(design)
+
+
+@router.get("/{study_id}/saved-designs", response_model=List[StudySavedDesignOut])
+def list_saved_designs_endpoint(
+    study_id: UUID,
+    design_type: str = Query("configurator", pattern="^(configurator|input)$"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    designs = db.scalars(
+        select(StudySavedDesign)
+        .where(
+            StudySavedDesign.study_id == study_id,
+            StudySavedDesign.design_type == design_type,
+        )
+        .order_by(desc(StudySavedDesign.created_at))
+    ).all()
+    return [_saved_design_to_out(design) for design in designs]
+
+
+@router.post("/{study_id}/saved-designs/compare", response_model=List[StudySavedDesignOut])
+def compare_saved_designs_endpoint(
+    study_id: UUID,
+    payload: StudySavedDesignCompareRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    unique_ids = list(dict.fromkeys(payload.design_ids))
+    if len(unique_ids) < 2 or len(unique_ids) > 4:
+        raise HTTPException(status_code=400, detail="Select between 2 and 4 designs to compare.")
+
+    designs = db.scalars(
+        select(StudySavedDesign).where(
+            StudySavedDesign.study_id == study_id,
+            StudySavedDesign.design_type == payload.design_type,
+            StudySavedDesign.id.in_(unique_ids),
+        )
+    ).all()
+    by_id = {design.id: design for design in designs}
+    if len(by_id) != len(unique_ids):
+        raise HTTPException(status_code=404, detail="One or more saved designs were not found.")
+
+    return [_saved_design_to_out(by_id[design_id]) for design_id in unique_ids]
+
+
+@router.delete("/{study_id}/saved-designs/{design_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_saved_design_endpoint(
+    study_id: UUID,
+    design_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    result = db.execute(
+        delete(StudySavedDesign).where(
+            StudySavedDesign.study_id == study_id,
+            StudySavedDesign.id == design_id,
+        )
+    )
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Saved design not found.")
+    db.commit()
+    return None
 
 
 # ---------- Sharing Endpoints ----------

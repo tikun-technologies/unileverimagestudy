@@ -61,6 +61,12 @@ class User(Base):
         cascade="all, delete-orphan",
         lazy="noload",
     )
+    saved_designs = relationship(
+        "StudySavedDesign",
+        back_populates="created_by",
+        lazy="noload",
+        passive_deletes=True,
+    )
 
     # Indexes for better query performance
     __table_args__ = (

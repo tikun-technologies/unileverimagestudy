@@ -1,6 +1,6 @@
 # app/models/study.py
 from sqlalchemy import (
-    Column, String, Integer, DateTime, Enum, ForeignKey, Index, UniqueConstraint, Text, Boolean
+    Column, String, Integer, Float, DateTime, Enum, ForeignKey, Index, UniqueConstraint, Text, Boolean
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.sql import func, expression
@@ -81,6 +81,7 @@ class Study(Base):
     study_responses = relationship("StudyResponse", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     members = relationship("StudyMember", back_populates="study", cascade="all, delete-orphan", lazy="selectin")
     filter_history = relationship("StudyFilterHistory", back_populates="study", cascade="all, delete-orphan", lazy="noload")
+    saved_designs = relationship("StudySavedDesign", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     task_assignments = relationship("StudyTaskAssignment", back_populates="study", cascade="all, delete-orphan", lazy="noload")
 
     __table_args__ = (
@@ -300,4 +301,39 @@ class StudyFilterHistory(Base):
     __table_args__ = (
         Index('idx_study_filter_history_study_user', 'study_id', 'user_id'),
         Index('idx_study_filter_history_created', 'study_id', 'created_at'),
+    )
+
+
+class StudySavedDesign(Base):
+    """
+    Shared saved design configurations for the analytics design configurator.
+    Stores a denormalized JSONB snapshot so compare reads stay fast.
+    """
+    __tablename__ = "study_saved_designs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    study_id = Column(UUID(as_uuid=True), ForeignKey('studies.id', ondelete='CASCADE'), nullable=False, index=True)
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+
+    name = Column(String(255), nullable=False)
+    normalized_name = Column(String(255), nullable=False)
+    design_type = Column(String(30), nullable=False, server_default='configurator')
+    study_type = Column(study_type_enum, nullable=False)
+    metric = Column(String(50), nullable=False)
+    segment_label = Column(String(255), nullable=True)
+    selection_count = Column(Integer, nullable=False, server_default=expression.text('0'))
+    total_coefficient = Column(Float, nullable=True)
+    configuration = Column(JSONB, nullable=False, server_default='{}')
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    study = relationship("Study", back_populates="saved_designs", lazy="noload")
+    created_by = relationship("User", back_populates="saved_designs", lazy="noload")
+
+    __table_args__ = (
+        UniqueConstraint('study_id', 'design_type', 'normalized_name', name='uq_study_saved_designs_study_type_name'),
+        Index('idx_study_saved_designs_study_created', 'study_id', 'created_at'),
+        Index('idx_study_saved_designs_study_type_created', 'study_id', 'design_type', 'created_at'),
+        Index('idx_study_saved_designs_study_updated', 'study_id', 'updated_at'),
     )

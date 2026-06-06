@@ -11,6 +11,8 @@ StudyStatus = Literal['draft', 'active', 'paused', 'completed']
 ElementType = Literal['image', 'text']
 LayerType = Literal['image', 'text']
 StudyRole = Literal['admin', 'editor', 'viewer']
+DesignMetric = Literal['Top Down', 'Bottom Up', 'Response Time']
+SavedDesignType = Literal['configurator', 'input']
 
 # ---------- Nested value objects ----------
 
@@ -237,6 +239,71 @@ class StudyMemberUpdate(BaseModel):
 class CopyStudyRequest(BaseModel):
     """Optional payload for copy study; when project_id is set, the copy is associated with that project."""
     project_id: Optional[UUID] = Field(None, description="Optional project ID to put the copy in")
+
+
+# ---------- Saved design configurator schemas ----------
+
+class SavedDesignSegment(BaseModel):
+    id: Optional[str] = None
+    label: Optional[str] = None
+    section_key: Optional[str] = None
+    value_key: Optional[str] = None
+
+
+class SavedDesignInputInsightRow(BaseModel):
+    segment_id: str
+    label: str
+    value: float
+
+
+class SavedDesignConfiguration(BaseModel):
+    metric: DesignMetric
+    study_type: StudyType
+    segment: Optional[SavedDesignSegment] = None
+    selected_by_category: Dict[str, str] = Field(default_factory=dict)
+    selected_elements: List[Dict[str, Any]] = Field(default_factory=list)
+    input_insights: Optional[Dict[DesignMetric, List[SavedDesignInputInsightRow]]] = None
+    show_layer_background: bool = False
+    background_url: Optional[str] = None
+    aspect_ratio: Optional[str] = None
+    total_coefficient: Optional[float] = None
+
+
+class StudySavedDesignCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    design_type: SavedDesignType = 'configurator'
+    configuration: SavedDesignConfiguration
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        name = " ".join(value.strip().split())
+        if not name:
+            raise ValueError("Design name is required")
+        return name
+
+
+class StudySavedDesignCompareRequest(BaseModel):
+    design_ids: List[UUID] = Field(..., min_length=2, max_length=4)
+    design_type: SavedDesignType = 'configurator'
+
+
+class StudySavedDesignOut(BaseModel):
+    id: UUID
+    study_id: UUID
+    created_by_id: Optional[UUID] = None
+    name: str
+    design_type: SavedDesignType = 'configurator'
+    study_type: StudyType
+    metric: DesignMetric
+    segment_label: Optional[str] = None
+    selection_count: int
+    total_coefficient: Optional[float] = None
+    configuration: Dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 # ---------- Read models ----------
 
