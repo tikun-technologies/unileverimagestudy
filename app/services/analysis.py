@@ -279,7 +279,12 @@ class StudyAnalysisService:
         output.seek(0)
         return output
 
-    def generate_json_report(self, df: pd.DataFrame, study_data: Dict[str, Any]) -> Dict[str, Any]:
+    def generate_json_report(
+        self,
+        df: pd.DataFrame,
+        study_data: Dict[str, Any],
+        include_raw_data: bool = True,
+    ) -> Dict[str, Any]:
         """
         Generates the JSON report from the DataFrame and Study Data.
         Returns a dictionary with sheet names as keys and their data as values.
@@ -457,34 +462,40 @@ class StudyAnalysisService:
         
         result["Information Block"] = info_block
         
-        # 5c. RawData - Convert DataFrame to JSON-serializable format
-        raw_data_list = []
-        for _, row in df.iterrows():
-            raw_row = {}
-            for col in df.columns:
-                val = row[col]
-                # Handle case where duplicate columns return a Series
-                if isinstance(val, pd.Series):
-                    val = val.iloc[0] if not val.empty else None
-                
-                # Check for NA values safely
-                try:
-                    is_na = pd.isna(val) if not isinstance(val, (list, dict)) else False
-                except (ValueError, TypeError):
-                    is_na = False
-                
-                if is_na:
-                    raw_row[col] = None
-                elif isinstance(val, (np.integer, np.int64)):
-                    raw_row[col] = int(val)
-                elif isinstance(val, (np.floating, np.float64)):
-                    raw_row[col] = float(val)
-                elif isinstance(val, pd.Timestamp):
-                    raw_row[col] = val.isoformat()
-                else:
-                    raw_row[col] = val
-            raw_data_list.append(raw_row)
-        result["RawData"] = raw_data_list
+        # 5c. Lightweight dashboard stats used by the analytics page overview.
+        # This replaces the need to ship full RawData in the optimized endpoint.
+        result["dashboard_summary"] = self._build_dashboard_summary(df, categories)
+
+        if include_raw_data:
+            # RawData is useful for full exports/debugging, but it is very large for
+            # high-response studies. The optimized endpoint skips this block.
+            raw_data_list = []
+            for _, row in df.iterrows():
+                raw_row = {}
+                for col in df.columns:
+                    val = row[col]
+                    # Handle case where duplicate columns return a Series
+                    if isinstance(val, pd.Series):
+                        val = val.iloc[0] if not val.empty else None
+                    
+                    # Check for NA values safely
+                    try:
+                        is_na = pd.isna(val) if not isinstance(val, (list, dict)) else False
+                    except (ValueError, TypeError):
+                        is_na = False
+                    
+                    if is_na:
+                        raw_row[col] = None
+                    elif isinstance(val, (np.integer, np.int64)):
+                        raw_row[col] = int(val)
+                    elif isinstance(val, (np.floating, np.float64)):
+                        raw_row[col] = float(val)
+                    elif isinstance(val, pd.Timestamp):
+                        raw_row[col] = val.isoformat()
+                    else:
+                        raw_row[col] = val
+                raw_data_list.append(raw_row)
+            result["RawData"] = raw_data_list
         
         # 5d. Overall Sheets
         result["(T) Overall"] = self._build_overall_json(
@@ -590,6 +601,179 @@ class StudyAnalysisService:
         return result
 
     # --- JSON Builder Helpers ---
+    def _build_dashboard_summary(self, df: pd.DataFrame, categories: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if df is None or df.empty:
+            return {
+                "totalResponses": 0,
+                "uniquePanelists": 0,
+                "totalRespondents": 0,
+                "avgResponseTime": 0,
+                "avgRating": 0,
+                "taskCount": 1,
+                "categoryCount": len(categories or []),
+                "ratingDistribution": [],
+                "ageDistribution": [],
+                "genderDistribution": [],
+                "responseTimeDistribution": [],
+                "responseTimeByTask": [],
+            }
+
+        task_series = df[self.TASK_COL] if self.TASK_COL in df.columns else pd.Series(dtype=object)
+        all_tasks = task_series.dropna().unique().tolist()
+        task_count = len(all_tasks) or 1
+
+        panelist_tasks = {}
+        if self.PANEL_COL in df.columns:
+            task_source = task_series if self.TASK_COL in df.columns else pd.Series([None] * len(df), index=df.index)
+            for panelist, task in zip(df[self.PANEL_COL], task_source):
+                if pd.isna(panelist):
+                    continue
+                panelist_key = str(panelist)
+                panelist_tasks.setdefault(panelist_key, set())
+                if not pd.isna(task):
+                    panelist_tasks[panelist_key].add(task)
+
+        total_respondents = sum(1 for tasks in panelist_tasks.values() if len(tasks) == task_count)
+
+        response_times = self._numeric_values(df, self.RESPONSE_TIME_COL)
+        ratings = self._numeric_values(df, self.RATING_COL)
+
+        return {
+            "totalResponses": int(len(df)),
+            "uniquePanelists": int(len(panelist_tasks)),
+            "totalRespondents": int(total_respondents),
+            "avgResponseTime": sum(response_times) / len(response_times) if response_times else 0,
+            "avgRating": sum(ratings) / len(ratings) if ratings else 0,
+            "taskCount": int(task_count),
+            "categoryCount": int(len(categories or [])),
+            "ratingDistribution": self._build_rating_distribution(ratings),
+            "ageDistribution": self._build_age_distribution(df),
+            "genderDistribution": self._build_segment_participation(df, self.GENDER_COL),
+            "responseTimeDistribution": self._build_response_time_distribution(response_times),
+            "responseTimeByTask": self._build_response_time_by_task(df),
+        }
+
+    def _numeric_values(self, df: pd.DataFrame, column: str) -> List[float]:
+        if column not in df.columns:
+            return []
+        values = []
+        for value in df[column].tolist():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not np.isnan(number):
+                values.append(number)
+        return values
+
+    def _build_response_time_distribution(self, response_times: List[float]) -> List[Dict[str, Any]]:
+        buckets = [
+            {"name": "Fast (<0.5s)", "max": 0.5, "fill": "#22C55E"},
+            {"name": "Medium (0.5-1s)", "max": 1, "fill": "#FCCD5B"},
+            {"name": "Slow (1-2s)", "max": 2, "fill": "#F7945A"},
+            {"name": "Very Slow (>2s)", "max": float("inf"), "fill": "#C04E35"},
+        ]
+        counts = [0, 0, 0, 0]
+        for time_value in response_times:
+            for idx, bucket in enumerate(buckets):
+                if float(time_value) < bucket["max"]:
+                    counts[idx] += 1
+                    break
+        return [
+            {"name": bucket["name"], "value": int(counts[idx]), "fill": bucket["fill"]}
+            for idx, bucket in enumerate(buckets)
+            if counts[idx] > 0
+        ]
+
+    def _build_response_time_by_task(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        if self.TASK_COL not in df.columns or self.RESPONSE_TIME_COL not in df.columns:
+            return []
+        by_task = {}
+        for task, response_time in zip(df[self.TASK_COL], df[self.RESPONSE_TIME_COL]):
+            if pd.isna(task):
+                continue
+            try:
+                task_key = int(task)
+                time_value = float(response_time)
+            except (TypeError, ValueError):
+                continue
+            if np.isnan(time_value):
+                continue
+            by_task.setdefault(task_key, []).append(time_value)
+        return [
+            {"task": task, "avg": sum(times) / len(times), "count": len(times)}
+            for task, times in sorted(by_task.items())
+        ]
+
+    def _build_rating_distribution(self, ratings: List[float]) -> List[Dict[str, Any]]:
+        counts = {}
+        for rating in ratings:
+            counts[rating] = counts.get(rating, 0) + 1
+        return [
+            {"name": f"Rating {self._format_distribution_key(key)}", "value": int(value)}
+            for key, value in sorted(counts.items())
+        ]
+
+    def _build_age_distribution(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
+        if self.AGE_COL not in df.columns or self.PANEL_COL not in df.columns:
+            return []
+        order = ["13-18", "18-24", "25-34", "35-44", "45-54", "55-64", "65+", "Under 13", "Unknown"]
+        by_range = {label: set() for label in order}
+        for age, panelist in zip(df[self.AGE_COL], df[self.PANEL_COL]):
+            if pd.isna(panelist):
+                continue
+            label = self._age_range_label(age)
+            by_range.setdefault(label, set()).add(str(panelist))
+        return [
+            {"name": label, "value": len(by_range[label])}
+            for label in order
+            if len(by_range.get(label, set())) > 0
+        ]
+
+    def _build_segment_participation(self, df: pd.DataFrame, field: str) -> List[Dict[str, Any]]:
+        if field not in df.columns or self.PANEL_COL not in df.columns:
+            return []
+        by_segment = {}
+        for segment_value, panelist in zip(df[field], df[self.PANEL_COL]):
+            if pd.isna(segment_value) or pd.isna(panelist):
+                continue
+            segment = str(segment_value)
+            by_segment.setdefault(segment, set()).add(str(panelist))
+        return [{"name": name, "value": len(panelists)} for name, panelists in by_segment.items()]
+
+    def _age_range_label(self, age_raw: Any) -> str:
+        if pd.isna(age_raw):
+            return "Unknown"
+        age_str = str(age_raw).strip()
+        if age_str in {"13-18", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"}:
+            return age_str
+        try:
+            age = float(age_raw)
+        except (TypeError, ValueError):
+            return "Unknown"
+        if age >= 65:
+            return "65+"
+        if age >= 55:
+            return "55-64"
+        if age >= 45:
+            return "45-54"
+        if age >= 35:
+            return "35-44"
+        if age >= 25:
+            return "25-34"
+        if age >= 18:
+            return "18-24"
+        if age >= 13:
+            return "13-18"
+        return "Under 13"
+
+    def _format_distribution_key(self, value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return str(int(number)) if number.is_integer() else str(number)
+
     def _build_overall_json(self, element_cols, sorted_cats, col_to_cat, col_to_elt, means, base, threshold, round_vals):
         result = {
             "base_size": int(base),

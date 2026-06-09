@@ -1231,7 +1231,8 @@ async def export_study_analysis(
 async def export_study_analysis_json(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    include_raw_data: bool = True,
 ):
     """
     Export a comprehensive JSON report with regression analysis, segmentation, and clustering.
@@ -1358,7 +1359,11 @@ async def export_study_analysis_json(
     # 3. Generate JSON Report
     analysis_service = StudyAnalysisService()
     try:
-        json_report = analysis_service.generate_json_report(df, study_data)
+        json_report = analysis_service.generate_json_report(
+            df,
+            study_data,
+            include_raw_data=include_raw_data,
+        )
     except Exception as e:
         print(f"JSON Analysis generation failed: {e}")
         import traceback
@@ -1404,6 +1409,24 @@ async def export_study_analysis_json(
         return obj
 
     return sanitize_for_json(json_report)
+
+
+@router.get("/study/{study_id}/optimized-analysis-json")
+async def export_study_optimized_analysis_json(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Export analytics JSON for the frontend without the heavy RawData payload.
+    Raw-derived overview widgets read the compact dashboard_summary instead.
+    """
+    return await export_study_analysis_json(
+        study_id=study_id,
+        current_user=current_user,
+        db=db,
+        include_raw_data=False,
+    )
 
 
 @router.get("/study/{study_id}/filters")
