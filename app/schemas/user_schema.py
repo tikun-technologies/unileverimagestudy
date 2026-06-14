@@ -32,12 +32,26 @@ class UserResponse(BaseModel):
     date_of_birth: Optional[datetime]
     is_active: bool
     is_verified: bool
+    dashboard_onboarding_completed: bool = False
+    dashboard_onboarding_skipped: bool = False
+    create_study_onboarding_completed: bool = False
+    create_study_onboarding_skipped: bool = False
     created_at: datetime
     updated_at: datetime
     last_login: Optional[datetime]
 
     class Config:
         from_attributes = True
+
+
+class OnboardingStatusResponse(BaseModel):
+    """Computed onboarding flags for clients."""
+    onboarding_completed: bool = False
+    onboarding_skipped: bool = False
+    create_study_onboarding_completed: bool = False
+    create_study_onboarding_skipped: bool = False
+    show_dashboard_onboarding: bool = True
+    show_create_study_onboarding: bool = True
 
 
 class UserUpdate(BaseModel):
@@ -90,12 +104,18 @@ class ValidateTokenRequest(BaseModel):
 
 
 class ValidateTokenResponse(BaseModel):
-    """Schema for token validation response - fast, no DB for sub-10ms"""
+    """Schema for token validation response."""
     valid: bool
     access_token: Optional[str] = None
     user_id: Optional[str] = None
     email: Optional[str] = None
     error: Optional[str] = None
+    onboarding_completed: Optional[bool] = None
+    onboarding_skipped: Optional[bool] = None
+    create_study_onboarding_completed: Optional[bool] = None
+    create_study_onboarding_skipped: Optional[bool] = None
+    show_dashboard_onboarding: Optional[bool] = None
+    show_create_study_onboarding: Optional[bool] = None
 
 
 class UserLoginResponse(BaseModel):

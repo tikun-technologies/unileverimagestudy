@@ -8,7 +8,7 @@ from app.db.session import get_db
 from app.schemas.user_schema import (
     UserLogin, UserRegister, UserResponse, UserUpdate, 
     PasswordChange, Token, TokenRefresh, TokenRefreshResponse,
-    ValidateTokenRequest, ValidateTokenResponse,
+    ValidateTokenRequest, ValidateTokenResponse, OnboardingStatusResponse,
     UserLoginResponse, ForgotPasswordRequest, ResetPasswordRequest, PasswordResetResponse,
     OAuthData, OAuthLoginResponse
 )
@@ -19,6 +19,15 @@ from app.services.user import (
 )
 from app.core.dependencies import get_current_user, get_current_active_user
 from app.core.security import verify_token, refresh_access_token
+from app.services.onboarding import (
+    build_onboarding_status,
+    get_onboarding_status_for_user_id,
+    mark_dashboard_onboarding_complete,
+    mark_dashboard_onboarding_skipped,
+    mark_create_study_onboarding_complete,
+    mark_create_study_onboarding_skipped,
+    reset_user_onboarding,
+)
 from app.models.user_model import User
 
 router = APIRouter()
@@ -108,16 +117,37 @@ async def refresh_tokens(token_data: TokenRefresh, db: Session = Depends(get_db)
     return TokenRefreshResponse(**result)
 
 
+def _validate_token_response(
+    db: Session,
+    *,
+    user_id: str | None,
+    email: str | None,
+    access_token: str | None = None,
+) -> ValidateTokenResponse:
+    onboarding = get_onboarding_status_for_user_id(db, user_id) if user_id else OnboardingStatusResponse()
+    return ValidateTokenResponse(
+        valid=True,
+        access_token=access_token,
+        user_id=user_id,
+        email=email,
+        onboarding_completed=onboarding.onboarding_completed,
+        onboarding_skipped=onboarding.onboarding_skipped,
+        create_study_onboarding_completed=onboarding.create_study_onboarding_completed,
+        create_study_onboarding_skipped=onboarding.create_study_onboarding_skipped,
+        show_dashboard_onboarding=onboarding.show_dashboard_onboarding,
+        show_create_study_onboarding=onboarding.show_create_study_onboarding,
+    )
+
+
 @router.post("/validate-token", response_model=ValidateTokenResponse)
-async def validate_token(request: ValidateTokenRequest):
+async def validate_token(request: ValidateTokenRequest, db: Session = Depends(get_db)):
     """
-    Fast token validation (no DB) - validates access token, optionally refreshes if expired.
-    Returns in ~10ms.
+    Validate access token and return onboarding status for the authenticated user.
     """
     payload = verify_token(request.access_token, "access")
     if payload:
-        return ValidateTokenResponse(
-            valid=True,
+        return _validate_token_response(
+            db,
             user_id=payload.get("sub"),
             email=payload.get("email"),
         )
@@ -125,11 +155,11 @@ async def validate_token(request: ValidateTokenRequest):
         refreshed = refresh_access_token(request.refresh_token)
         if refreshed:
             sub = verify_token(refreshed["access_token"], "access")
-            return ValidateTokenResponse(
-                valid=True,
-                access_token=refreshed["access_token"],
+            return _validate_token_response(
+                db,
                 user_id=sub.get("sub") if sub else None,
                 email=sub.get("email") if sub else None,
+                access_token=refreshed["access_token"],
             )
     return ValidateTokenResponse(
         valid=False,
@@ -399,3 +429,47 @@ async def validate_reset_token(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to validate reset token"
         )
+
+@router.post("/onboarding/dashboard/complete", response_model=OnboardingStatusResponse)
+async def complete_dashboard_onboarding(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    mark_dashboard_onboarding_complete(db, current_user)
+    return build_onboarding_status(current_user)
+
+
+@router.post("/onboarding/dashboard/skip", response_model=OnboardingStatusResponse)
+async def skip_dashboard_onboarding(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    mark_dashboard_onboarding_skipped(db, current_user)
+    return build_onboarding_status(current_user)
+
+
+@router.post("/onboarding/create-study/complete", response_model=OnboardingStatusResponse)
+async def complete_create_study_onboarding(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    mark_create_study_onboarding_complete(db, current_user)
+    return build_onboarding_status(current_user)
+
+
+@router.post("/onboarding/create-study/skip", response_model=OnboardingStatusResponse)
+async def skip_create_study_onboarding(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    mark_create_study_onboarding_skipped(db, current_user)
+    return build_onboarding_status(current_user)
+
+
+@router.post("/onboarding/reset", response_model=OnboardingStatusResponse)
+async def reset_onboarding(
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    user = reset_user_onboarding(db, current_user)
+    return build_onboarding_status(user)

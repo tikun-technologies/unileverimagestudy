@@ -28,6 +28,10 @@ class User(Base):
     # Status fields
     is_active = Column(Boolean, default=True, nullable=False)
     is_verified = Column(Boolean, default=False, nullable=False)
+    dashboard_onboarding_completed = Column(Boolean, default=False, nullable=False)
+    dashboard_onboarding_skipped = Column(Boolean, default=False, nullable=False)
+    create_study_onboarding_completed = Column(Boolean, default=False, nullable=False)
+    create_study_onboarding_skipped = Column(Boolean, default=False, nullable=False)
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
