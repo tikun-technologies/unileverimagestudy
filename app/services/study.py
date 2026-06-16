@@ -92,6 +92,12 @@ def _build_share_url(base_url: Optional[str], study_id: str) -> str:
     return f"{url.rstrip('/')}/participate/{study_id}"
 
 
+def _classification_question_config(question: Any) -> Dict[str, Any]:
+    config = dict(getattr(question, "config", None) or {})
+    config["optional_classification_question"] = bool(getattr(question, "optional_classification_question", False))
+    return config
+
+
 def _maybe_upload_data_url_to_cloudinary(url_or_data: Optional[str]) -> tuple[str, Optional[str]]:
     """If value is a data URL, upload to Cloudinary and return (secure_url, public_id).
     Otherwise return (original_value, None).
@@ -473,7 +479,7 @@ def create_study(
                     is_required='Y' if question.is_required else 'N',
                     order=question.order + order_offset,
                     answer_options=answer_options_json,
-                    config=question.config
+                    config=_classification_question_config(question)
                 ))
         if new_questions:
             db.bulk_save_objects(new_questions)
@@ -791,6 +797,7 @@ def build_study_data_for_analysis(study: Study) -> Dict[str, Any]:
             "question_id": q.question_id,
             "question_text": q.question_text,
             "answer_options": q.answer_options,
+            "optional_classification_question": q.optional_classification_question,
         })
     return study_data
 
@@ -1436,7 +1443,7 @@ def update_study(
                 is_required='Y' if question.is_required else 'N',
                 order=question.order + order_offset,
                 answer_options=answer_options_json,
-                config=question.config
+                config=_classification_question_config(question)
             ))
 
     db.commit()
@@ -2150,6 +2157,7 @@ def get_study_basic_details_public(db: Session, study_id: UUID) -> Optional[Dict
             "is_required": row.is_required,
             "order": row.order,
             "answer_options": row.answer_options,
+            "optional_classification_question": bool((row.config or {}).get("optional_classification_question", False)),
             "config": row.config
         })
     # For draft studies, do not expose the system fragrance question (Q0) in preview/editing

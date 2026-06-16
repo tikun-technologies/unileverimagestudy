@@ -112,6 +112,32 @@ class StudyResponseService:
         stmt = select(StudyResponse).where(StudyResponse.session_id == session_id)
         return self.db.execute(stmt).scalar_one_or_none()
 
+    def _optional_classification_question_ids(self, study_id: UUID) -> List[str]:
+        """Return post-task classification question ids for a study."""
+        questions = self.db.execute(
+            select(StudyClassificationQuestion.question_id, StudyClassificationQuestion.config)
+            .where(StudyClassificationQuestion.study_id == study_id)
+        ).all()
+        ids: List[str] = []
+        for question_id, config in questions:
+            if isinstance(config, dict) and bool(config.get("optional_classification_question", False)):
+                ids.append(str(question_id))
+        return ids
+
+    def _has_unanswered_optional_classification(self, response: StudyResponse) -> bool:
+        """Check whether a task-complete response still needs post-task answers."""
+        optional_question_ids = set(self._optional_classification_question_ids(response.study_id))
+        if not optional_question_ids:
+            return False
+
+        answered_question_ids = set(
+            self.db.execute(
+                select(ClassificationAnswer.question_id)
+                .where(ClassificationAnswer.study_response_id == response.id)
+            ).scalars().all()
+        )
+        return not optional_question_ids.issubset(answered_question_ids)
+
     def _get_response_by_session_for_update(self, session_id: str) -> Optional[StudyResponse]:
         """Get a study response by session ID with row-level lock for safe progress updates."""
         stmt = (
@@ -704,10 +730,12 @@ class StudyResponseService:
             if interactions:
                 self.db.bulk_save_objects(interactions)
         
-        # Mark complete if done
-        is_complete = response.current_task_index >= (response.total_tasks_assigned or 0)
-        if is_complete:
+        # Mark complete if all tasks are done and no post-task classification remains.
+        tasks_complete = response.current_task_index >= (response.total_tasks_assigned or 0)
+        response_completed = False
+        if tasks_complete and not self._has_unanswered_optional_classification(response):
             self._mark_response_completed(response)
+            response_completed = True
             # Check if study should be auto-completed after this response completion
             self._check_and_complete_studies(study_id=response.study_id)
         
@@ -716,8 +744,8 @@ class StudyResponseService:
         
         return SubmitTaskResponse(
             success=True,
-            next_task_index=response.current_task_index if not is_complete else None,
-            is_study_complete=is_complete,
+            next_task_index=response.current_task_index if not tasks_complete else None,
+            is_study_complete=response_completed,
             completion_percentage=response.completion_percentage
         )
     
@@ -753,6 +781,17 @@ class StudyResponseService:
                 self.db.add(answer)
         
         response.last_activity = datetime.utcnow()
+        tasks_complete = (response.completed_tasks_count or 0) >= (response.total_tasks_assigned or 0)
+        if (
+            request.finalize_response
+            and tasks_complete
+            and not response.is_completed
+            and not self._has_unanswered_optional_classification(response)
+        ):
+            self._mark_response_completed(response)
+            self.db.flush()
+            self._check_and_complete_studies(study_id=response.study_id)
+
         self.db.commit()
         
         return True
@@ -860,7 +899,7 @@ class StudyResponseService:
         tasks_to_insert: List[CompletedTask] = []
         interactions_to_insert: List[ElementInteraction] = []
         submitted = 0
-        study_just_completed = False
+        response_just_completed = False
         existing_task_keys = set(
             self.db.execute(
                 select(CompletedTask.task_id, CompletedTask.task_type).where(
@@ -1067,10 +1106,11 @@ class StudyResponseService:
             response.current_task_index = (response.current_task_index or 0) + 1
             submitted += 1
 
-            # Stop early if completed (defer study completion check until after we commit this response)
+            # Stop early if tasks are completed. Post-task classification can still keep the response open.
             if response.current_task_index >= (response.total_tasks_assigned or 0):
-                self._mark_response_completed(response)
-                study_just_completed = True
+                if not self._has_unanswered_optional_classification(response):
+                    self._mark_response_completed(response)
+                    response_just_completed = True
                 break
 
         # Bulk insert
@@ -1087,7 +1127,7 @@ class StudyResponseService:
 
         self.db.commit()
 
-        if study_just_completed:
+        if response_just_completed:
             self._check_and_complete_studies(study_id=response.study_id)
 
         is_complete = bool(response.is_completed)

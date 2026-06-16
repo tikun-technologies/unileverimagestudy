@@ -61,6 +61,7 @@ def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] =
             "question_text": (q.question_text or "")[:500],
             "order": q.order,
             "answer_options": answer_options,
+            "optional_classification_question": q.optional_classification_question,
         })
     
     # Categories and elements: grid/text use StudyCategory and StudyElement; layer uses StudyLayer and LayerImage

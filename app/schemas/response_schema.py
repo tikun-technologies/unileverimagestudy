@@ -328,6 +328,7 @@ class BulkSubmitTasksResponse(BaseModel):
 class SubmitClassificationRequest(BaseModel):
     """Request to submit classification answers"""
     answers: List[ClassificationAnswerCreate]
+    finalize_response: bool = False
 
 class SubmitClassificationResponse(BaseModel):
     """Response after submitting classification"""

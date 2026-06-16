@@ -211,6 +211,17 @@ class StudyClassificationQuestion(Base):
     # Additional configuration
     config = Column(JSONB, nullable=True)  # Additional question-specific config
 
+    @property
+    def optional_classification_question(self) -> bool:
+        config = self.config or {}
+        return bool(config.get("optional_classification_question", False))
+
+    @optional_classification_question.setter
+    def optional_classification_question(self, value: bool) -> None:
+        config = dict(self.config or {})
+        config["optional_classification_question"] = bool(value)
+        self.config = config
+
     study = relationship("Study", back_populates="classification_questions", lazy="selectin")
 
     __table_args__ = (

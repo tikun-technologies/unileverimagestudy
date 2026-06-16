@@ -1203,7 +1203,8 @@ async def export_study_analysis(
         study_data["classification_questions"].append({
             "question_id": q.question_id,
             "question_text": q.question_text,
-            "answer_options": q.answer_options
+            "answer_options": q.answer_options,
+            "optional_classification_question": q.optional_classification_question,
         })
         
     # 3. Generate Report
@@ -1353,7 +1354,8 @@ async def export_study_analysis_json(
         study_data["classification_questions"].append({
             "question_id": q.question_id,
             "question_text": q.question_text,
-            "answer_options": q.answer_options
+            "answer_options": q.answer_options,
+            "optional_classification_question": q.optional_classification_question,
         })
         
     # 3. Generate JSON Report
@@ -1574,6 +1576,7 @@ async def filter_study_regression_report(
             "question_id": q.question_id,
             "question_text": q.question_text,
             "answer_options": q.answer_options,
+            "optional_classification_question": q.optional_classification_question,
         })
 
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
@@ -1888,7 +1891,8 @@ async def get_respondent_study_info(
                 "question_type": q.question_type,
                 "answer_options": q.answer_options,
                 "order": q.order,
-                "is_required": q.is_required
+                "is_required": q.is_required,
+                "optional_classification_question": q.optional_classification_question,
             }
             for q in classification_questions
         ],

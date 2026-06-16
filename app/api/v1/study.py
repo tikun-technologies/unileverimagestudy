@@ -679,6 +679,7 @@ def get_study_endpoint(
                     'is_required': True if (str(q.is_required).upper() == 'Y' or bool(q.is_required)) else False,
                     'order': q.order,
                     'answer_options': q.answer_options,
+                    'optional_classification_question': q.optional_classification_question,
                     'config': q.config,
                 })
         except Exception:
@@ -796,6 +797,7 @@ def get_study_preview_endpoint(
                     'is_required': True if (str(q.is_required).upper() == 'Y' or bool(q.is_required)) else False,
                     'order': q.order,
                     'answer_options': q.answer_options,
+                    'optional_classification_question': q.optional_classification_question,
                     'config': q.config,
                 })
         except Exception:
