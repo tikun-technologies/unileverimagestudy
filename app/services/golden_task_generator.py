@@ -6,7 +6,9 @@ Uses 2× respondent count (cap 1500) like task_generation_core.generate_*_tasks_
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import math
+from itertools import combinations
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -91,6 +93,7 @@ def _build_design_config_layer(
     n_gen: int,
     layers_data: List[Dict],
     tasks_per_respondent: int,
+    incompatible_pairs: Optional[List[Tuple[int, int]]] = None,
 ) -> DesignConfig:
     counts = [len(L["images"]) for L in layers_data]
     c = len(counts)
@@ -105,6 +108,240 @@ def _build_design_config_layer(
         elements_per_category=counts,
         min_actives_per_row=min_a,
         max_actives_per_row=max_a,
+        incompatible_pairs=incompatible_pairs or [],
+    )
+
+
+def _constraint_ref_key(ref: Any) -> Optional[Tuple[str, str]]:
+    if not isinstance(ref, dict):
+        return None
+    layer_id = str(ref.get("layer_id") or ref.get("layerId") or "").strip()
+    image_id = str(ref.get("image_id") or ref.get("imageId") or "").strip()
+    if not layer_id or not image_id:
+        return None
+    return layer_id, image_id
+
+
+def _layer_constraint_pairs(
+    layers_data: List[Dict],
+    design_constraints: Optional[List[Dict[str, Any]]],
+) -> Tuple[List[Tuple[int, int]], int]:
+    if not design_constraints:
+        return [], 0
+
+    ref_to_col: Dict[Tuple[str, str], int] = {}
+    col_idx = 0
+    for layer in layers_data:
+        layer_id = str(layer.get("layer_id") or layer.get("id") or layer.get("name") or "").strip()
+        for image_index, image in enumerate(layer.get("images") or []):
+            image_id = str(
+                image.get("image_id")
+                or image.get("id")
+                or image.get("name")
+                or f"{image_index + 1}"
+            ).strip()
+            if layer_id and image_id:
+                ref_to_col[(layer_id, image_id)] = col_idx
+            col_idx += 1
+
+    pair_keys: Set[Tuple[int, int]] = set()
+    skipped = 0
+    for constraint in design_constraints:
+        if not isinstance(constraint, dict):
+            skipped += 1
+            continue
+        anchors = constraint.get("anchors") or []
+        blocked = constraint.get("blocked") or []
+        for anchor in anchors:
+            anchor_key = _constraint_ref_key(anchor)
+            anchor_col = ref_to_col.get(anchor_key) if anchor_key else None
+            if anchor_col is None:
+                skipped += 1
+                continue
+            for blocked_ref in blocked:
+                blocked_key = _constraint_ref_key(blocked_ref)
+                blocked_col = ref_to_col.get(blocked_key) if blocked_key else None
+                if blocked_col is None or blocked_col == anchor_col:
+                    skipped += 1
+                    continue
+                pair_keys.add(tuple(sorted((anchor_col, blocked_col))))
+
+    return sorted(pair_keys), skipped
+
+
+def validate_layer_design_constraints_fast(
+    layers_data: List[Dict],
+    design_constraints: Optional[List[Dict[str, Any]]] = None,
+    tasks_per_respondent: int = 0,
+) -> Dict[str, Any]:
+    layers = _filter_nonempty_layers(layers_data)
+    if not layers:
+        return {
+            "feasible": False,
+            "reason": "Layer study requires at least one layer with images.",
+            "valid_row_variety": 0,
+            "required_row_variety": 0,
+            "tasks_per_respondent": 0,
+            "constraints_checked": len(design_constraints or []),
+            "incompatible_pairs_count": 0,
+            "skipped_constraint_refs": 0,
+            "row_universe_rank": 0,
+            "required_rank": 0,
+            "suggestions": ["Add images to each layer before generating tasks."],
+        }
+
+    counts = [len(layer.get("images") or []) for layer in layers]
+    total_elements = sum(counts)
+    if total_elements < 1:
+        return {
+            "feasible": False,
+            "reason": "Layer study requires at least one image.",
+            "valid_row_variety": 0,
+            "required_row_variety": 0,
+            "tasks_per_respondent": 0,
+            "constraints_checked": len(design_constraints or []),
+            "incompatible_pairs_count": 0,
+            "skipped_constraint_refs": 0,
+            "row_universe_rank": 0,
+            "required_rank": 0,
+            "suggestions": ["Add more layer images before generating tasks."],
+        }
+
+    tpr = max(0, int(tasks_per_respondent or 0))
+    if tpr == 0:
+        tpr = math.ceil(1.5 * total_elements)
+    required_variety = max(1, 2 * tpr)
+
+    def make_response(
+        feasible: bool,
+        reason: str,
+        valid_row_variety: int,
+        row_universe_rank: int,
+        suggestions: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "feasible": feasible,
+            "reason": reason,
+            "valid_row_variety": valid_row_variety,
+            "required_row_variety": required_variety,
+            "tasks_per_respondent": tpr,
+            "constraints_checked": len(design_constraints or []),
+            "incompatible_pairs_count": len(incompatible_pairs),
+            "skipped_constraint_refs": skipped_constraints,
+            "row_universe_rank": row_universe_rank,
+            "required_rank": total_elements,
+            "suggestions": suggestions or [],
+        }
+
+    incompatible_pairs, skipped_constraints = _layer_constraint_pairs(layers, design_constraints)
+    incompatible_lookup = {tuple(sorted(pair)) for pair in incompatible_pairs}
+
+    col_to_layer: List[int] = []
+    layer_cols: List[List[int]] = []
+    col_idx = 0
+    for layer_idx, layer in enumerate(layers):
+        cols: List[int] = []
+        for _ in layer.get("images") or []:
+            cols.append(col_idx)
+            col_to_layer.append(layer_idx)
+            col_idx += 1
+        layer_cols.append(cols)
+
+    if tpr < total_elements:
+        return make_response(
+            feasible=False,
+            reason=f"Tasks per respondent must be at least {total_elements} for this layer study.",
+            valid_row_variety=0,
+            row_universe_rank=0,
+            suggestions=[
+                "Increase tasks per respondent.",
+                "Reduce the number of layer images.",
+            ],
+        )
+
+    valid_row_variety = 0
+    basis_rows: List[np.ndarray] = []
+    row_universe_rank = 0
+    c = len(layers)
+    min_a = min(2, c) if c >= 1 else 1
+    max_a = c if c >= 1 else 1
+
+    def is_allowed(candidate: int, selected: List[int]) -> bool:
+        return all(tuple(sorted((candidate, prior))) not in incompatible_lookup for prior in selected)
+
+    def observe_valid_row(selected: List[int]) -> bool:
+        nonlocal valid_row_variety, row_universe_rank, basis_rows
+        valid_row_variety += 1
+
+        if row_universe_rank < total_elements:
+            row = np.zeros(total_elements, dtype=int)
+            row[selected] = 1
+            trial_rows = basis_rows + [row]
+            trial_rank = int(np.linalg.matrix_rank(np.vstack(trial_rows)))
+            if trial_rank > row_universe_rank:
+                basis_rows.append(row)
+                row_universe_rank = trial_rank
+
+        return valid_row_variety >= required_variety and row_universe_rank >= total_elements
+
+    for k in range(min_a, max_a + 1):
+        for active_layers in combinations(range(c), k):
+            selected: List[int] = []
+
+            def backtrack(depth: int) -> bool:
+                if depth == len(active_layers):
+                    return observe_valid_row(selected)
+                layer_idx = active_layers[depth]
+                for candidate in layer_cols[layer_idx]:
+                    if not is_allowed(candidate, selected):
+                        continue
+                    selected.append(candidate)
+                    enough = backtrack(depth + 1)
+                    selected.pop()
+                    if enough:
+                        return True
+                return False
+
+            if backtrack(0):
+                return make_response(
+                    feasible=True,
+                    reason="Design constraints are feasible.",
+                    valid_row_variety=valid_row_variety,
+                    row_universe_rank=row_universe_rank,
+                )
+
+    if valid_row_variety < required_variety:
+        return make_response(
+            feasible=False,
+            reason="Not enough valid layer combinations are available.",
+            valid_row_variety=valid_row_variety,
+            row_universe_rank=row_universe_rank,
+            suggestions=[
+                "Remove or relax some design constraints.",
+                "Add more images to constrained layers.",
+                "Reduce tasks per respondent.",
+            ],
+        )
+
+    if row_universe_rank < total_elements:
+        return make_response(
+            feasible=False,
+            reason="Design constraints make the study unsolvable because the valid task combinations cannot identify all layer images independently.",
+            valid_row_variety=valid_row_variety,
+            row_universe_rank=row_universe_rank,
+            suggestions=[
+                "Remove or relax constraints around overlapping images.",
+                "Add more images to constrained layers.",
+                "Increase tasks per respondent after loosening constraints.",
+            ],
+        )
+
+    return make_response(
+        feasible=True,
+        reason="Design constraints are feasible.",
+        valid_row_variety=valid_row_variety,
+        row_universe_rank=row_universe_rank,
+        suggestions=[],
     )
 
 
@@ -343,6 +580,7 @@ def generate_layer_tasks_golden(
     seed: Optional[int] = None,
     tasks_per_respondent: int = 0,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    design_constraints: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Same return shape as generate_layer_tasks_v2."""
     tasks_per_respondent = max(0, int(tasks_per_respondent or 0))
@@ -383,7 +621,8 @@ def generate_layer_tasks_golden(
             },
         }
 
-    config = _build_design_config_layer(n_gen, layers, tasks_per_respondent)
+    incompatible_pairs, skipped_constraints = _layer_constraint_pairs(layers, design_constraints)
+    config = _build_design_config_layer(n_gen, layers, tasks_per_respondent, incompatible_pairs)
     T = config.tasks_per_respondent
 
     try:
@@ -413,6 +652,9 @@ def generate_layer_tasks_golden(
             "capacity": capacity,
             "background_image_url": None,
             "algorithm": "golden_matrix",
+            "design_constraints_count": len(design_constraints or []),
+            "incompatible_pairs_count": len(incompatible_pairs),
+            "skipped_constraint_refs": skipped_constraints,
             "golden_report": _compact_report(report),
         },
     }

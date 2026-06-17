@@ -595,8 +595,10 @@ class BackgroundTaskService:
         layers = []
         for layer in payload.get('study_layers', []):
             layer_obj = type('Layer', (), {
+                'layer_id': layer.get('layer_id', ''),
                 'name': layer.get('name', ''),
                 'images': [type('Image', (), {
+                    'image_id': img.get('image_id', ''),
                     'name': img.get('name', ''),
                     'url': img.get('url', '')
                 }) for img in layer.get('images', [])],
@@ -652,11 +654,13 @@ class BackgroundTaskService:
                 None,
                 lambda: generate_layer_tasks_golden(
                     layers_data=[{
+                        "layer_id": getattr(l, "layer_id", ""),
                         "name": l.name,
                         "z_index": getattr(l, 'z_index', 0),
                         "order": getattr(l, 'order', 0),
                         "images": [
                             {
+                                "image_id": getattr(i, "image_id", ""),
                                 "name": i.name,
                                 "url": i.url,
                                 "alt_text": getattr(i, "alt_text", "") or "",
@@ -668,7 +672,8 @@ class BackgroundTaskService:
                     exposure_tolerance_pct=payload.get('exposure_tolerance_pct', 2.0),
                     seed=payload.get('seed'),
                     tasks_per_respondent=tpr,
-                    progress_callback=on_progress
+                    progress_callback=on_progress,
+                    design_constraints=payload.get("design_constraints") or [],
                 )
             )
         except RuntimeError as e:
@@ -765,7 +770,8 @@ class BackgroundTaskService:
             study_updates = {}
             # Map payload fields to update
             for field in ['title', 'background', 'language', 'main_question', 'orientation_text', 
-                          'background_image_url', 'rating_scale', 'audience_segmentation', 'phase_order']:
+                          'background_image_url', 'rating_scale', 'audience_segmentation', 'phase_order',
+                          'design_constraints']:
                 if payload.get(field):
                     study_updates[field] = payload.get(field)
             

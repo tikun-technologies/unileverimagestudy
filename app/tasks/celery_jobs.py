@@ -130,11 +130,13 @@ def _generate_layer_tasks(job_id: str, payload: Dict) -> Dict[str, Any]:
     layers = []
     for layer in payload.get("study_layers", []):
         layer_obj = {
+            "layer_id": layer.get("layer_id", ""),
             "name": layer.get("name", ""),
             "z_index": layer.get("z_index", 0),
             "order": layer.get("order", 0),
             "images": [
                 {
+                    "image_id": img.get("image_id", ""),
                     "name": img.get("name", ""),
                     "url": img.get("url", ""),
                     "alt_text": img.get("alt_text", "") or "",
@@ -166,6 +168,7 @@ def _generate_layer_tasks(job_id: str, payload: Dict) -> Dict[str, Any]:
             seed=payload.get("seed"),
             tasks_per_respondent=tpr,
             progress_callback=on_progress,
+            design_constraints=payload.get("design_constraints") or [],
         )
     except RuntimeError as e:
         if "Preflight failed" in str(e) or "consider more elements" in str(e):
@@ -336,6 +339,7 @@ def _launch_study(job_id: str, study_id: str, user_id: str, payload: Dict) -> No
             "rating_scale",
             "audience_segmentation",
             "phase_order",
+            "design_constraints",
         ]:
             if payload.get(field) is not None:
                 study_updates[field] = payload.get(field)

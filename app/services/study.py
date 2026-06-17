@@ -17,7 +17,7 @@ from app.models.response_model import StudyResponse
 from app.schemas.study_schema import (
     StudyCreate, StudyUpdate, StudyOut, StudyListItem,
     StudyStatus, StudyType, RegenerateTasksResponse, ValidateTasksResponse,
-    StudyPublicMinimal
+    StudyPublicMinimal, DesignConstraintIn
 )
 from app.services.task_generation_adapter import generate_grid_tasks, generate_layer_tasks
 from app.services.cloudinary_service import upload_base64, delete_public_id
@@ -96,6 +96,24 @@ def _classification_question_config(question: Any) -> Dict[str, Any]:
     config = dict(getattr(question, "config", None) or {})
     config["optional_classification_question"] = bool(getattr(question, "optional_classification_question", False))
     return config
+
+
+def _design_constraints_payload(constraints: Optional[List[Any]]) -> Optional[List[Dict[str, Any]]]:
+    if constraints is None:
+        return None
+    out: List[Dict[str, Any]] = []
+    for constraint in constraints:
+        if hasattr(constraint, "model_dump"):
+            item = constraint.model_dump(exclude_none=True)
+        elif isinstance(constraint, dict):
+            item = {k: v for k, v in constraint.items() if v is not None}
+        else:
+            continue
+        anchors = item.get("anchors") or []
+        blocked = item.get("blocked") or []
+        if anchors and blocked:
+            out.append(item)
+    return out
 
 
 def _maybe_upload_data_url_to_cloudinary(url_or_data: Optional[str]) -> tuple[str, Optional[str]]:
@@ -323,6 +341,7 @@ def create_study(
         last_step=payload.last_step or 1,
         product_keys=[k.model_dump() for k in payload.product_keys] if getattr(payload, 'product_keys', None) else None,
         product_id=getattr(payload, 'product_id', None),
+        design_constraints=_design_constraints_payload(getattr(payload, 'design_constraints', None)),
     )
     db.add(study)
     # UUID is already assigned above; avoid early flush to reduce DB round-trips
@@ -642,6 +661,7 @@ def copy_study(db: Session, study_id: UUID, user_id: UUID, project_id: Optional[
             if source.product_keys else None
         ),
         product_id=None,
+        design_constraints=_design_constraints_payload(source.design_constraints or []),
     )
     db.add(new_study)
     db.flush()
@@ -928,6 +948,7 @@ def get_study_public_with_status_check(db: Session, study_id: UUID) -> Dict[str,
             Study.share_token,
             Study.orientation_text,
             Study.language,
+            Study.design_constraints,
             UserModel.email.label("creator_email")
         ).join(UserModel, UserModel.id == Study.creator_id)
         .where(Study.id == study_id)
@@ -988,6 +1009,7 @@ def get_study_public_with_status_check(db: Session, study_id: UUID) -> Dict[str,
         "status": row.status,
         "orientation_text": row.orientation_text,
         "language": row.language,
+        "design_constraints": row.design_constraints or [],
         "creator_email": row.creator_email,
         "require_panelist_selection": require_panelist,
         "show_fragrance_question": require_panelist,
@@ -1265,6 +1287,9 @@ def update_study(
     if payload.product_id is not None:
         study.product_id = payload.product_id
 
+    if payload.design_constraints is not None:
+        study.design_constraints = _design_constraints_payload(payload.design_constraints)
+
     # Replace children collections if provided
     if payload.elements is not None:
         # Only valid for grid, text, and hybrid
@@ -1533,6 +1558,9 @@ def update_study_fast(
     if payload.product_id is not None:
         study.product_id = payload.product_id
 
+    if payload.design_constraints is not None:
+        study.design_constraints = _design_constraints_payload(payload.design_constraints)
+
     # For fast updates, we only handle simple scalar fields
     # Complex operations (elements, layers, classification_questions) fall back to full loading
     if payload.elements is not None or payload.study_layers is not None:
@@ -1604,6 +1632,9 @@ def update_and_launch_study_fast(
 
     if payload.product_id is not None:
         study.product_id = payload.product_id
+
+    if payload.design_constraints is not None:
+        study.design_constraints = _design_constraints_payload(payload.design_constraints)
 
     # Handle complex updates that require full loading
     if payload.elements is not None or payload.study_layers is not None or payload.classification_questions is not None:
@@ -1854,7 +1885,8 @@ def regenerate_tasks(
             layers=layers,
             number_of_respondents=number_of_respondents,
             exposure_tolerance_pct=exposure_tolerance_pct,
-            seed=seed
+            seed=seed,
+            design_constraints=study.design_constraints or [],
         )
         # Attach optional background image URL to metadata for client rendering
         try:
@@ -2072,6 +2104,62 @@ def validate_tasks(
     return ValidateTasksResponse(validation_passed=len(issues) == 0, issues=issues, totals=totals)
 
 
+def upsert_design_constraint(
+    db: Session,
+    study_id: UUID,
+    owner_id: UUID,
+    constraint: DesignConstraintIn,
+) -> List[Dict[str, Any]]:
+    study = _load_owned_study_minimal(db, study_id, owner_id, for_update=True)
+    if not _get_effective_edit_permission(db, study, owner_id):
+        raise HTTPException(status_code=403, detail="You do not have permission to edit this study.")
+
+    payload = _design_constraints_payload([constraint])
+    if not payload:
+        raise HTTPException(status_code=400, detail="Design constraint must include anchors and blocked elements.")
+
+    item = payload[0]
+    if not item.get("id"):
+        item["id"] = uuid4().hex
+
+    current = list(getattr(study, "design_constraints", None) or [])
+    replaced = False
+    for idx, existing in enumerate(current):
+        if isinstance(existing, dict) and existing.get("id") == item["id"]:
+            current[idx] = item
+            replaced = True
+            break
+    if not replaced:
+        current.append(item)
+
+    study.design_constraints = current
+    db.commit()
+    return current
+
+
+def delete_design_constraint(
+    db: Session,
+    study_id: UUID,
+    owner_id: UUID,
+    constraint_id: str,
+) -> List[Dict[str, Any]]:
+    study = _load_owned_study_minimal(db, study_id, owner_id, for_update=True)
+    if not _get_effective_edit_permission(db, study, owner_id):
+        raise HTTPException(status_code=403, detail="You do not have permission to edit this study.")
+
+    current = list(getattr(study, "design_constraints", None) or [])
+    next_constraints = [
+        item for item in current
+        if not (isinstance(item, dict) and str(item.get("id")) == str(constraint_id))
+    ]
+    if len(next_constraints) == len(current):
+        raise HTTPException(status_code=404, detail="Design constraint not found.")
+
+    study.design_constraints = next_constraints
+    db.commit()
+    return next_constraints
+
+
 def get_study_basic_details(db: Session, study_id: UUID, owner_id: UUID) -> Optional[Dict[str, Any]]:
     """
     Get basic study details for authenticated users.
@@ -2107,7 +2195,8 @@ def get_study_basic_details(db: Session, study_id: UUID, owner_id: UUID) -> Opti
         "rating_scale": study.rating_scale,
         "study_config": study_config,
         "classification_questions": study.classification_questions,
-        "toggle_shuffle": study.toggle_shuffle
+        "toggle_shuffle": study.toggle_shuffle,
+        "design_constraints": study.design_constraints,
     }
 
 
@@ -2122,7 +2211,8 @@ def get_study_basic_details_public(db: Session, study_id: UUID) -> Optional[Dict
     # Ultra-fast raw SQL query - only essential fields (product_id/product_keys fetched via ORM below)
     query = text("""
         SELECT id, title, status, study_type, created_at, background, 
-               main_question, orientation_text, rating_scale, iped_parameters, language, toggle_shuffle
+               main_question, orientation_text, rating_scale, iped_parameters, language, toggle_shuffle,
+               design_constraints
         FROM studies 
         WHERE id = :study_id
     """)
@@ -2203,7 +2293,8 @@ def get_study_basic_details_public(db: Session, study_id: UUID) -> Optional[Dict
         "study_config": study_config,
         "classification_questions": classification_questions,
         "element_count": element_count,
-        "toggle_shuffle": result.toggle_shuffle
+        "toggle_shuffle": result.toggle_shuffle,
+        "design_constraints": result.design_constraints,
     }
     # Fetch product_id and product_keys via ORM (reliable across local/hosted; raw SQL Row can differ)
     product_row = db.execute(

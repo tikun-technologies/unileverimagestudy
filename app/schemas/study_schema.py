@@ -109,6 +109,17 @@ class StudyLayerOut(BaseModel):
     images: List[LayerImageOut] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
+class DesignConstraintElementRef(BaseModel):
+    layer_id: str = Field(..., max_length=100)
+    image_id: str = Field(..., max_length=100)
+
+class DesignConstraintIn(BaseModel):
+    id: Optional[str] = Field(default=None, max_length=100)
+    name: str = Field(..., max_length=255)
+    anchors: List[DesignConstraintElementRef] = Field(default_factory=list)
+    blocked: List[DesignConstraintElementRef] = Field(default_factory=list)
+    created_at: Optional[int] = None
+
 class AnswerOption(BaseModel):
     """Answer option for multiple choice questions"""
     id: str = Field(..., max_length=10)  # A, B, C, etc.
@@ -182,6 +193,7 @@ class StudyCreate(StudyBase):
     categories: Optional[List[StudyCategoryIn]] = None
     elements: Optional[List[StudyElementIn]] = None
     study_layers: Optional[List[StudyLayerIn]] = None
+    design_constraints: Optional[List[DesignConstraintIn]] = None
     classification_questions: Optional[List[StudyClassificationQuestionIn]] = None
     project_id: Optional[UUID] = Field(None, description="Optional project ID to affiliate this study with")
 
@@ -203,6 +215,7 @@ class StudyUpdate(BaseModel):
     categories: Optional[List[StudyCategoryIn]] = None
     elements: Optional[List[StudyElementIn]] = None
     study_layers: Optional[List[StudyLayerIn]] = None
+    design_constraints: Optional[List[DesignConstraintIn]] = None
     classification_questions: Optional[List[StudyClassificationQuestionIn]] = None
     phase_order: Optional[List[str]] = None
     toggle_shuffle: Optional[bool] = None
@@ -364,6 +377,7 @@ class StudyBasicDetails(BaseModel):
     toggle_shuffle: bool = False
     product_keys: Optional[List[ProductKey]] = None
     product_id: Optional[str] = None
+    design_constraints: Optional[List[DesignConstraintIn]] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -392,6 +406,7 @@ class StudyOut(BaseModel):
     toggle_shuffle: bool = False
     product_keys: Optional[List[ProductKey]] = None
     product_id: Optional[str] = None
+    design_constraints: Optional[List[DesignConstraintIn]] = None
 
     # Children
     categories: Optional[List[StudyCategoryOut]] = None
@@ -451,6 +466,19 @@ class ValidateTasksResponse(BaseModel):
     issues: List[str] = []
     totals: Dict[str, Any] = {}
 
+class ValidateDesignConstraintsResponse(BaseModel):
+    feasible: bool
+    reason: str
+    valid_row_variety: int
+    required_row_variety: int
+    tasks_per_respondent: int
+    constraints_checked: int
+    incompatible_pairs_count: int
+    skipped_constraint_refs: int = 0
+    row_universe_rank: int = 0
+    required_rank: int = 0
+    suggestions: List[str] = []
+
 class GenerateTasksRequest(BaseModel):
     study_id: Optional[UUID] = None
     last_step: Optional[int] = None
@@ -469,6 +497,7 @@ class GenerateTasksRequest(BaseModel):
     categories: Optional[List[StudyCategoryIn]] = None
     elements: Optional[List[StudyElementIn]] = None
     study_layers: Optional[List[StudyLayerIn]] = None
+    design_constraints: Optional[List[DesignConstraintIn]] = None
     exposure_tolerance_cv: Optional[float] = None
     exposure_tolerance_pct: Optional[float] = None
     phase_order: Optional[List[str]] = None

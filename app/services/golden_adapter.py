@@ -86,6 +86,7 @@ def generate_layer_tasks(
     exposure_tolerance_pct: float,
     seed: Optional[int],
     tasks_per_consumer: Optional[int] = None,
+    design_constraints: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     tpr = int(tasks_per_consumer) if tasks_per_consumer is not None else 0
     if tpr < 0:
@@ -95,11 +96,13 @@ def generate_layer_tasks(
     for layer in layers:
         layers_data.append(
             {
+                "layer_id": str(getattr(layer, "layer_id", getattr(layer, "id", ""))),
                 "name": str(getattr(layer, "name")),
                 "z_index": int(getattr(layer, "z_index", 0)),
                 "order": int(getattr(layer, "order", 0)),
                 "images": [
                     {
+                        "image_id": str(getattr(img, "image_id", getattr(img, "id", ""))),
                         "name": str(getattr(img, "name")),
                         "url": str(getattr(img, "url", "")),
                         "alt_text": str(getattr(img, "alt_text", "")),
@@ -115,4 +118,5 @@ def generate_layer_tasks(
         exposure_tolerance_pct=exposure_tolerance_pct,
         seed=seed,
         tasks_per_respondent=tpr,
+        design_constraints=design_constraints,
     )

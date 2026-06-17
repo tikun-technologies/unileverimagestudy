@@ -19,8 +19,10 @@ from app.schemas.study_schema import (
     StudyCreate, StudyUpdate, StudyOut, StudyListItem, StudyLaunchOut,
     ChangeStatusPayload, RegenerateTasksResponse, ValidateTasksResponse, StudyStatus,
     GenerateTasksRequest, GenerateTasksResult, StudyPublicMinimal, StudyBasicDetails, StudyBasicDetailsV2, SimulateAIRespondentsRequest,
+    ValidateDesignConstraintsResponse,
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
-    StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest
+    StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest,
+    DesignConstraintIn
 )
 from app.services import study as study_service
 from app.services.response import StudyResponseService
@@ -113,8 +115,10 @@ def _generate_preview_tasks(payload: GenerateTasksRequest, number_of_respondents
         layers = []
         for layer in payload.study_layers:
             layer_obj = type('Layer', (), {
+                'layer_id': layer.layer_id,
                 'name': layer.name,
                 'images': [type('Image', (), {
+                    'image_id': img.image_id,
                     'name': img.name,
                     'url': img.url
                 }) for img in layer.images or []],
@@ -132,6 +136,7 @@ def _generate_preview_tasks(payload: GenerateTasksRequest, number_of_respondents
                 exposure_tolerance_pct=payload.exposure_tolerance_pct or 2.0,
                 seed=payload.seed,
                 tasks_per_consumer=int(payload.tasks_per_respondent or 0),
+                design_constraints=[c.model_dump(exclude_none=True) for c in (payload.design_constraints or [])],
             )
             return result.get('tasks', {})
         except Exception:
@@ -266,6 +271,7 @@ def _ensure_study_exists(payload: GenerateTasksRequest, db: Session, current_use
                 categories=payload.categories,
                 elements=payload.elements,
                 study_layers=payload.study_layers,
+                design_constraints=payload.design_constraints,
                 classification_questions=payload.classification_questions,
                 product_keys=getattr(payload, 'product_keys', None),
                 product_id=getattr(payload, 'product_id', None),
@@ -1077,6 +1083,44 @@ def update_study_endpoint(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
+@router.put("/{study_id}/design-constraints/{constraint_id}")
+def upsert_design_constraint_endpoint(
+    study_id: UUID,
+    constraint_id: str,
+    payload: DesignConstraintIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    if payload.id and payload.id != constraint_id:
+        raise HTTPException(status_code=400, detail="Constraint id in path and payload must match.")
+    payload.id = constraint_id
+    constraints = study_service.upsert_design_constraint(
+        db=db,
+        study_id=study_id,
+        owner_id=current_user.id,
+        constraint=payload,
+    )
+    invalidate_study_cache(study_id)
+    return {"design_constraints": constraints}
+
+
+@router.delete("/{study_id}/design-constraints/{constraint_id}")
+def delete_design_constraint_endpoint(
+    study_id: UUID,
+    constraint_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    constraints = study_service.delete_design_constraint(
+        db=db,
+        study_id=study_id,
+        owner_id=current_user.id,
+        constraint_id=constraint_id,
+    )
+    invalidate_study_cache(study_id)
+    return {"design_constraints": constraints}
+
+
 @router.delete("/{study_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_study_endpoint(
     study_id: UUID,
@@ -1386,6 +1430,83 @@ def share_url_endpoint(
     return {"share_token": study.share_token, "share_url": study.share_url}
 
 
+def _validate_design_constraints_payload(payload: GenerateTasksRequest) -> ValidateDesignConstraintsResponse:
+    if payload.study_type != "layer":
+        return ValidateDesignConstraintsResponse(
+            feasible=True,
+            reason="Design constraints apply only to layer studies.",
+            valid_row_variety=0,
+            required_row_variety=0,
+            tasks_per_respondent=0,
+            constraints_checked=0,
+            incompatible_pairs_count=0,
+            skipped_constraint_refs=0,
+            suggestions=[],
+        )
+
+    design_constraints = [c.model_dump(exclude_none=True) for c in (payload.design_constraints or [])]
+    if not design_constraints:
+        return ValidateDesignConstraintsResponse(
+            feasible=True,
+            reason="No design constraints to validate.",
+            valid_row_variety=0,
+            required_row_variety=0,
+            tasks_per_respondent=int(payload.tasks_per_respondent or 0),
+            constraints_checked=0,
+            incompatible_pairs_count=0,
+            skipped_constraint_refs=0,
+            suggestions=[],
+        )
+
+    if not payload.study_layers:
+        return ValidateDesignConstraintsResponse(
+            feasible=False,
+            reason="Layer study requires study_layers before validating constraints.",
+            valid_row_variety=0,
+            required_row_variety=0,
+            tasks_per_respondent=int(payload.tasks_per_respondent or 0),
+            constraints_checked=len(design_constraints),
+            incompatible_pairs_count=0,
+            skipped_constraint_refs=0,
+            suggestions=["Add layers and images before generating tasks."],
+        )
+
+    layers_data = [
+        {
+            "layer_id": layer.layer_id,
+            "name": layer.name,
+            "z_index": layer.z_index,
+            "order": layer.order,
+            "images": [
+                {
+                    "image_id": image.image_id,
+                    "name": image.name,
+                    "url": image.url,
+                    "alt_text": image.alt_text or "",
+                }
+                for image in (layer.images or [])
+            ],
+        }
+        for layer in payload.study_layers
+    ]
+
+    from app.services.golden_task_generator import validate_layer_design_constraints_fast
+    result = validate_layer_design_constraints_fast(
+        layers_data=layers_data,
+        design_constraints=design_constraints,
+        tasks_per_respondent=int(payload.tasks_per_respondent or 0),
+    )
+    return ValidateDesignConstraintsResponse(**result)
+
+
+@router.post("/validate-design-constraints", response_model=ValidateDesignConstraintsResponse)
+def validate_design_constraints_endpoint(
+    payload: GenerateTasksRequest,
+    current_user: User = Depends(get_current_active_user),
+):
+    return _validate_design_constraints_payload(payload)
+
+
 @router.post("/generate-tasks", response_model=GenerateTasksResult)
 def generate_tasks_from_body_endpoint(
     payload: GenerateTasksRequest,
@@ -1393,13 +1514,17 @@ def generate_tasks_from_body_endpoint(
     current_user: User = Depends(get_current_active_user),
 ):
     # Check if we should use async processing for large studies
-    number_of_respondents = payload.audience_segmentation.number_of_respondents if payload.audience_segmentation else 0
+    number_of_respondents = int(payload.audience_segmentation.number_of_respondents or 0) if payload.audience_segmentation else 0
     
     # Debug logging
     import logging
     logger = logging.getLogger(__name__)
     logger.info(f"Requested respondents: {number_of_respondents}, threshold: {settings.MAX_RESPONDENTS_FOR_SYNC}")
     logger.info(f"Using background processing: {number_of_respondents > settings.MAX_RESPONDENTS_FOR_SYNC}")
+
+    constraint_validation = _validate_design_constraints_payload(payload)
+    if not constraint_validation.feasible:
+        raise HTTPException(status_code=400, detail=constraint_validation.model_dump())
     
     if number_of_respondents > settings.MAX_RESPONDENTS_FOR_SYNC:
         # Use async background processing for large studies
@@ -1407,6 +1532,8 @@ def generate_tasks_from_body_endpoint(
         
         # Create study first if needed
         study_row = _ensure_study_exists(payload, db, current_user)
+        if payload.design_constraints is not None:
+            study_row.design_constraints = [c.model_dump(exclude_none=True) for c in payload.design_constraints]
         
         # Log whether this is a new study or existing study
         if payload.study_id:
@@ -1547,10 +1674,14 @@ def generate_tasks_from_body_endpoint(
                 categories=payload.categories,
                 elements=payload.elements,
                 study_layers=payload.study_layers,
+                design_constraints=payload.design_constraints,
                 classification_questions=payload.classification_questions,
             ),
             base_url_for_share=settings.BASE_URL,
         )
+
+    if payload.design_constraints is not None:
+        study_row.design_constraints = [c.model_dump(exclude_none=True) for c in payload.design_constraints]
 
     if payload.study_type in ('grid', 'text'):
         if not payload.elements or len(payload.elements) == 0:
@@ -1655,19 +1786,21 @@ def generate_tasks_from_body_endpoint(
             raise HTTPException(status_code=400, detail="Layer study requires study_layers")
         # Build a minimal StudyLayer-like structure for adapter
         class _TmpImg:
-            def __init__(self, name: str, url: str):
+            def __init__(self, image_id: str, name: str, url: str):
+                self.image_id = image_id
                 self.name = name
                 self.url = url
         class _TmpLayer:
-            def __init__(self, name: str, images: list, z_index: int, order: int):
+            def __init__(self, layer_id: str, name: str, images: list, z_index: int, order: int):
+                self.layer_id = layer_id
                 self.name = name
                 self.images = images
                 self.z_index = z_index
                 self.order = order
         layers = []
         for L in payload.study_layers:
-            imgs = [_TmpImg(img.name, img.url) for img in L.images or []]
-            layers.append(_TmpLayer(L.name, imgs, L.z_index, L.order))
+            imgs = [_TmpImg(img.image_id, img.name, img.url) for img in L.images or []]
+            layers.append(_TmpLayer(L.layer_id, L.name, imgs, L.z_index, L.order))
 
         # Feasibility preflight for layer mode
         try:
@@ -1705,6 +1838,7 @@ def generate_tasks_from_body_endpoint(
             exposure_tolerance_pct=payload.exposure_tolerance_pct or 2.0,
             seed=payload.seed,
             tasks_per_consumer=int(payload.tasks_per_respondent or 0),
+            design_constraints=[c.model_dump(exclude_none=True) for c in (payload.design_constraints or [])],
         )
         # Persist tasks to new table
         tasks = result.get('tasks', {})

@@ -66,6 +66,8 @@ class Study(Base):
     product_keys = Column(JSONB, nullable=True)
     # Optional product ID (e.g. for station/product linking)
     product_id = Column(String(100), nullable=True)
+    # Optional layer study exclusion rules from Step 5 design constraints.
+    design_constraints = Column(JSONB, nullable=True)
 
     # Relations
     # Use lazy="noload" for heavy relationships to prevent accidental loading
