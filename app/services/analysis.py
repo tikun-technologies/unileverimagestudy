@@ -435,6 +435,10 @@ class StudyAnalysisService:
                 "name": cat_name,
                 "elements": []
             }
+            if cat.get("id") is not None:
+                cat_info["id"] = cat.get("id")
+                if study_data.get("study_type") == "layer":
+                    cat_info["layer_id"] = cat.get("id")
             if cat.get("z_index") is not None:
                 cat_info["z_index"] = cat.get("z_index")
             if cat.get("transform") is not None:
@@ -447,6 +451,14 @@ class StudyAnalysisService:
                     "name": el.get("name", ""),
                     "content": el.get("content", "")
                 }
+                if el.get("id") is not None:
+                    element_info["id"] = el.get("id")
+                    if study_data.get("study_type") == "layer":
+                        element_info["image_id"] = el.get("id")
+                if el.get("category_id") is not None:
+                    element_info["category_id"] = el.get("category_id")
+                    if study_data.get("study_type") == "layer":
+                        element_info["layer_id"] = el.get("category_id")
                 for key in (
                     "z_index",
                     "transform",
