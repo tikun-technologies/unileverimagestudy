@@ -494,6 +494,84 @@ class EmailService:
             logger.error(f"Failed to send export ready email to {to_email}: {str(e)}")
             return False
 
+    def send_task_generation_complete_email(
+        self,
+        to_email: str,
+        user_name: str,
+        study_title: str,
+        study_url: str,
+        respondents_count: int | None = None,
+    ) -> bool:
+        """Send email when background task generation completes successfully."""
+        try:
+            subject = f"Tasks generated: {study_title}"
+
+            detail_line = ""
+            if respondents_count and respondents_count > 0:
+                detail_line = f"<p>Tasks were generated for <strong>{respondents_count}</strong> respondent(s).</p>"
+
+            html_body = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
+                    <h2 style="color: #2674BA;">Task generation complete</h2>
+
+                    <p>Hello {user_name},</p>
+
+                    <p>Task generation for <strong>{study_title}</strong> has finished successfully.</p>
+
+                    {detail_line}
+
+                    <div style="text-align: center; margin: 30px 0;">
+                        <a href="{study_url}"
+                           style="background-color: #2674BA; color: white; padding: 14px 35px;
+                                  text-decoration: none; border-radius: 5px; display: inline-block;
+                                  font-weight: bold; font-size: 16px;">
+                            View study
+                        </a>
+                    </div>
+
+                    <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+                    <p style="font-size: 12px; color: #666;">
+                        This email was sent from {self.app_name}.<br>
+                        If you did not start this task generation, you can ignore this email.
+                    </p>
+                </div>
+            </body>
+            </html>
+            """
+
+            respondents_text = (
+                f"Tasks were generated for {respondents_count} respondent(s).\n\n"
+                if respondents_count and respondents_count > 0
+                else ""
+            )
+
+            text_body = f"""
+            Task generation complete - {self.app_name}
+
+            Hello {user_name},
+
+            Task generation for {study_title} has finished successfully.
+
+            {respondents_text}View your study here:
+            {study_url}
+
+            ---
+            This email was sent from {self.app_name}.
+            If you did not start this task generation, you can ignore this email.
+            """
+
+            return self._send_email(
+                to_email=to_email,
+                subject=subject,
+                html_body=html_body,
+                text_body=text_body,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send task generation email to {to_email}: {str(e)}")
+            return False
+
 
 # Global email service instance
 email_service = EmailService()

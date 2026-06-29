@@ -111,6 +111,22 @@ class ProjectMemberService:
         except Exception as e:
             logger.error(f"Failed to send project invitation email: {e}")
 
+        if user:
+            try:
+                from app.services.job_notification_service import create_project_invitation_notification
+
+                create_project_invitation_notification(
+                    db,
+                    user_id=user.id,
+                    project_id=project_id,
+                    project_name=project.name or "Untitled Project",
+                    inviter_name=inviter.name or inviter.email,
+                    role=payload.role,
+                    member_id=new_member.id,
+                )
+            except Exception as e:
+                logger.warning("Failed to create project invitation notification: %s", e)
+
         return new_member
 
     def _sync_member_to_all_studies(

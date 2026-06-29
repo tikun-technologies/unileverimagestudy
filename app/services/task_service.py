@@ -89,7 +89,7 @@ class TaskService:
                     StudyTaskAssignment.respondent_id == respondent_id,
                     StudyTaskAssignment.task_index == task_index
                 )
-            ).scalar_one_or_none()
+            ).scalars().first()
             
             if assignment:
                 return self._assignment_to_dict(assignment)

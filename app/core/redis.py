@@ -79,6 +79,57 @@ def get_sync_redis() -> sync_redis.Redis | None:
     return _sync_redis_client
 
 
+def publish_user_job_update(user_id: str, data: dict[str, Any]) -> bool:
+    """Publish a job update to a user's global notification channel."""
+    client = get_sync_redis()
+    if client is None:
+        logger.debug(f"Redis not available, skipping user publish for {user_id}")
+        return False
+
+    channel = f"user:{user_id}:jobs"
+    try:
+        payload = json.dumps(data)
+        client.publish(channel, payload)
+        logger.debug(f"Published to {channel}: {data.get('event') or data.get('type')}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to publish user job update for {user_id}: {e}")
+        return False
+
+
+async def subscribe_to_user_jobs(user_id: str) -> AsyncGenerator[dict[str, Any], None]:
+    """Subscribe to all job updates for a user via Redis."""
+    client = await get_async_redis()
+    if client is None:
+        logger.warning(f"Redis not available, cannot subscribe to user jobs {user_id}")
+        return
+
+    channel = f"user:{user_id}:jobs"
+    pubsub = client.pubsub()
+
+    try:
+        await pubsub.subscribe(channel)
+        logger.debug(f"Subscribed to Redis channel: {channel}")
+
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                try:
+                    data = json.loads(message["data"])
+                    yield data
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid JSON in user Redis message: {e}")
+                    continue
+    except Exception as e:
+        logger.error(f"Error in Redis user subscription for {user_id}: {e}")
+    finally:
+        try:
+            await pubsub.unsubscribe(channel)
+            await pubsub.close()
+            logger.debug(f"Unsubscribed from Redis channel: {channel}")
+        except Exception as e:
+            logger.warning(f"Error cleaning up user Redis subscription: {e}")
+
+
 def publish_job_update(job_id: str, data: dict[str, Any]) -> bool:
     """
     Publish a job progress update to Redis.

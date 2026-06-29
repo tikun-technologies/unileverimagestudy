@@ -93,8 +93,22 @@ class StudyMemberService:
                 )
         except Exception as e:
             logger.error(f"Failed to send invitation email: {e}")
-            # we don't fail the request if email fails, but maybe we should?
-            # for now, just log it.
+
+        if user:
+            try:
+                from app.services.job_notification_service import create_study_invitation_notification
+
+                create_study_invitation_notification(
+                    db,
+                    user_id=user.id,
+                    study_id=study_id,
+                    study_title=study.title or "Untitled Study",
+                    inviter_name=inviter.name or inviter.email,
+                    role=payload.role,
+                    member_id=new_member.id,
+                )
+            except Exception as e:
+                logger.warning("Failed to create study invitation notification: %s", e)
 
         return new_member
 

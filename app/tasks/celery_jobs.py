@@ -431,6 +431,16 @@ def generate_tasks_celery(
                     "message": "Task generation completed successfully",
                 },
             )
+
+            from app.services.job_notification_service import send_task_generation_complete_email_for_job
+
+            send_task_generation_complete_email_for_job(
+                db,
+                user_id=user_id,
+                study_id=study_id,
+                payload=payload,
+            )
+
             logger.info(f"Job {job_id} completed successfully")
         finally:
             try:

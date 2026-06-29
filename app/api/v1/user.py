@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 import logging, traceback
 from sqlalchemy.orm import Session
 from typing import List
@@ -173,6 +173,104 @@ async def get_current_user_profile(current_user: User = Depends(get_current_acti
     Get current user profile information
     """
     return UserResponse.from_orm(current_user)
+
+
+@router.get("/me/active-jobs")
+def get_my_active_jobs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+    include_recent: bool = Query(False, description="Include recently completed/failed jobs"),
+):
+    """
+    Bootstrap endpoint for global job notifications.
+    Returns active task-generation and synthetic-respondent jobs for the current user.
+    """
+    from app.services.job_notification_service import get_user_notifications
+
+    payload = get_user_notifications(
+        db,
+        current_user.id,
+        active_only=not include_recent,
+    )
+    return {"jobs": payload.get("jobs", []), "unread_count": payload.get("unread_count", 0)}
+
+
+@router.get("/me/notifications")
+def get_my_notifications(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+    include_recent: bool = Query(True, description="Include recently completed/failed jobs"),
+):
+    """Full persisted notification list with read state (cross-device sync)."""
+    from app.services.job_notification_service import get_user_notifications
+
+    return get_user_notifications(
+        db,
+        current_user.id,
+        active_only=not include_recent,
+    )
+
+
+@router.post("/me/notifications/{notification_id}/read", status_code=status.HTTP_204_NO_CONTENT)
+def mark_notification_read(
+    notification_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Mark a single notification as read (job or invitation)."""
+    from app.services.job_notification_service import mark_notification_read as mark_read
+
+    mark_read(db, current_user.id, notification_id)
+    return None
+
+
+@router.post("/me/notifications/read-all", status_code=status.HTTP_204_NO_CONTENT)
+def mark_all_notifications_read(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Mark all job notifications as read."""
+    from app.services.job_notification_service import mark_all_notifications_read
+
+    mark_all_notifications_read(db, current_user.id)
+    return None
+
+
+@router.get("/me/dismissed-jobs")
+def get_my_dismissed_jobs(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Return job IDs whose notifications the user has dismissed."""
+    from app.services.job_notification_service import get_dismissed_job_ids
+
+    return {"job_ids": sorted(get_dismissed_job_ids(db, current_user.id))}
+
+
+@router.post("/me/dismissed-jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+def dismiss_job_notification(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Permanently dismiss a job notification for the current user."""
+    from app.services.job_notification_service import dismiss_notification
+
+    dismiss_notification(db, current_user.id, job_id)
+    return None
+
+
+@router.post("/me/notifications/{notification_id}/dismiss", status_code=status.HTTP_204_NO_CONTENT)
+def dismiss_notification_endpoint(
+    notification_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Permanently dismiss any notification (job or invitation)."""
+    from app.services.job_notification_service import dismiss_notification
+
+    dismiss_notification(db, current_user.id, notification_id)
+    return None
 
 
 @router.put("/me", response_model=UserResponse)

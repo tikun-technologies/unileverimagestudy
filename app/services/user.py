@@ -314,9 +314,9 @@ class UserService:
 
     def _link_pending_invitations(self, db_user: User):
         """Link any pending project or study invitations to the new user ID"""
-        from sqlalchemy import update
-        from app.models.project_model import ProjectMember
-        from app.models.study_model import StudyMember
+        from sqlalchemy import update, select
+        from app.models.project_model import Project, ProjectMember
+        from app.models.study_model import Study, StudyMember
         
         try:
             # 1. Link project invitations
@@ -335,6 +335,48 @@ class UserService:
             
             self.db.commit()
             logger.info("Linked pending invitations for user: %s", db_user.email)
+
+            try:
+                from app.services.job_notification_service import (
+                    create_project_invitation_notification,
+                    create_study_invitation_notification,
+                )
+
+                study_members = self.db.scalars(
+                    select(StudyMember).where(StudyMember.user_id == db_user.id)
+                ).all()
+                for member in study_members:
+                    study = self.db.get(Study, member.study_id)
+                    if not study or study.creator_id == db_user.id:
+                        continue
+                    create_study_invitation_notification(
+                        self.db,
+                        user_id=db_user.id,
+                        study_id=member.study_id,
+                        study_title=study.title or "Untitled Study",
+                        inviter_name="A team member",
+                        role=member.role,
+                        member_id=member.id,
+                    )
+
+                project_members = self.db.scalars(
+                    select(ProjectMember).where(ProjectMember.user_id == db_user.id)
+                ).all()
+                for member in project_members:
+                    project = self.db.get(Project, member.project_id)
+                    if not project or project.creator_id == db_user.id:
+                        continue
+                    create_project_invitation_notification(
+                        self.db,
+                        user_id=db_user.id,
+                        project_id=member.project_id,
+                        project_name=project.name or "Untitled Project",
+                        inviter_name="A team member",
+                        role=member.role,
+                        member_id=member.id,
+                    )
+            except Exception:
+                logger.exception("Failed to create invitation notifications for user: %s", db_user.email)
         except Exception:
             logger.exception("Failed to link pending invitations for user: %s", db_user.email)
             self.db.rollback()

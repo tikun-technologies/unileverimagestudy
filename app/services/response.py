@@ -110,7 +110,7 @@ class StudyResponseService:
     def get_response_by_session(self, session_id: str) -> Optional[StudyResponse]:
         """Get a study response by session ID."""
         stmt = select(StudyResponse).where(StudyResponse.session_id == session_id)
-        return self.db.execute(stmt).scalar_one_or_none()
+        return self.db.execute(stmt).scalars().first()
 
     def _optional_classification_question_ids(self, study_id: UUID) -> List[str]:
         """Return post-task classification question ids for a study."""
@@ -145,7 +145,7 @@ class StudyResponseService:
             .where(StudyResponse.session_id == session_id)
             .with_for_update()
         )
-        return self.db.execute(stmt).scalar_one_or_none()
+        return self.db.execute(stmt).scalars().first()
 
     def _completed_task_exists(
         self,
@@ -166,7 +166,7 @@ class StudyResponseService:
     def get_response_by_respondent_id(self, respondent_id: int) -> Optional[StudyResponse]:
         """Get a study response by respondent ID."""
         stmt = select(StudyResponse).where(StudyResponse.respondent_id == respondent_id)
-        return self.db.execute(stmt).scalar_one_or_none()
+        return self.db.execute(stmt).scalars().first()
     
     def get_response_by_respondent_and_study(self, respondent_id: int, study_id: UUID) -> Optional[StudyResponse]:
         """Get a study response by respondent ID and study ID."""
@@ -176,7 +176,7 @@ class StudyResponseService:
                 StudyResponse.study_id == study_id
             )
         )
-        return self.db.execute(stmt).scalar_one_or_none()
+        return self.db.execute(stmt).scalars().first()
     
     def get_respondent_ids_for_study(self, study_id: UUID) -> List[int]:
         """Get all respondent IDs for a specific study."""
@@ -279,7 +279,7 @@ class StudyResponseService:
                 ),
             )
         )
-        return self.db.execute(stmt).scalar_one_or_none()
+        return self.db.execute(stmt).scalars().first()
     
     def get_responses_by_study(self, study_id: UUID, limit: int = 100, offset: int = 0) -> List[StudyResponse]:
         """Get all responses for a study."""
@@ -758,22 +758,27 @@ class StudyResponseService:
         # Add or update classification answers (upsert to prevent duplicates)
         for answer_data in request.answers:
             # Check if an answer already exists for this question
-            existing_answer = self.db.execute(
+            existing_answers = self.db.execute(
                 select(ClassificationAnswer).where(
                     and_(
                         ClassificationAnswer.study_response_id == response.id,
                         ClassificationAnswer.question_id == answer_data.question_id
                     )
                 )
-            ).scalar_one_or_none()
+            ).scalars().all()
             
-            if existing_answer:
+            if existing_answers:
                 # Update existing answer instead of creating duplicate
+                existing_answer = existing_answers[0]
                 existing_answer.answer = answer_data.answer
                 existing_answer.answer_timestamp = answer_data.answer_timestamp
                 existing_answer.time_spent_seconds = answer_data.time_spent_seconds
                 if answer_data.question_text:
                     existing_answer.question_text = answer_data.question_text
+                
+                # Clean up any duplicates that might have been created previously
+                for extra in existing_answers[1:]:
+                    self.db.delete(extra)
             else:
                 # Create new answer
                 answer = ClassificationAnswer(**answer_data.model_dump())
@@ -3186,7 +3191,7 @@ class TaskSessionService:
                 TaskSession.task_id == task_id
             )
         )
-        return self.db.execute(stmt).scalar_one_or_none()
+        return self.db.execute(stmt).scalars().first()
     
     def update_task_session(self, session_id: str, task_id: str, update_data: Dict[str, Any]) -> Optional[TaskSession]:
         """Update a task session."""

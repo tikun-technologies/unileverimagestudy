@@ -94,6 +94,14 @@ class BackgroundTaskService:
             )
             db.add(new_job)
             db.commit()
+            db.refresh(new_job)
+
+            try:
+                from app.services.job_notification_service import upsert_user_job_notification
+                upsert_user_job_notification(db, new_job)
+            except Exception as e:
+                logger.warning(f"Failed to create notification for job {job_id}: {e}")
+
             logger.info(f"Created job {job_id} for study {study_id}")
             return job_id
         except Exception as e:
@@ -187,6 +195,15 @@ class BackgroundTaskService:
                         "progress": 100.0,
                         "message": "Task generation completed successfully"
                     })
+
+                    from app.services.job_notification_service import send_task_generation_complete_email_for_job
+
+                    send_task_generation_complete_email_for_job(
+                        db_fresh,
+                        user_id=job_fresh.user_id,
+                        study_id=job_fresh.study_id,
+                        payload=payload,
+                    )
                 logger.info(f"Job {job_id} completed successfully")
             finally:
                 db_fresh.close()

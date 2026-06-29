@@ -705,3 +705,101 @@ async def websocket_job_progress(
             await websocket.close(code=1011, reason="Internal server error")
         except Exception:
             pass
+
+
+@router.websocket("/user/jobs")
+async def websocket_user_jobs(
+    websocket: WebSocket,
+    token: str = Query(..., description="JWT access token"),
+):
+    """
+    Global WebSocket for all background job notifications (task generation, synthetic AI).
+
+    Connect with: ws://host/api/v1/ws/user/jobs?token={jwt_token}
+
+    On connect sends: {"event": "snapshot", "jobs": [...]}
+    Then streams: {"event": "job_update", "job_id": "...", "progress": ..., ...}
+    """
+    db_auth = next(get_db())
+    user_id_str: str | None = None
+    try:
+        user = await get_user_from_token(token, db_auth)
+        if not user:
+            await websocket.close(code=4001, reason="Invalid or expired token")
+            return
+        user_id_str = str(user.id)
+    finally:
+        db_auth.close()
+
+    from app.services.job_notification_service import get_user_notifications
+
+    db_snapshot = next(get_db())
+    try:
+        payload = get_user_notifications(
+            db_snapshot,
+            UUID(user_id_str),
+            active_only=False,
+        )
+        snapshot = payload.get("jobs") or payload.get("notifications") or []
+        active = [j for j in snapshot if j.get("status") in ("pending", "started", "processing")]
+        recent_terminal = [
+            j for j in snapshot
+            if j.get("status") in ("completed", "failed", "cancelled")
+        ][:10]
+        snapshot = active + recent_terminal
+    finally:
+        db_snapshot.close()
+
+    try:
+        await websocket.accept()
+        logger.info(f"Global job WebSocket connected for user {user_id_str}")
+
+        await websocket.send_json({"event": "snapshot", "jobs": snapshot})
+
+        ping_interval = 30
+        start_time = asyncio.get_event_loop().time()
+        timeout_seconds = _websocket_job_wall_clock_seconds()
+
+        async def ping_task():
+            while True:
+                await asyncio.sleep(ping_interval)
+                try:
+                    await websocket.send_json({"event": "ping"})
+                except Exception:
+                    break
+
+        ping_coro = asyncio.create_task(ping_task())
+
+        try:
+            async for update in job_progress_notifier.subscribe_user_redis(user_id_str):
+                elapsed = asyncio.get_event_loop().time() - start_time
+                if elapsed >= timeout_seconds:
+                    logger.warning(f"Global job WebSocket timeout for user {user_id_str}")
+                    await websocket.send_json({
+                        "event": "error",
+                        "message": "Connection timeout — reconnect to continue receiving updates",
+                    })
+                    break
+
+                event_type = update.get("event") or update.get("type")
+                if event_type == "ping":
+                    continue
+
+                await websocket.send_json(update)
+        except WebSocketDisconnect:
+            logger.info(f"Global job WebSocket disconnected for user {user_id_str}")
+        finally:
+            ping_coro.cancel()
+            try:
+                await ping_coro
+            except asyncio.CancelledError:
+                pass
+
+    except WebSocketDisconnect:
+        logger.info(f"Global job WebSocket disconnected for user {user_id_str}")
+    except Exception as e:
+        logger.error(f"Global job WebSocket error for user {user_id_str}: {e}")
+        try:
+            await websocket.close(code=1011, reason="Internal server error")
+        except Exception:
+            pass
