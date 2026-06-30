@@ -11,6 +11,8 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.formatting.rule import CellIsRule, FormulaRule
 from openpyxl.utils import get_column_letter
 
+from app.services.analysis_settings import DEFAULT_ANALYSIS_SETTINGS, normalize_analysis_settings
+
 class StudyAnalysisService:
     def __init__(self):
         self.rng = np.random.default_rng(123)
@@ -37,11 +39,38 @@ class StudyAnalysisService:
         self.MAX_WIDTH = 45
         self.letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-    def generate_report(self, df: pd.DataFrame, study_data: Dict[str, Any]) -> io.BytesIO:
+    def _resolve_analysis_options(self, analysis_options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return normalize_analysis_settings(analysis_options or DEFAULT_ANALYSIS_SETTINGS)
+
+    def _include_intercept(self, analysis_options: Dict[str, Any]) -> bool:
+        return bool((analysis_options.get("regression") or {}).get("include_intercept", True))
+
+    def _build_y_vector(
+        self,
+        ratings: np.ndarray,
+        mode: str,
+        analysis_options: Dict[str, Any],
+        jitter_seed: Optional[int] = None,
+    ) -> np.ndarray:
+        if mode == "RESPONSE":
+            return np.clip(ratings.astype(float), None, 7.0)
+
+        scoring = analysis_options["top"] if mode == "TOP" else analysis_options["bottom"]
+        hundred = set(scoring.get("hundred") or [])
+        Y = np.array(
+            [100.0 if int(r) in hundred else 0.0 for r in ratings],
+            dtype=float,
+        )
+        rng = self.rng if jitter_seed is None else np.random.default_rng(jitter_seed)
+        Y = Y + rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
+        return Y
+
+    def generate_report(self, df: pd.DataFrame, study_data: Dict[str, Any], analysis_options: Optional[Dict[str, Any]] = None) -> io.BytesIO:
         """
         Generates the Excel report from the DataFrame and Study Data.
         Returns a BytesIO object containing the Excel file.
         """
+        analysis_options = self._resolve_analysis_options(analysis_options)
         # 1. Preprocess Data
         # Handle NA values if not already handled
         # df is passed in, assuming it's already reasonably clean from response service
@@ -145,9 +174,9 @@ class StudyAnalysisService:
                 
         # 4. Run Analysis
         # 4a. Panel-level Regressions
-        coef_table_T = self._run_panel_regressions(df, element_cols, "TOP")
-        coef_table_B = self._run_panel_regressions(df, element_cols, "BOTTOM")
-        coef_table_R = self._run_panel_regressions(df, element_cols, "RESPONSE")
+        coef_table_T = self._run_panel_regressions(df, element_cols, "TOP", analysis_options)
+        coef_table_B = self._run_panel_regressions(df, element_cols, "BOTTOM", analysis_options)
+        coef_table_R = self._run_panel_regressions(df, element_cols, "RESPONSE", analysis_options)
         
         # 4b. Aggregations (Means & Groups)
         # Base Size
@@ -173,9 +202,9 @@ class StudyAnalysisService:
         class_groups_R = self._build_class_groups(coef_table_R, df, element_cols, classification_cols)
         
         # 4c. Pooled Regressions (Intercepts)
-        intercepts_T = self._run_pooled_regression(df, element_cols, "TOP")
-        intercepts_B = self._run_pooled_regression(df, element_cols, "BOTTOM")
-        intercepts_R = self._run_pooled_regression(df, element_cols, "RESPONSE")
+        intercepts_T = self._run_pooled_regression(df, element_cols, "TOP", analysis_options)
+        intercepts_B = self._run_pooled_regression(df, element_cols, "BOTTOM", analysis_options)
+        intercepts_R = self._run_pooled_regression(df, element_cols, "RESPONSE", analysis_options)
         
         coef_threshold_T = intercepts_T.get("threshold")
         coef_threshold_B = intercepts_B.get("threshold")
@@ -284,11 +313,13 @@ class StudyAnalysisService:
         df: pd.DataFrame,
         study_data: Dict[str, Any],
         include_raw_data: bool = True,
+        analysis_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generates the JSON report from the DataFrame and Study Data.
         Returns a dictionary with sheet names as keys and their data as values.
         """
+        analysis_options = self._resolve_analysis_options(analysis_options)
         # 1. Preprocess Data (same as generate_report)
         elements_json = study_data.get("elements", [])
         categories_json = study_data.get("categories", [])
@@ -361,9 +392,9 @@ class StudyAnalysisService:
                 classification_cols.append(q_text)
                 
         # 4. Run Analysis (same as generate_report)
-        coef_table_T = self._run_panel_regressions(df, element_cols, "TOP")
-        coef_table_B = self._run_panel_regressions(df, element_cols, "BOTTOM")
-        coef_table_R = self._run_panel_regressions(df, element_cols, "RESPONSE")
+        coef_table_T = self._run_panel_regressions(df, element_cols, "TOP", analysis_options)
+        coef_table_B = self._run_panel_regressions(df, element_cols, "BOTTOM", analysis_options)
+        coef_table_R = self._run_panel_regressions(df, element_cols, "RESPONSE", analysis_options)
         
         base_size = df[self.PANEL_COL].nunique()
         
@@ -383,9 +414,9 @@ class StudyAnalysisService:
         class_groups_B = self._build_class_groups(coef_table_B, df, element_cols, classification_cols)
         class_groups_R = self._build_class_groups(coef_table_R, df, element_cols, classification_cols)
         
-        intercepts_T = self._run_pooled_regression(df, element_cols, "TOP")
-        intercepts_B = self._run_pooled_regression(df, element_cols, "BOTTOM")
-        intercepts_R = self._run_pooled_regression(df, element_cols, "RESPONSE")
+        intercepts_T = self._run_pooled_regression(df, element_cols, "TOP", analysis_options)
+        intercepts_B = self._run_pooled_regression(df, element_cols, "BOTTOM", analysis_options)
+        intercepts_R = self._run_pooled_regression(df, element_cols, "RESPONSE", analysis_options)
         
         coef_threshold_T = intercepts_T.get("threshold")
         coef_threshold_B = intercepts_B.get("threshold")
@@ -406,7 +437,9 @@ class StudyAnalysisService:
             labels_3_T = np.zeros(n_samples, dtype=int)
         
         # 5. Build JSON structure
-        result = {}
+        result = {
+            "analysis_settings": analysis_options,
+        }
         
         # 5a. Front Page
         result["Front Page"] = {
@@ -600,14 +633,17 @@ class StudyAnalysisService:
         result["(T) Intercepts"] = self._build_intercepts_json(
             intercepts_T["df"], coef_threshold_T,
             intercept=intercepts_T.get("intercept"), t_intercept=intercepts_T.get("t_intercept"),
+            include_intercept=self._include_intercept(analysis_options),
         )
         result["(B) Intercepts"] = self._build_intercepts_json(
             intercepts_B["df"], coef_threshold_B,
             intercept=intercepts_B.get("intercept"), t_intercept=intercepts_B.get("t_intercept"),
+            include_intercept=self._include_intercept(analysis_options),
         )
         result["(R) Intercepts"] = self._build_intercepts_json(
             intercepts_R["df"], coef_threshold_R,
             intercept=intercepts_R.get("intercept"), t_intercept=intercepts_R.get("t_intercept"),
+            include_intercept=self._include_intercept(analysis_options),
         )
         
         return result
@@ -905,6 +941,7 @@ class StudyAnalysisService:
         df: pd.DataFrame,
         filters: Optional[Dict[str, Any]] = None,
         include_per_panelist: bool = False,
+        analysis_options: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run panel regressions (TOP, BOTTOM, RESPONSE) on a filtered subset of the
@@ -928,6 +965,7 @@ class StudyAnalysisService:
             response (coefficient_means per mode), and optionally per_panelist.
         """
         filters = filters or {}
+        analysis_options = self._resolve_analysis_options(analysis_options)
         age_groups = filters.get("age_groups") or []
         genders = filters.get("genders") or []
         classification_filters = filters.get("classification_filters") or {}
@@ -971,9 +1009,9 @@ class StudyAnalysisService:
             )
 
         # Run regressions
-        coef_T = self._run_panel_regressions(df_filtered, element_cols, "TOP")
-        coef_B = self._run_panel_regressions(df_filtered, element_cols, "BOTTOM")
-        coef_R = self._run_panel_regressions(df_filtered, element_cols, "RESPONSE")
+        coef_T = self._run_panel_regressions(df_filtered, element_cols, "TOP", analysis_options)
+        coef_B = self._run_panel_regressions(df_filtered, element_cols, "BOTTOM", analysis_options)
+        coef_R = self._run_panel_regressions(df_filtered, element_cols, "RESPONSE", analysis_options)
 
         means_T = coef_T[element_cols].mean(axis=0)
         means_B = coef_B[element_cols].mean(axis=0)
@@ -998,6 +1036,7 @@ class StudyAnalysisService:
                     "genders": list(genders),
                     "classification_filters": dict(classification_filters),
                 },
+                "analysis_settings": analysis_options,
                 "total_rows_before_filter": rows_before,
                 "total_rows_after_filter": rows_after,
                 "panelists_before_filter": panelists_before,
@@ -1376,8 +1415,9 @@ class StudyAnalysisService:
         
         return result
 
-    def _build_intercepts_json(self, df, threshold, intercept=None, t_intercept=None):
+    def _build_intercepts_json(self, df, threshold, intercept=None, t_intercept=None, include_intercept=True):
         result = {
+            "regression_mode": "with_intercept" if include_intercept else "without_intercept",
             "threshold": float(threshold) if threshold is not None else None,
             "intercept": float(intercept) if intercept is not None else None,
             "t_intercept": float(t_intercept) if t_intercept is not None else None,
@@ -1389,6 +1429,8 @@ class StudyAnalysisService:
                 "element": str(row["element"]),
                 "beta_with_intercept": float(row["beta_with_intercept"]),
                 "t_with_intercept": float(row["t_with_intercept"]),
+                "beta": float(row["beta_with_intercept"]),
+                "t": float(row["t_with_intercept"]),
                 "t_above_2": float(row["t_with_intercept"]) >= 2.0
             }
             result["data"].append(row_data)
@@ -1396,70 +1438,83 @@ class StudyAnalysisService:
         return result
 
     # --- Regression Helpers ---
-    def _run_panel_regressions(self, df: pd.DataFrame, element_cols: List[str], mode: str) -> pd.DataFrame:
+    def _run_panel_regressions(
+        self,
+        df: pd.DataFrame,
+        element_cols: List[str],
+        mode: str,
+        analysis_options: Optional[Dict[str, Any]] = None,
+    ) -> pd.DataFrame:
+        analysis_options = self._resolve_analysis_options(analysis_options)
+        include_intercept = self._include_intercept(analysis_options)
         rows = []
         for pid, g in df.groupby(self.PANEL_COL):
             X = g[element_cols].to_numpy(dtype=float)
             
-            if mode == "TOP":
-                ratings = g[self.RATING_COL].to_numpy()
-                Y = np.where(ratings >= 4, 100.0, 0.0)
-                Y = Y + self.rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
-            elif mode == "BOTTOM":
-                ratings = g[self.RATING_COL].to_numpy()
-                Y = np.where(ratings <= 2, 100.0, 0.0)
-                Y = Y + self.rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
-            else: # RESPONSE
-                # Cap at 7s
+            if mode == "RESPONSE":
                 rt = g[self.RESPONSE_TIME_COL].clip(upper=7.0).to_numpy()
-                Y = rt
+                Y = rt.astype(float)
+            else:
+                ratings = g[self.RATING_COL].to_numpy()
+                Y = self._build_y_vector(ratings, mode, analysis_options)
 
-            # Regress with intercept
             n = X.shape[0]
-            X_design = np.column_stack([np.ones(n), X])
+            if include_intercept:
+                X_design = np.column_stack([np.ones(n), X])
+            else:
+                X_design = X
             beta_full, _, _, _ = np.linalg.lstsq(X_design, Y, rcond=None)
-            intercept = float(beta_full[0])
-            beta = beta_full[1:]
+            intercept = float(beta_full[0]) if include_intercept else None
+            beta = beta_full[1:] if include_intercept else beta_full
 
-            # R2 (with intercept)
+            # R2 (with intercept when enabled)
             Y_hat = X_design @ beta_full
             sse = float(np.sum((Y - Y_hat) ** 2))
             y_mean = float(np.mean(Y))
             sst = float(np.sum((Y - y_mean) ** 2))
             r2 = np.nan if sst == 0 else 1.0 - sse / sst
 
-            row = {"Panelist": pid, f"R2_{mode}": r2, f"Intercept_{mode}": intercept}
+            row = {"Panelist": pid, f"R2_{mode}": r2}
+            if include_intercept:
+                row[f"Intercept_{mode}"] = intercept
             for col_name, b in zip(element_cols, beta):
                 row[col_name] = b
             rows.append(row)
             
         return pd.DataFrame(rows)
 
-    def _run_pooled_regression(self, df: pd.DataFrame, element_cols: List[str], mode: str) -> Dict[str, Any]:
+    def _run_pooled_regression(
+        self,
+        df: pd.DataFrame,
+        element_cols: List[str],
+        mode: str,
+        analysis_options: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        analysis_options = self._resolve_analysis_options(analysis_options)
+        include_intercept = self._include_intercept(analysis_options)
         X_all = df[element_cols].to_numpy(dtype=float)
         
-        if mode == "TOP":
-            ratings_all = df[self.RATING_COL].to_numpy()
-            Y_all = np.where(ratings_all >= 4, 100.0, 0.0)
-            Y_all = Y_all + np.random.default_rng(123).uniform(-0.5, 0.5, size=Y_all.shape) * 1e-5
-        elif mode == "BOTTOM":
-            ratings_all = df[self.RATING_COL].to_numpy()
-            Y_all = np.where(ratings_all <= 2, 100.0, 0.0)
-            Y_all = Y_all + np.random.default_rng(456).uniform(-0.5, 0.5, size=Y_all.shape) * 1e-5
-        else:
+        if mode == "RESPONSE":
             rt_all = df[self.RESPONSE_TIME_COL].clip(upper=7.0).to_numpy()
             Y_all = rt_all
+        else:
+            ratings_all = df[self.RATING_COL].to_numpy()
+            jitter_seed = 123 if mode == "TOP" else 456
+            Y_all = self._build_y_vector(ratings_all, mode, analysis_options, jitter_seed=jitter_seed)
 
         n, p = X_all.shape
-        X_design = np.column_stack([np.ones(n), X_all])
+        if include_intercept:
+            X_design = np.column_stack([np.ones(n), X_all])
+        else:
+            X_design = X_all
         beta_full, _, _, _ = np.linalg.lstsq(X_design, Y_all, rcond=None)
 
-        # Stats (with intercept)
+        # Stats
         Y_hat = X_design @ beta_full
         e = Y_all - Y_hat
         sse = float(np.sum(e ** 2))
         dof = n - X_design.shape[1]
-        sigma2 = sse / dof
+        sigma2 = sse / dof if dof > 0 else 0.0
 
         try:
             if dof <= 0:
@@ -1474,10 +1529,16 @@ class StudyAnalysisService:
         except Exception:
             t_vals = np.zeros_like(beta_full)
 
-        intercept = float(beta_full[0])
-        t_intercept = float(t_vals[0])
-        beta_with = beta_full[1:]
-        t_elements = t_vals[1:]
+        if include_intercept:
+            intercept = float(beta_full[0])
+            t_intercept = float(t_vals[0])
+            beta_with = beta_full[1:]
+            t_elements = t_vals[1:]
+        else:
+            intercept = None
+            t_intercept = None
+            beta_with = beta_full
+            t_elements = t_vals
 
         pooled_df = pd.DataFrame({
             "element": element_cols,
@@ -1485,7 +1546,7 @@ class StudyAnalysisService:
             "t_with_intercept": t_elements,
         })
 
-        # Threshold from intercept-model coefficients
+        # Threshold from pooled model coefficients
         mask = t_elements >= 2.0
         threshold = float(np.min(beta_with[mask])) if np.any(mask) else None
 

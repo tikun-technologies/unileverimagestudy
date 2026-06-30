@@ -33,11 +33,122 @@ from app.schemas.response_schema import (
     ClassificationAnswerOut, ElementInteractionOut, TaskSessionOut, TaskSessionCreate,
     ElementInteractionCreate, CompletedTaskCreate, ClassificationAnswerCreate, StudyResponseCreate,
     StudyFilterPayload,
+    StudyAnalysisSettingsPayload,
 )
 from app.services.response import StudyResponseService, TaskSessionService
 from app.services.analysis import StudyAnalysisService
+from app.services.analysis_settings import (
+    get_study_analysis_settings,
+    save_study_analysis_settings,
+    get_cached_analysis_settings_response,
+    build_analysis_settings_response,
+    get_max_rating_from_study,
+    analysis_settings_cache_key,
+    ANALYSIS_SETTINGS_CACHE_TTL,
+)
+from app.models.study_model import StudyAnalysisSettings
 
 router = APIRouter()
+
+
+def _authorize_study_access(db: Session, study_id: UUID, user_id: UUID) -> Study:
+    from sqlalchemy.orm import defer
+
+    study_obj = (
+        db.query(Study)
+        .options(defer(Study.tasks))
+        .filter(Study.id == study_id)
+        .first()
+    )
+    if not study_obj:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    if study_obj.creator_id == user_id:
+        return study_obj
+
+    member = db.scalar(
+        select(StudyMember).where(
+            StudyMember.study_id == study_id,
+            StudyMember.user_id == user_id,
+        )
+    )
+    if not member:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return study_obj
+
+
+def _build_study_data_dict(study_obj: Study) -> Dict[str, Any]:
+    study_data = {
+        "title": study_obj.title,
+        "study_type": study_obj.study_type,
+        "background": getattr(study_obj, "background_image_url", None) or "",
+        "language": study_obj.language,
+        "launched_at": study_obj.created_at.isoformat() if study_obj.created_at else "",
+        "aspect_ratio": (
+            (study_obj.audience_segmentation or {}).get("aspect_ratio")
+            if isinstance(study_obj.audience_segmentation, dict)
+            else None
+        ),
+        "categories": [],
+        "elements": [],
+        "classification_questions": [],
+    }
+
+    if str(study_obj.study_type) == "layer":
+        sorted_layers = sorted(study_obj.layers, key=lambda x: x.order)
+        for layer in sorted_layers:
+            cat_id = str(layer.layer_id)
+            study_data["categories"].append({
+                "id": cat_id,
+                "name": layer.name,
+                "order": layer.order,
+                "z_index": layer.z_index,
+                "transform": layer.transform or {},
+            })
+            for img in sorted(layer.images, key=lambda x: x.order):
+                study_data["elements"].append({
+                    "id": str(img.image_id),
+                    "name": img.name,
+                    "content": img.url,
+                    "category_id": cat_id,
+                    "category": {
+                        "name": layer.name,
+                        "order": layer.order,
+                        "z_index": layer.z_index,
+                        "transform": layer.transform or {},
+                    },
+                    "z_index": layer.z_index,
+                    "transform": layer.transform or {},
+                    "layer_name": layer.name,
+                    "layer_order": layer.order,
+                    "image_order": img.order,
+                    "alt_text": img.alt_text,
+                })
+    else:
+        for cat in study_obj.categories:
+            study_data["categories"].append({
+                "id": str(cat.id),
+                "name": cat.name,
+                "order": cat.order,
+            })
+            for el in cat.elements:
+                study_data["elements"].append({
+                    "id": str(el.id),
+                    "name": el.name,
+                    "content": el.content,
+                    "category_id": str(cat.id),
+                    "category": {"name": cat.name, "order": cat.order},
+                })
+
+    for q in study_obj.classification_questions:
+        study_data["classification_questions"].append({
+            "question_id": q.question_id,
+            "question_text": q.question_text,
+            "answer_options": q.answer_options,
+            "optional_classification_question": q.optional_classification_question,
+        })
+
+    return study_data
 
 # ---------- Study Participation Endpoints (Public) ----------
 
@@ -1208,9 +1319,10 @@ async def export_study_analysis(
         })
         
     # 3. Generate Report
+    analysis_options = get_study_analysis_settings(db, study_id, study=study_obj)
     analysis_service = StudyAnalysisService()
     try:
-        excel_file = analysis_service.generate_report(df, study_data)
+        excel_file = analysis_service.generate_report(df, study_data, analysis_options=analysis_options)
     except Exception as e:
         print(f"Analysis generation failed: {e}")
         import traceback
@@ -1359,12 +1471,14 @@ async def export_study_analysis_json(
         })
         
     # 3. Generate JSON Report
+    analysis_options = get_study_analysis_settings(db, study_id, study=study_obj)
     analysis_service = StudyAnalysisService()
     try:
         json_report = analysis_service.generate_json_report(
             df,
             study_data,
             include_raw_data=include_raw_data,
+            analysis_options=analysis_options,
         )
     except Exception as e:
         print(f"JSON Analysis generation failed: {e}")
@@ -1411,6 +1525,39 @@ async def export_study_analysis_json(
         return obj
 
     return sanitize_for_json(json_report)
+
+
+@router.get("/study/{study_id}/analysis-settings")
+async def get_study_analysis_settings_endpoint(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Return saved analysis settings for a study, or defaults if none saved."""
+    study_obj = _authorize_study_access(db, study_id, current_user.id)
+    return get_cached_analysis_settings_response(db, study_id, study=study_obj)
+
+
+@router.put("/study/{study_id}/analysis-settings")
+async def save_study_analysis_settings_endpoint(
+    study_id: UUID,
+    payload: StudyAnalysisSettingsPayload,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Save analysis settings for a study (rating mappings + intercept mode)."""
+    study_obj = _authorize_study_access(db, study_id, current_user.id)
+    settings_dict = payload.model_dump()
+    save_study_analysis_settings(
+        db,
+        study_id,
+        settings_dict,
+        current_user.id,
+        study=study_obj,
+    )
+    response = build_analysis_settings_response(db, study_id, study=study_obj)
+    RedisCache.set(analysis_settings_cache_key(study_id), response, ttl_seconds=ANALYSIS_SETTINGS_CACHE_TTL)
+    return response
 
 
 @router.get("/study/{study_id}/optimized-analysis-json")
@@ -1580,6 +1727,7 @@ async def filter_study_regression_report(
         })
 
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    analysis_options = get_study_analysis_settings(db, study_id, study=study_obj)
 
     analysis_service = StudyAnalysisService()
     try:
@@ -1588,6 +1736,7 @@ async def filter_study_regression_report(
             df=df,
             filters=filters_dict,
             include_per_panelist=payload.include_per_panelist,
+            analysis_options=analysis_options,
         )
     except Exception as e:
         import traceback

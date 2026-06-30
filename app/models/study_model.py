@@ -83,6 +83,7 @@ class Study(Base):
     study_responses = relationship("StudyResponse", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     members = relationship("StudyMember", back_populates="study", cascade="all, delete-orphan", lazy="selectin")
     filter_history = relationship("StudyFilterHistory", back_populates="study", cascade="all, delete-orphan", lazy="noload")
+    analysis_settings = relationship("StudyAnalysisSettings", back_populates="study", cascade="all, delete-orphan", lazy="noload", uselist=False)
     saved_designs = relationship("StudySavedDesign", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     task_assignments = relationship("StudyTaskAssignment", back_populates="study", cascade="all, delete-orphan", lazy="noload")
 
@@ -288,6 +289,28 @@ class StudyTaskAssignment(Base):
         UniqueConstraint('study_id', 'respondent_id', 'task_index', name='uq_study_task_assignment'),
         Index('idx_sta_study_respondent', 'study_id', 'respondent_id'),
         Index('idx_sta_study', 'study_id'),
+    )
+
+
+class StudyAnalysisSettings(Base):
+    """
+    Active analysis configuration for a study (rating mappings + intercept mode).
+    One row per study; shared by all authorized users on analytics/export.
+    """
+    __tablename__ = "study_analysis_settings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    study_id = Column(UUID(as_uuid=True), ForeignKey('studies.id', ondelete='CASCADE'), nullable=False, unique=True, index=True)
+    settings = Column(JSONB, nullable=False, server_default='{}')
+    updated_by_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    study = relationship("Study", back_populates="analysis_settings", lazy="noload")
+    updated_by = relationship("User", lazy="noload")
+
+    __table_args__ = (
+        UniqueConstraint('study_id', name='uq_study_analysis_settings_study_id'),
     )
 
 

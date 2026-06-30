@@ -516,6 +516,31 @@ class StudyFilterPayload(BaseModel):
     )
 
 
+class RatingScoringGroup(BaseModel):
+    """Ratings mapped to 100 or 0 for top-down / bottom-up regressions."""
+    hundred: List[int] = Field(default_factory=list, description="Ratings coded as 100")
+    zero: List[int] = Field(default_factory=list, description="Ratings coded as 0")
+
+
+class AnalysisRegressionSettings(BaseModel):
+    include_intercept: bool = Field(default=True, description="If false, regress without intercept")
+
+
+class StudyAnalysisSettingsPayload(BaseModel):
+    """Rating mappings and intercept mode for study analysis."""
+    top: RatingScoringGroup = Field(default_factory=lambda: RatingScoringGroup(hundred=[4, 5], zero=[1, 2, 3]))
+    bottom: RatingScoringGroup = Field(default_factory=lambda: RatingScoringGroup(hundred=[1, 2], zero=[3, 4, 5]))
+    regression: AnalysisRegressionSettings = Field(default_factory=AnalysisRegressionSettings)
+
+
+class StudyAnalysisSettingsResponse(BaseModel):
+    study_id: UUID
+    settings: StudyAnalysisSettingsPayload
+    max_rating: int = 5
+    is_default: bool = False
+    updated_at: Optional[str] = None
+
+
 # Rebuild models to resolve forward references
 def rebuild_models():
     """Rebuild all models to resolve forward references"""
