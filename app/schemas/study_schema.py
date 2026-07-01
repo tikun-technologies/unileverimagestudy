@@ -360,7 +360,7 @@ class StudyPublicMinimal(BaseModel):
     model_config = ConfigDict(from_attributes=False)
 
 class StudyBasicDetails(BaseModel):
-    """Basic study details for authenticated users - includes core study info without heavy data"""
+    """Basic study details - core study info, classification questions, and element metadata."""
     id: UUID
     title: str
     status: StudyStatus
@@ -374,6 +374,8 @@ class StudyBasicDetails(BaseModel):
     study_config: Optional[Dict[str, Any]] = None  # For additional configuration
     classification_questions: Optional[List[StudyClassificationQuestionOut]] = None
     element_count: Optional[int] = None  # Number of images (grid/layer) or statements (text)
+    layers: Optional[List[Dict[str, Any]]] = None  # Layer studies: layer name + element/image metadata
+    categories: Optional[List[Dict[str, Any]]] = None  # Grid/text/hybrid: category + element metadata
     toggle_shuffle: bool = False
     product_keys: Optional[List[ProductKey]] = None
     product_id: Optional[str] = None

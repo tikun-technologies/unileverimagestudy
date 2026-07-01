@@ -91,6 +91,13 @@ class Settings(BaseSettings):
             "redis_url",
         ),
     )
+    REDIS_MAX_CONNECTIONS: int = Field(
+        default=50,
+        validation_alias=AliasChoices(
+            "REDIS_MAX_CONNECTIONS",
+            "redis_max_connections",
+        ),
+    )
 
     # Celery: RabbitMQ (AMQP) broker (same URL for dev and prod is fine until you split instances)
     CELERY_BROKER_URL: str | None = None

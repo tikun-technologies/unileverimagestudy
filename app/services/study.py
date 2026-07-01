@@ -98,6 +98,180 @@ def _classification_question_config(question: Any) -> Dict[str, Any]:
     return config
 
 
+def _serialize_classification_question_for_result(question: Any) -> Dict[str, Any]:
+    """Lightweight classification-question payload for task-generation result responses."""
+    is_required_raw = getattr(question, "is_required", True)
+    is_required = (
+        True
+        if (isinstance(is_required_raw, str) and is_required_raw.upper() == "Y")
+        or bool(is_required_raw)
+        else False
+    )
+    return {
+        "id": str(getattr(question, "id", "")),
+        "question_id": question.question_id,
+        "question_text": question.question_text,
+        "question_type": question.question_type,
+        "is_required": is_required,
+        "order": question.order,
+        "answer_options": question.answer_options,
+        "optional_classification_question": bool(question.optional_classification_question),
+        "config": question.config,
+    }
+
+
+def _serialize_layer_image_for_result(image: Any) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "image_id": image.image_id,
+        "name": image.name,
+        "url": image.url,
+        "alt_text": image.alt_text,
+        "order": image.order,
+    }
+    if getattr(image, "config", None):
+        payload["config"] = image.config
+        text_content = (image.config or {}).get("text") or (image.config or {}).get("content")
+        if text_content:
+            payload["text_content"] = text_content
+    return payload
+
+
+def _serialize_grid_element_for_result(element: Any) -> Dict[str, Any]:
+    element_type = str(getattr(element, "element_type", "image"))
+    content = element.content
+    payload: Dict[str, Any] = {
+        "element_id": str(element.element_id),
+        "name": element.name,
+        "element_type": element_type,
+        "content": content,
+        "alt_text": element.alt_text,
+        "description": element.description,
+    }
+    if element_type == "image":
+        payload["url"] = content
+    else:
+        payload["text_content"] = content
+    return payload
+
+
+def build_study_elements_payload(study: Study) -> Dict[str, List[Dict[str, Any]]]:
+    """Serialize layer/category element metadata from an ORM study."""
+    default_transform = {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}
+    study_type = str(study.study_type)
+
+    layers: List[Dict[str, Any]] = []
+    if study_type == "layer":
+        for layer in sorted(study.layers or [], key=lambda row: row.order):
+            serialized_elements = [
+                _serialize_layer_image_for_result(image)
+                for image in sorted(layer.images or [], key=lambda row: row.order)
+            ]
+            layers.append({
+                "layer_id": layer.layer_id,
+                "name": layer.name,
+                "description": layer.description,
+                "layer_type": str(getattr(layer, "layer_type", "image")),
+                "z_index": layer.z_index,
+                "order": layer.order,
+                "transform": layer.transform or default_transform,
+                "elements": serialized_elements,
+                "images": serialized_elements,
+            })
+
+    categories: List[Dict[str, Any]] = []
+    if study_type in ("grid", "text", "hybrid"):
+        elements_by_category_id: Dict[Any, List[Any]] = {}
+        for element in study.elements or []:
+            elements_by_category_id.setdefault(element.category_id, []).append(element)
+
+        for category in sorted(study.categories or [], key=lambda row: row.order):
+            category_elements = elements_by_category_id.get(category.id, [])
+            categories.append({
+                "category_id": str(category.category_id),
+                "name": category.name,
+                "order": category.order,
+                "phase_type": str(category.phase_type) if category.phase_type else None,
+                "elements": [
+                    _serialize_grid_element_for_result(element)
+                    for element in category_elements
+                ],
+            })
+
+    return {"layers": layers, "categories": categories}
+
+
+def count_study_elements_from_payload(
+    study_type: str,
+    layers: List[Dict[str, Any]],
+    categories: List[Dict[str, Any]],
+) -> int:
+    if str(study_type) == "layer":
+        return sum(len(layer.get("elements") or []) for layer in layers)
+    return sum(len(category.get("elements") or []) for category in categories)
+
+
+def load_study_elements_payload(
+    db: Session,
+    study_id: UUID,
+    study_type: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Load and serialize study elements with one targeted query."""
+    normalized_type = str(study_type)
+    if normalized_type == "layer":
+        stmt = (
+            select(Study)
+            .options(selectinload(Study.layers).selectinload(StudyLayer.images))
+            .where(Study.id == study_id)
+        )
+    elif normalized_type in ("grid", "text", "hybrid"):
+        stmt = (
+            select(Study)
+            .options(
+                selectinload(Study.categories),
+                selectinload(Study.elements),
+            )
+            .where(Study.id == study_id)
+        )
+    else:
+        return {"layers": [], "categories": []}
+
+    study = db.scalars(stmt).first()
+    if not study:
+        return {"layers": [], "categories": []}
+    return build_study_elements_payload(study)
+
+
+def build_task_generation_result_config(study: Study) -> Dict[str, Any]:
+    """
+    Build study element/category/layer metadata for task-generation result responses.
+
+    Uses relations already loaded on ``study`` (categories, elements, layers, images,
+    classification_questions) so callers avoid extra DB round-trips.
+    """
+    elements_payload = build_study_elements_payload(study)
+
+    all_questions = sorted(study.classification_questions or [], key=lambda row: (row.order, row.question_id))
+    if getattr(study, "status", None) == "draft":
+        all_questions = [q for q in all_questions if q.question_id != FRAGRANCE_QUESTION_ID]
+
+    serialized_questions = [_serialize_classification_question_for_result(q) for q in all_questions]
+    post_classification_questions = [
+        q for q in serialized_questions if q.get("optional_classification_question")
+    ]
+    classification_questions = [
+        q for q in serialized_questions if not q.get("optional_classification_question")
+    ]
+
+    return {
+        "study_type": str(study.study_type),
+        "phase_order": study.phase_order,
+        "layers": elements_payload["layers"],
+        "categories": elements_payload["categories"],
+        "classification_questions": classification_questions,
+        "post_classification_questions": post_classification_questions,
+    }
+
+
 def _design_constraints_payload(constraints: Optional[List[Any]]) -> Optional[List[Dict[str, Any]]]:
     if constraints is None:
         return None
@@ -2163,15 +2337,16 @@ def delete_design_constraint(
 def get_study_basic_details(db: Session, study_id: UUID, owner_id: UUID) -> Optional[Dict[str, Any]]:
     """
     Get basic study details for authenticated users.
-    Returns core study information without heavy data like tasks, elements, or layers.
+    Returns core study information with element metadata but without tasks.
     """
-    from sqlalchemy import select
-    from sqlalchemy.orm import selectinload
-    
-    # Optimized query to get basic study details with classification questions
     study = db.scalars(
         select(Study)
-        .options(selectinload(Study.classification_questions))
+        .options(
+            selectinload(Study.classification_questions),
+            selectinload(Study.layers).selectinload(StudyLayer.images),
+            selectinload(Study.categories),
+            selectinload(Study.elements),
+        )
         .where(Study.id == study_id, Study.creator_id == owner_id)
     ).first()
     
@@ -2182,6 +2357,8 @@ def get_study_basic_details(db: Session, study_id: UUID, owner_id: UUID) -> Opti
     study_config = {}
     if study.audience_segmentation:
         study_config.update(study.audience_segmentation)
+
+    elements_payload = build_study_elements_payload(study)
     
     return {
         "id": study.id,
@@ -2195,6 +2372,13 @@ def get_study_basic_details(db: Session, study_id: UUID, owner_id: UUID) -> Opti
         "rating_scale": study.rating_scale,
         "study_config": study_config,
         "classification_questions": study.classification_questions,
+        "element_count": count_study_elements_from_payload(
+            str(study.study_type),
+            elements_payload["layers"],
+            elements_payload["categories"],
+        ),
+        "layers": elements_payload["layers"],
+        "categories": elements_payload["categories"],
         "toggle_shuffle": study.toggle_shuffle,
         "design_constraints": study.design_constraints,
     }
@@ -2203,8 +2387,8 @@ def get_study_basic_details(db: Session, study_id: UUID, owner_id: UUID) -> Opti
 def get_study_basic_details_public(db: Session, study_id: UUID) -> Optional[Dict[str, Any]]:
     """
     Get basic study details for public access (no authentication required).
-    Ultra-fast query with minimal data loading using raw SQL for maximum speed.
-    Includes element_count: number of images (grid/layer) or statements (text).
+    Uses a fast raw SQL query for core study fields, then one targeted ORM query
+    for element metadata (layers or categories/elements).
     """
     from sqlalchemy import text
     
@@ -2254,30 +2438,11 @@ def get_study_basic_details_public(db: Session, study_id: UUID) -> Optional[Dict
     if result.status == "draft":
         classification_questions = [q for q in classification_questions if q.get("question_id") != FRAGRANCE_QUESTION_ID]
 
-    # Count elements based on study type
-    element_count = 0
     study_type = result.study_type
-    
-    if study_type == 'grid' or study_type == 'text':
-        # For grid and text studies, count elements (images for grid, statements for text)
-        element_count_query = text("""
-            SELECT COUNT(*) as count
-            FROM study_elements
-            WHERE study_id = :study_id
-        """)
-        count_result = db.execute(element_count_query, {"study_id": study_id}).first()
-        element_count = count_result.count if count_result else 0
-        
-    elif study_type == 'layer':
-        # For layer studies, count total images across all layers
-        layer_image_count_query = text("""
-            SELECT COUNT(li.id) as count
-            FROM layer_images li
-            INNER JOIN study_layers sl ON li.layer_id = sl.id
-            WHERE sl.study_id = :study_id
-        """)
-        count_result = db.execute(layer_image_count_query, {"study_id": study_id}).first()
-        element_count = count_result.count if count_result else 0
+    elements_payload = load_study_elements_payload(db, study_id, study_type)
+    layers = elements_payload["layers"]
+    categories = elements_payload["categories"]
+    element_count = count_study_elements_from_payload(study_type, layers, categories)
     
     out = {
         "id": result.id,
@@ -2293,6 +2458,8 @@ def get_study_basic_details_public(db: Session, study_id: UUID) -> Optional[Dict
         "study_config": study_config,
         "classification_questions": classification_questions,
         "element_count": element_count,
+        "layers": layers,
+        "categories": categories,
         "toggle_shuffle": result.toggle_shuffle,
         "design_constraints": result.design_constraints,
     }

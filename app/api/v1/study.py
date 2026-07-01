@@ -833,6 +833,7 @@ def get_study_basic_details_endpoint(
     - Rating scale configuration
     - Study config (audience segmentation)
     - Classification questions
+    - Element metadata (layers for layer studies, categories/elements for grid/text/hybrid)
     """
     cache_key = f"study_config:basic:{study_id}"
     cached_data = RedisCache.get(cache_key)
@@ -2232,32 +2233,8 @@ def get_task_generation_result(
     
     db.commit()
 
-    # Prepare lightweight layer metadata including transform
-    layers = []
-    try:
-        for L in (study.layers or []):
-            default_transform = {"x": 0.0, "y": 0.0, "width": 100.0, "height": 100.0}
-            layers.append({
-                "layer_id": L.layer_id,
-                "name": L.name,
-                "description": L.description,
-                "z_index": L.z_index,
-                "order": L.order,
-                "transform": L.transform or default_transform,
-                "images": [
-                    {
-                        "image_id": I.image_id,
-                        "name": I.name,
-                        "url": I.url,
-                        "alt_text": I.alt_text,
-                        "order": I.order,
-                    }
-                    for I in (L.images or [])
-                ],
-            })
-    except Exception:
-        # If any unexpected serialization issue occurs, fall back without layers
-        layers = []
+    study_config = study_service.build_task_generation_result_config(study)
+    layers = study_config.get("layers") or []
 
     # Load tasks using TaskService
     from app.services.task_service import TaskService
@@ -2293,11 +2270,16 @@ def get_task_generation_result(
         "job_id": job.job_id,
         "study_id": job.study_id,
         "status": job.status.value,
+        "study_type": study_config.get("study_type"),
+        "phase_order": study_config.get("phase_order"),
         "tasks": enriched_tasks,
         "metadata": {
             "total_respondents": len([k for k in enriched_tasks if str(k).isdigit()]) if isinstance(enriched_tasks, dict) else 0,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "message": "Task generation completed successfully"
         },
-        "layers": layers
+        "layers": layers,
+        "categories": study_config.get("categories") or [],
+        "classification_questions": study_config.get("classification_questions") or [],
+        "post_classification_questions": study_config.get("post_classification_questions") or [],
     }

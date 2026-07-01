@@ -34,13 +34,17 @@ async def get_async_redis() -> aioredis.Redis | None:
     
     if _async_redis_pool is None:
         try:
+            max_connections = max(1, settings.REDIS_MAX_CONNECTIONS)
             _async_redis_pool = aioredis.ConnectionPool.from_url(
                 redis_url,
                 decode_responses=True,
-                max_connections=10,
+                max_connections=max_connections,
                 retry_on_timeout=True,
             )
-            logger.info("Async Redis connection pool initialized")
+            logger.info(
+                "Async Redis connection pool initialized with max_connections=%s",
+                max_connections,
+            )
         except Exception as e:
             logger.error(f"Failed to create async Redis pool: {e}")
             return None
