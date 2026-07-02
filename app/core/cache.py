@@ -103,3 +103,5 @@ def invalidate_study_cache(study_id: UUID | str) -> None:
     
     # Clear analytics caches
     RedisCache.delete(f"study_analytics:{study_id_str}")
+    # Drop any legacy optimized-analysis cache keys from older deployments
+    RedisCache.delete_pattern(f"optimized_analysis:{study_id_str}:*")

@@ -65,6 +65,12 @@ class User(Base):
         cascade="all, delete-orphan",
         lazy="noload",
     )
+    active_filters = relationship(
+        "StudyActiveFilter",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="noload",
+    )
     saved_designs = relationship(
         "StudySavedDesign",
         back_populates="created_by",

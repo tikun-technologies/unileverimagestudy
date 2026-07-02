@@ -495,6 +495,47 @@ class StudyFilterCriteria(BaseModel):
     )
 
 
+class ActiveFilterPayload(BaseModel):
+    """Request body for POST /study/{study_id}/active-filter."""
+    filters: Optional[StudyFilterCriteria] = Field(
+        None,
+        description="Filter criteria to persist as the user's active analytics filter.",
+    )
+
+
+class ActiveFilterResponse(BaseModel):
+    """Saved active filter for a user on a study."""
+    study_id: UUID
+    filters: Optional[StudyFilterCriteria] = None
+    has_active_filter: bool = False
+    updated_at: Optional[str] = None
+
+
+class AnalyticsSessionResponse(BaseModel):
+    """Bootstrap payload for the analytics page (active filter + cached analysis)."""
+    study_id: UUID
+    active_filters: Optional[StudyFilterCriteria] = None
+    has_active_filter: bool = False
+    analysis: Dict[str, Any] = Field(default_factory=dict)
+
+
+class OptimizedAnalysisPayload(BaseModel):
+    """Request body for POST /study/{study_id}/optimized-analysis-json."""
+    filters: Optional[StudyFilterCriteria] = Field(
+        None,
+        description="Optional filter criteria. When set, the full optimized analysis JSON is computed on the filtered cohort only.",
+    )
+    save_to_history: bool = Field(
+        default=True,
+        description="If true and filters are applied, save this filter selection to the user's filter history.",
+    )
+    name: Optional[str] = Field(
+        None,
+        max_length=255,
+        description="Optional label when saving filter history.",
+    )
+
+
 class StudyFilterPayload(BaseModel):
     """Request body for POST /study/{study_id}/filter (filtered regression report)."""
     filters: Optional[StudyFilterCriteria] = Field(

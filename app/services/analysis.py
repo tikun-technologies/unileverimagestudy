@@ -314,12 +314,48 @@ class StudyAnalysisService:
         study_data: Dict[str, Any],
         include_raw_data: bool = True,
         analysis_options: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generates the JSON report from the DataFrame and Study Data.
         Returns a dictionary with sheet names as keys and their data as values.
+
+        When ``filters`` is provided and non-empty, panelists are subset first via
+        ``_filter_df_by_filters`` and all sections (dashboard_summary, Overall,
+        Age, Gender, Mindsets, Classification, etc.) are computed on that cohort only.
         """
         analysis_options = self._resolve_analysis_options(analysis_options)
+        normalized_filters = self._normalize_filters_dict(filters)
+        filters_active = self._filters_are_active(normalized_filters)
+
+        rows_before = int(len(df))
+        panelists_before = int(df[self.PANEL_COL].nunique()) if self.PANEL_COL in df.columns and not df.empty else 0
+
+        if filters_active:
+            df = self._filter_df_by_filters(
+                df,
+                age_groups=normalized_filters.get("age_groups"),
+                genders=normalized_filters.get("genders"),
+                classification_filters=normalized_filters.get("classification_filters"),
+            )
+            df = df.sort_values([self.PANEL_COL, self.TASK_COL]).reset_index(drop=True) if not df.empty else df
+
+        rows_after = int(len(df))
+        panelists_after = int(df[self.PANEL_COL].nunique()) if self.PANEL_COL in df.columns and not df.empty else 0
+
+        if filters_active and df.empty:
+            return self._build_empty_filtered_json_report(
+                study_data=study_data,
+                filters_applied=normalized_filters,
+                filter_meta={
+                    "total_rows_before_filter": rows_before,
+                    "total_rows_after_filter": 0,
+                    "panelists_before_filter": panelists_before,
+                    "panelists_after_filter": 0,
+                },
+                include_raw_data=include_raw_data,
+                analysis_options=analysis_options,
+            )
         # 1. Preprocess Data (same as generate_report)
         elements_json = study_data.get("elements", [])
         categories_json = study_data.get("categories", [])
@@ -645,8 +681,352 @@ class StudyAnalysisService:
             intercept=intercepts_R.get("intercept"), t_intercept=intercepts_R.get("t_intercept"),
             include_intercept=self._include_intercept(analysis_options),
         )
+
+        if filters_active:
+            self._apply_filter_segment_masks(result, normalized_filters, study_data)
+            result["filters_applied"] = normalized_filters
+            result["filter_meta"] = {
+                "total_rows_before_filter": rows_before,
+                "total_rows_after_filter": rows_after,
+                "panelists_before_filter": panelists_before,
+                "panelists_after_filter": panelists_after,
+            }
         
         return result
+
+    def _normalize_filter_age_groups(self, age_groups: Optional[List[str]]) -> List[str]:
+        if not age_groups:
+            return []
+        alias = {"13-18": "13-17"}
+        return [alias.get(g, g) for g in age_groups]
+
+    def _normalize_filters_dict(self, filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not filters:
+            return {}
+        out: Dict[str, Any] = {}
+        if filters.get("age_groups"):
+            out["age_groups"] = self._normalize_filter_age_groups(list(filters["age_groups"]))
+        if filters.get("genders"):
+            out["genders"] = [str(g) for g in filters["genders"]]
+        if filters.get("classification_filters"):
+            out["classification_filters"] = {
+                str(k): [str(v) for v in vals]
+                for k, vals in filters["classification_filters"].items()
+                if vals
+            }
+        return out
+
+    def _filters_are_active(self, filters: Dict[str, Any]) -> bool:
+        if not filters:
+            return False
+        if filters.get("age_groups") or filters.get("genders"):
+            return True
+        class_f = filters.get("classification_filters") or {}
+        return any(vals for vals in class_f.values())
+
+    def _build_information_block(self, study_data: Dict[str, Any]) -> Dict[str, Any]:
+        info_block = {
+            "Study Title": study_data.get("title", ""),
+            "Study Type": study_data.get("study_type", ""),
+            "Study Background": study_data.get("background", ""),
+            "Aspect Ratio": study_data.get("aspect_ratio"),
+            "Categories": [],
+        }
+        categories = study_data.get("categories", [])
+        elements = study_data.get("elements", [])
+        for cat in categories:
+            cat_name = cat.get("name", "")
+            cat_id = cat.get("id")
+            cat_info: Dict[str, Any] = {"name": cat_name, "elements": []}
+            if cat.get("id") is not None:
+                cat_info["id"] = cat.get("id")
+                if study_data.get("study_type") == "layer":
+                    cat_info["layer_id"] = cat.get("id")
+            if cat.get("z_index") is not None:
+                cat_info["z_index"] = cat.get("z_index")
+            if cat.get("transform") is not None:
+                cat_info["transform"] = cat.get("transform")
+            if cat.get("order") is not None:
+                cat_info["order"] = cat.get("order")
+            c_elements = [e for e in elements if e.get("category_id") == cat_id]
+            for el in c_elements:
+                element_info: Dict[str, Any] = {
+                    "name": el.get("name", ""),
+                    "content": el.get("content", ""),
+                }
+                if el.get("id") is not None:
+                    element_info["id"] = el.get("id")
+                    if study_data.get("study_type") == "layer":
+                        element_info["image_id"] = el.get("id")
+                if el.get("category_id") is not None:
+                    element_info["category_id"] = el.get("category_id")
+                    if study_data.get("study_type") == "layer":
+                        element_info["layer_id"] = el.get("category_id")
+                for key in (
+                    "z_index", "transform", "layer_name", "layer_order", "image_order", "alt_text",
+                ):
+                    if el.get(key) is not None:
+                        element_info[key] = el.get(key)
+                cat_info["elements"].append(element_info)
+            info_block["Categories"].append(cat_info)
+        return info_block
+
+    def _build_empty_filtered_json_report(
+        self,
+        study_data: Dict[str, Any],
+        filters_applied: Dict[str, Any],
+        filter_meta: Dict[str, Any],
+        include_raw_data: bool,
+        analysis_options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        categories = study_data.get("categories", [])
+        info_block = self._build_information_block(study_data)
+        empty_segment = {"base_size": 0, "threshold": None, "segments": {}, "categories": []}
+        empty_class = {"threshold": None, "questions": [], "categories": []}
+        empty_mindset = {
+            "base_size": 0,
+            "threshold": None,
+            "groups": {"Total": {"base_size": 0}},
+            "categories": [],
+        }
+        empty_overall = {"base_size": 0, "threshold": None, "categories": []}
+        empty_intercepts = {
+            "regression_mode": "with_intercept",
+            "threshold": None,
+            "intercept": None,
+            "t_intercept": None,
+            "data": [],
+        }
+        result: Dict[str, Any] = {
+            "analysis_settings": analysis_options,
+            "filters_applied": filters_applied,
+            "filter_meta": {**filter_meta, "error": "No respondents match the applied filters."},
+            "Front Page": {
+                "Title": study_data.get("title", ""),
+                "Background": study_data.get("background", ""),
+                "Language": study_data.get("language", ""),
+                "Launched At": study_data.get("launched_at", ""),
+                "Aspect Ratio": study_data.get("aspect_ratio"),
+            },
+            "Information Block": info_block,
+            "dashboard_summary": self._build_dashboard_summary(pd.DataFrame(), categories),
+            "(T) Overall": empty_overall,
+            "(B) Overall": empty_overall,
+            "(R) Overall": empty_overall,
+            "(T) Mindsets": empty_mindset,
+            "(B) Mindsets": empty_mindset,
+            "(R) Mindsets": empty_mindset,
+            "(T) Gender": empty_segment,
+            "(B) Gender": empty_segment,
+            "(R) Gender": empty_segment,
+            "(T) Age": empty_segment,
+            "(B) Age": empty_segment,
+            "(R) Age": empty_segment,
+            "(T) Classification Questions": empty_class,
+            "(B) Classification Questions": empty_class,
+            "(R) Classification Questions": empty_class,
+            "(T) Combined": {"base_size": 0, "threshold": None, "segments": {}, "categories": []},
+            "(B) Combined": {"base_size": 0, "threshold": None, "segments": {}, "categories": []},
+            "(R) Combined": {"base_size": 0, "threshold": None, "segments": {}, "categories": []},
+            "(T) Intercepts": empty_intercepts,
+            "(B) Intercepts": empty_intercepts,
+            "(R) Intercepts": empty_intercepts,
+        }
+        if include_raw_data:
+            result["RawData"] = []
+        self._apply_filter_segment_masks(result, filters_applied, study_data)
+        return result
+
+    def _zero_unselected_segment_section(
+        self,
+        section: Optional[Dict[str, Any]],
+        all_segment_keys: List[str],
+        selected_keys: List[str],
+        round_vals: bool,
+    ) -> None:
+        if not section or not selected_keys:
+            return
+        selected_set = set(selected_keys)
+        segments = section.setdefault("segments", {})
+        for key in all_segment_keys:
+            if key not in selected_set:
+                segments[key] = {"base_size": 0}
+            elif key not in segments:
+                segments[key] = {"base_size": 0}
+
+        zero_val = 0
+        for cat in section.get("categories") or []:
+            for el in cat.get("elements") or []:
+                values = el.setdefault("values", {})
+                above = el.setdefault("above_threshold", {})
+                for key in all_segment_keys:
+                    if key not in selected_set:
+                        values[key] = zero_val
+                        above[key] = False
+
+    def _zero_classification_element_value(
+        self, values: Dict[str, Any], key: str, zero_val: int = 0
+    ) -> None:
+        if key not in values:
+            return
+        if isinstance(values.get(key), dict):
+            values[key] = {"value": zero_val, "above_threshold": False}
+        else:
+            values[key] = zero_val
+
+    def _mask_classification_section(
+        self,
+        section: Optional[Dict[str, Any]],
+        classification_filters: Dict[str, List[str]],
+        round_vals: bool,
+    ) -> None:
+        """
+        When classification_filters is set, only filtered question(s) and their
+        selected answer option(s) keep data. All other questions and options are zeroed.
+        """
+        if not section or not classification_filters:
+            return
+
+        filtered_questions = set(classification_filters.keys())
+        zero_val = 0
+
+        for q_data in section.get("questions") or []:
+            q_text = q_data.get("question_text")
+            if not q_text:
+                continue
+
+            segments = q_data.setdefault("segments", {})
+            key_prefix = f"{q_text}::"
+
+            if q_text not in filtered_questions:
+                for ans in list(segments.keys()):
+                    segments[ans] = {"base_size": 0}
+                for cat in section.get("categories") or []:
+                    for el in cat.get("elements") or []:
+                        values = el.get("values") or {}
+                        for key in list(values.keys()):
+                            if key.startswith(key_prefix):
+                                self._zero_classification_element_value(values, key, zero_val)
+                continue
+
+            allowed = set(classification_filters[q_text])
+            for ans in list(segments.keys()):
+                if ans not in allowed:
+                    segments[ans] = {"base_size": 0}
+            for ans in allowed:
+                if ans not in segments:
+                    segments[ans] = {"base_size": 0}
+
+            for cat in section.get("categories") or []:
+                for el in cat.get("elements") or []:
+                    values = el.setdefault("values", {})
+                    for ans in list(segments.keys()):
+                        key = f"{q_text}::{ans}"
+                        if ans not in allowed:
+                            self._zero_classification_element_value(values, key, zero_val)
+
+    def _mask_combined_classification_section(
+        self,
+        section: Optional[Dict[str, Any]],
+        classification_filters: Dict[str, List[str]],
+    ) -> None:
+        """Zero classification segments in Combined sheets except filtered Q/options."""
+        if not section or not classification_filters:
+            return
+
+        filtered_questions = set(classification_filters.keys())
+        class_block = (section.get("segments") or {}).get("Classification") or {}
+
+        for q_text, q_info in class_block.items():
+            if not isinstance(q_info, dict):
+                continue
+            answers = q_info.setdefault("answers", {})
+            if q_text not in filtered_questions:
+                for ans in list(answers.keys()):
+                    answers[ans] = {"base_size": 0}
+            else:
+                allowed = set(classification_filters[q_text])
+                for ans in list(answers.keys()):
+                    if ans not in allowed:
+                        answers[ans] = {"base_size": 0}
+                for ans in allowed:
+                    if ans not in answers:
+                        answers[ans] = {"base_size": 0}
+
+        for cat in section.get("categories") or []:
+            for el in cat.get("elements") or []:
+                values = el.get("values") or {}
+                above = el.setdefault("above_threshold", {})
+                for key in list(values.keys()):
+                    if not key.startswith("Classification::"):
+                        continue
+                    parts = key.split("::", 2)
+                    if len(parts) != 3:
+                        continue
+                    _, q_text, ans = parts
+                    should_zero = (
+                        q_text not in filtered_questions
+                        or ans not in set(classification_filters.get(q_text) or [])
+                    )
+                    if should_zero:
+                        values[key] = 0
+                        above[key] = False
+
+    def _apply_filter_segment_masks(
+        self,
+        result: Dict[str, Any],
+        filters: Dict[str, Any],
+        study_data: Dict[str, Any],
+    ) -> None:
+        age_sel = filters.get("age_groups") or []
+        gender_sel = filters.get("genders") or []
+        class_sel = filters.get("classification_filters") or {}
+
+        if age_sel:
+            for prefix in ("(T)", "(B)", "(R)"):
+                self._zero_unselected_segment_section(
+                    result.get(f"{prefix} Age"),
+                    list(self.AGE_BINS),
+                    age_sel,
+                    round_vals=prefix != "(R)",
+                )
+
+        if gender_sel:
+            for prefix in ("(T)", "(B)", "(R)"):
+                self._zero_unselected_segment_section(
+                    result.get(f"{prefix} Gender"),
+                    ["Male", "Female"],
+                    gender_sel,
+                    round_vals=prefix != "(R)",
+                )
+
+        if class_sel:
+            for prefix in ("(T)", "(B)", "(R)"):
+                self._mask_classification_section(
+                    result.get(f"{prefix} Classification Questions"),
+                    class_sel,
+                    round_vals=prefix != "(R)",
+                )
+                self._mask_combined_classification_section(
+                    result.get(f"{prefix} Combined"),
+                    class_sel,
+                )
+
+        if age_sel and result.get("dashboard_summary"):
+            dist = result["dashboard_summary"].get("ageDistribution") or []
+            allowed = set(age_sel)
+            alias = {"13-17": "13-18"}
+            display_allowed = allowed | {alias.get(a, a) for a in allowed}
+            result["dashboard_summary"]["ageDistribution"] = [
+                d for d in dist if d.get("name") in display_allowed or d.get("name") in allowed
+            ]
+
+        if gender_sel and result.get("dashboard_summary"):
+            dist = result["dashboard_summary"].get("genderDistribution") or []
+            allowed = set(gender_sel)
+            result["dashboard_summary"]["genderDistribution"] = [
+                d for d in dist if d.get("name") in allowed
+            ]
 
     # --- JSON Builder Helpers ---
     def _build_dashboard_summary(self, df: pd.DataFrame, categories: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1608,6 +1988,8 @@ class StudyAnalysisService:
         if isinstance(val, str):
             b = check_bin(val)
             if b: return b
+            if val.replace(" ", "") == "13-18":
+                return "13-17"
             # Try parsing number
             digits = "".join(ch if ch.isdigit() else " " for ch in val)
             parts = digits.split()

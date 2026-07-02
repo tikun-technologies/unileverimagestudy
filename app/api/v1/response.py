@@ -17,7 +17,7 @@ from app.core.dependencies import get_current_active_user
 from app.core.domain import is_unilever_domain, FRAGRANCE_QUESTION_ID
 from app.db.session import get_db
 from app.models.user_model import User
-from app.models.study_model import Study, StudyMember
+from app.models.study_model import Study, StudyMember, StudyActiveFilter
 from app.schemas.response_schema import (
     StudyResponseOut, StudyResponseDetail, StudyResponseListItem,
     StartStudyRequest, StartStudyResponse, SubmitTaskRequest, SubmitTaskResponse,
@@ -33,7 +33,17 @@ from app.schemas.response_schema import (
     ClassificationAnswerOut, ElementInteractionOut, TaskSessionOut, TaskSessionCreate,
     ElementInteractionCreate, CompletedTaskCreate, ClassificationAnswerCreate, StudyResponseCreate,
     StudyFilterPayload,
+    OptimizedAnalysisPayload,
+    ActiveFilterPayload,
+    ActiveFilterResponse,
+    AnalyticsSessionResponse,
     StudyAnalysisSettingsPayload,
+)
+from app.services.analysis_filter import (
+    clear_active_filter,
+    filters_are_active,
+    get_active_filter,
+    save_active_filter,
 )
 from app.services.response import StudyResponseService, TaskSessionService
 from app.services.analysis import StudyAnalysisService
@@ -150,7 +160,105 @@ def _build_study_data_dict(study_obj: Study) -> Dict[str, Any]:
 
     return study_data
 
-# ---------- Study Participation Endpoints (Public) ----------
+
+def _sanitize_analysis_json(obj: Any) -> Any:
+    """Convert numpy/pandas scalars and NaN/Inf to JSON-serializable values."""
+    import math
+    import numpy as np
+
+    def _json_scalar(val):
+        if val is None:
+            return None
+        if isinstance(val, (np.integer,)):
+            return int(val)
+        if isinstance(val, (np.floating,)):
+            f = float(val)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+        if isinstance(val, (np.bool_,)):
+            return bool(val)
+        if isinstance(val, float):
+            return None if (math.isnan(val) or math.isinf(val)) else val
+        return val
+
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            safe_k = _json_scalar(k) if not isinstance(k, (str, type(None))) else k
+            if safe_k is None and k is not None:
+                safe_k = str(k)
+            out[safe_k] = _sanitize_analysis_json(v)
+        return out
+    if isinstance(obj, list):
+        return [_sanitize_analysis_json(item) for item in obj]
+    if isinstance(obj, (np.integer, np.floating, np.bool_)):
+        return _json_scalar(obj)
+    if isinstance(obj, float):
+        return _json_scalar(obj)
+    return obj
+
+
+def _generate_study_analysis_json(
+    db: Session,
+    study_obj: Study,
+    df,
+    *,
+    include_raw_data: bool,
+    filters_dict: Optional[Dict[str, Any]] = None,
+    unilever_format: bool = False,
+) -> Dict[str, Any]:
+    study_data = _build_study_data_dict(study_obj)
+    analysis_options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
+    analysis_service = StudyAnalysisService()
+    json_report = analysis_service.generate_json_report(
+        df,
+        study_data,
+        include_raw_data=include_raw_data,
+        analysis_options=analysis_options,
+        filters=filters_dict if filters_are_active(filters_dict) else None,
+    )
+    return _sanitize_analysis_json(json_report)
+
+
+async def _load_study_dataframe_for_analysis(
+    db: Session,
+    study_id: UUID,
+    current_user: User,
+):
+    unilever_format = is_unilever_domain(current_user.email or "")
+    response_service = StudyResponseService(db)
+    df = response_service.get_study_dataframe(
+        study_id,
+        unilever_format=unilever_format,
+        completed_only=True,
+    )
+    return df, unilever_format
+
+
+async def _build_analytics_session(
+    db: Session,
+    study_obj: Study,
+    current_user: User,
+) -> Dict[str, Any]:
+    study_id = study_obj.id
+    active = get_active_filter(db, study_id, current_user.id)
+    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    analysis = _generate_study_analysis_json(
+        db,
+        study_obj,
+        df,
+        include_raw_data=False,
+        filters_dict=active,
+        unilever_format=unilever_format,
+    )
+    return {
+        "study_id": str(study_id),
+        "active_filters": active,
+        "has_active_filter": filters_are_active(active),
+        "analysis": analysis,
+    }
+
 
 @router.post("/start-study", response_model=StartStudyResponse)
 async def start_study(
@@ -640,7 +748,7 @@ async def list_responses(
         # Optimized: lightweight ownership check
         # Optimized: ownership/membership check
         from sqlalchemy import select
-        from app.models.study_model import Study, StudyMember
+        from app.models.study_model import Study, StudyMember, StudyActiveFilter
         
         # Check if user is creator
         is_owner = db.scalar(
@@ -785,7 +893,7 @@ async def get_study_analytics(
     # Fast ownership verification - only check creator_id, don't load full study
     # Ownership/Membership verification
     from sqlalchemy import select
-    from app.models.study_model import Study, StudyMember
+    from app.models.study_model import Study, StudyMember, StudyActiveFilter
     
     ownership_check = select(Study.creator_id).where(Study.id == study_id)
     result = db.execute(ownership_check).first()
@@ -848,7 +956,7 @@ async def stream_study_analytics(
     # Ownership check (fast)
     # Ownership/Membership verification
     from sqlalchemy import select
-    from app.models.study_model import Study, StudyMember
+    from app.models.study_model import Study, StudyMember, StudyActiveFilter
     ownership_check = select(Study.creator_id).where(Study.id == study_id)
     result = db.execute(ownership_check).first()
     
@@ -1340,6 +1448,30 @@ async def export_study_analysis(
         headers=headers
     )
 
+def _authorize_study_for_analysis(db: Session, study_id: UUID, current_user: User) -> Study:
+    from sqlalchemy.orm import defer
+
+    study_obj = (
+        db.query(Study)
+        .options(defer(Study.tasks))
+        .filter(Study.id == study_id)
+        .first()
+    )
+    if not study_obj:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    if study_obj.creator_id != current_user.id:
+        member = db.scalar(
+            select(StudyMember).where(
+                StudyMember.study_id == study_id,
+                StudyMember.user_id == current_user.id,
+            )
+        )
+        if not member:
+            raise HTTPException(status_code=403, detail="Access denied")
+    return study_obj
+
+
 @router.get("/study/{study_id}/analysis-json")
 async def export_study_analysis_json(
     study_id: UUID,
@@ -1350,181 +1482,27 @@ async def export_study_analysis_json(
     """
     Export a comprehensive JSON report with regression analysis, segmentation, and clustering.
     """
-    # Verify user owns the study
-    from app.services import study as study_service
-    from app.models.study_model import Study
-    from sqlalchemy.orm import defer, selectinload
-    
-    study_obj = (
-        db.query(Study)
-        .options(defer(Study.tasks))
-        .filter(Study.id == study_id)
-        .first()
-    )
-    if not study_obj:
-        raise HTTPException(status_code=404, detail="Study not found")
-    
-    # Verify ownership or membership
-    is_authorized = False
-    if study_obj.creator_id == current_user.id:
-        is_authorized = True
-    else:
-        # Check membership
-        from app.models.study_model import StudyMember
-        member = db.scalar(
-            select(StudyMember).where(
-                StudyMember.study_id == study_id,
-                StudyMember.user_id == current_user.id
-            )
-        )
-        if member:
-            is_authorized = True
-
-    if not is_authorized:
-        raise HTTPException(status_code=403, detail="Access denied")
-
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
     unilever_format = is_unilever_domain(current_user.email or "")
-
-    # 1. Get DataFrame
     response_service = StudyResponseService(db)
     df = response_service.get_study_dataframe(
         study_id,
         unilever_format=unilever_format,
         completed_only=True,
     )
-
-    # 2. Build study_data dict from the ORM object
-    study_data = {
-        "title": study_obj.title,
-        "study_type": study_obj.study_type,
-        "background": study_obj.background_image_url,
-        "language": study_obj.language,
-        "launched_at": study_obj.created_at.isoformat() if study_obj.created_at else "",
-        "aspect_ratio": (
-            (study_obj.audience_segmentation or {}).get("aspect_ratio")
-            if isinstance(study_obj.audience_segmentation, dict)
-            else None
-        ),
-        "categories": [],
-        "elements": [],
-        "classification_questions": []
-    }
-    
-    # Populate lists based on study type
-    if str(study_obj.study_type) == 'layer':
-        # Map Layers -> Categories, Images -> Elements
-        sorted_layers = sorted(study_obj.layers, key=lambda x: x.order)
-        
-        for layer in sorted_layers:
-            cat_id = str(layer.layer_id)
-            study_data["categories"].append({
-                "id": cat_id,
-                "name": layer.name,
-                "order": layer.order,
-                "z_index": layer.z_index,
-                "transform": layer.transform or {},
-            })
-            
-            sorted_images = sorted(layer.images, key=lambda x: x.order)
-            for img in sorted_images:
-                study_data["elements"].append({
-                    "id": str(img.image_id),
-                    "name": img.name,
-                    "content": img.url,
-                    "category_id": cat_id,
-                    "category": {
-                        "name": layer.name,
-                        "order": layer.order,
-                        "z_index": layer.z_index,
-                        "transform": layer.transform or {},
-                    },
-                    "z_index": layer.z_index,
-                    "transform": layer.transform or {},
-                    "layer_name": layer.name,
-                    "layer_order": layer.order,
-                    "image_order": img.order,
-                    "alt_text": img.alt_text,
-                })
-    else:
-        # Grid and text logic (both use categories and elements)
-        for cat in study_obj.categories:
-            study_data["categories"].append({
-                "id": str(cat.id),
-                "name": cat.name,
-                "order": cat.order
-            })
-            for el in cat.elements:
-                study_data["elements"].append({
-                    "id": str(el.id),
-                    "name": el.name,
-                    "content": el.content,
-                    "category_id": str(cat.id),
-                    "category": {"name": cat.name, "order": cat.order}
-                })
-            
-    for q in study_obj.classification_questions:
-        study_data["classification_questions"].append({
-            "question_id": q.question_id,
-            "question_text": q.question_text,
-            "answer_options": q.answer_options,
-            "optional_classification_question": q.optional_classification_question,
-        })
-        
-    # 3. Generate JSON Report
-    analysis_options = get_study_analysis_settings(db, study_id, study=study_obj)
-    analysis_service = StudyAnalysisService()
     try:
-        json_report = analysis_service.generate_json_report(
+        return _generate_study_analysis_json(
+            db,
+            study_obj,
             df,
-            study_data,
             include_raw_data=include_raw_data,
-            analysis_options=analysis_options,
+            unilever_format=unilever_format,
         )
     except Exception as e:
         print(f"JSON Analysis generation failed: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate JSON analysis report: {str(e)}")
-    
-    # Sanitize NaN/Inf and numpy types so response is JSON-serializable
-    import math
-    import numpy as np
-
-    def _json_scalar(val):
-        """Convert numpy/float to JSON-serializable scalar; keys must be str/int."""
-        if val is None:
-            return None
-        if isinstance(val, (np.integer,)):
-            return int(val)
-        if isinstance(val, (np.floating,)):
-            f = float(val)
-            return None if (math.isnan(f) or math.isinf(f)) else f
-        if isinstance(val, (np.bool_,)):
-            return bool(val)
-        if isinstance(val, float):
-            return None if (math.isnan(val) or math.isinf(val)) else val
-        return val
-
-    def sanitize_for_json(obj):
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            out = {}
-            for k, v in obj.items():
-                safe_k = _json_scalar(k) if not isinstance(k, (str, type(None))) else k
-                if safe_k is None and k is not None:
-                    safe_k = str(k)
-                out[safe_k] = sanitize_for_json(v)
-            return out
-        if isinstance(obj, list):
-            return [sanitize_for_json(item) for item in obj]
-        if isinstance(obj, (np.integer, np.floating, np.bool_)):
-            return _json_scalar(obj)
-        if isinstance(obj, float):
-            return _json_scalar(obj)
-        return obj
-
-    return sanitize_for_json(json_report)
 
 
 @router.get("/study/{study_id}/analysis-settings")
@@ -1560,6 +1538,158 @@ async def save_study_analysis_settings_endpoint(
     return response
 
 
+@router.get("/study/{study_id}/analytics-session")
+async def get_study_analytics_session(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Single bootstrap call for the analytics page: returns the user's saved
+    active filter (if any) and freshly computed optimized analysis JSON.
+    """
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    try:
+        return await _build_analytics_session(db, study_obj, current_user)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load analytics session: {str(e)}",
+        )
+
+
+@router.get("/study/{study_id}/active-filter")
+async def get_study_active_filter(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Return the persisted active filter for this user on the study (Redis-backed)."""
+    _authorize_study_for_analysis(db, study_id, current_user)
+    active = get_active_filter(db, study_id, current_user.id)
+    row = (
+        db.query(StudyActiveFilter)
+        .filter(
+            StudyActiveFilter.study_id == study_id,
+            StudyActiveFilter.user_id == current_user.id,
+        )
+        .first()
+    )
+    return {
+        "study_id": str(study_id),
+        "filters": active,
+        "has_active_filter": filters_are_active(active),
+        "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+    }
+
+
+@router.post("/study/{study_id}/active-filter")
+async def save_study_active_filter(
+    study_id: UUID,
+    payload: ActiveFilterPayload,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Save the user's active analytics filter and return filtered analysis JSON.
+    Empty filters clears the active filter and returns full-study analysis.
+    """
+    from app.models.study_model import StudyFilterHistory
+
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+
+    if filters_are_active(filters_dict):
+        saved = save_active_filter(db, study_id, current_user.id, filters_dict)
+        try:
+            record = StudyFilterHistory(
+                study_id=study_id,
+                user_id=current_user.id,
+                filters=filters_dict or {},
+                name=None,
+            )
+            db.add(record)
+            db.commit()
+        except Exception:
+            db.rollback()
+    else:
+        clear_active_filter(db, study_id, current_user.id)
+        saved = None
+
+    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    try:
+        analysis = _generate_study_analysis_json(
+            db,
+            study_obj,
+            df,
+            include_raw_data=False,
+            filters_dict=saved,
+            unilever_format=unilever_format,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate analysis for active filter: {str(e)}",
+        )
+
+    row = (
+        db.query(StudyActiveFilter)
+        .filter(
+            StudyActiveFilter.study_id == study_id,
+            StudyActiveFilter.user_id == current_user.id,
+        )
+        .first()
+    )
+    return {
+        "study_id": str(study_id),
+        "filters": saved,
+        "has_active_filter": filters_are_active(saved),
+        "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+        "analysis": analysis,
+    }
+
+
+@router.delete("/study/{study_id}/active-filter")
+async def reset_study_active_filter(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Clear saved active filter and return full-study optimized analysis."""
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    clear_active_filter(db, study_id, current_user.id)
+
+    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    try:
+        analysis = _generate_study_analysis_json(
+            db,
+            study_obj,
+            df,
+            include_raw_data=False,
+            filters_dict=None,
+            unilever_format=unilever_format,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reset analytics filter: {str(e)}",
+        )
+
+    return {
+        "study_id": str(study_id),
+        "filters": None,
+        "has_active_filter": False,
+        "updated_at": None,
+        "analysis": analysis,
+    }
+
+
 @router.get("/study/{study_id}/optimized-analysis-json")
 async def export_study_optimized_analysis_json(
     study_id: UUID,
@@ -1576,6 +1706,63 @@ async def export_study_optimized_analysis_json(
         db=db,
         include_raw_data=False,
     )
+
+
+@router.post("/study/{study_id}/optimized-analysis-json")
+async def post_study_optimized_analysis_json(
+    study_id: UUID,
+    payload: OptimizedAnalysisPayload,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Export analytics JSON for the frontend, optionally filtered by age, gender,
+    and classification question answers. Returns the same shape as GET
+    optimized-analysis-json, with filters_applied / filter_meta when filtered.
+    """
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    has_filters = filters_are_active(filters_dict)
+
+    if has_filters:
+        save_active_filter(db, study_id, current_user.id, filters_dict)
+    else:
+        clear_active_filter(db, study_id, current_user.id)
+
+    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+
+    try:
+        json_report = _generate_study_analysis_json(
+            db,
+            study_obj,
+            df,
+            include_raw_data=False,
+            filters_dict=filters_dict if has_filters else None,
+            unilever_format=unilever_format,
+        )
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate filtered analysis JSON: {str(e)}",
+        )
+
+    if has_filters and payload.save_to_history:
+        try:
+            from app.models.study_model import StudyFilterHistory
+            record = StudyFilterHistory(
+                study_id=study_id,
+                user_id=current_user.id,
+                filters=filters_dict or {},
+                name=payload.name[:255] if payload.name else None,
+            )
+            db.add(record)
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    return json_report
 
 
 @router.get("/study/{study_id}/filters")

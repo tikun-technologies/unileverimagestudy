@@ -83,6 +83,7 @@ class Study(Base):
     study_responses = relationship("StudyResponse", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     members = relationship("StudyMember", back_populates="study", cascade="all, delete-orphan", lazy="selectin")
     filter_history = relationship("StudyFilterHistory", back_populates="study", cascade="all, delete-orphan", lazy="noload")
+    active_filters = relationship("StudyActiveFilter", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     analysis_settings = relationship("StudyAnalysisSettings", back_populates="study", cascade="all, delete-orphan", lazy="noload", uselist=False)
     saved_designs = relationship("StudySavedDesign", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     task_assignments = relationship("StudyTaskAssignment", back_populates="study", cascade="all, delete-orphan", lazy="noload")
@@ -337,6 +338,28 @@ class StudyFilterHistory(Base):
     __table_args__ = (
         Index('idx_study_filter_history_study_user', 'study_id', 'user_id'),
         Index('idx_study_filter_history_created', 'study_id', 'created_at'),
+    )
+
+
+class StudyActiveFilter(Base):
+    """
+    Per-user active filter for study analytics (persisted selection restored on page load).
+    One row per (study_id, user_id).
+    """
+    __tablename__ = "study_active_filters"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    study_id = Column(UUID(as_uuid=True), ForeignKey('studies.id', ondelete='CASCADE'), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
+    filters = Column(JSONB, nullable=False, server_default='{}')
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    study = relationship("Study", back_populates="active_filters", lazy="noload")
+    user = relationship("User", back_populates="active_filters", lazy="noload")
+
+    __table_args__ = (
+        UniqueConstraint('study_id', 'user_id', name='uq_study_active_filter_study_user'),
+        Index('idx_study_active_filter_study_user', 'study_id', 'user_id'),
     )
 
 
