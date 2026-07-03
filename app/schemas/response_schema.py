@@ -536,6 +536,71 @@ class OptimizedAnalysisPayload(BaseModel):
     )
 
 
+class ClassificationCohortPayload(BaseModel):
+    """Request body for classification cohort drill-down."""
+    filters: Optional[StudyFilterCriteria] = Field(
+        None,
+        description="Current active analytics filters (age, gender, classification).",
+    )
+    question_text: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        description="Classification question text clicked in Prelim.",
+    )
+    answer: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+        description="Selected answer option clicked in Prelim.",
+    )
+    limit: int = Field(
+        default=120,
+        ge=1,
+        le=500,
+        description="Max respondents to return for the current page.",
+    )
+    offset: int = Field(
+        default=0,
+        ge=0,
+        description="Pagination offset for respondents list.",
+    )
+
+
+class ClassificationCohortRespondent(BaseModel):
+    id: str
+    label: str
+    session_id: str
+    panelist_id: Optional[str] = None
+    gender: Optional[str] = None
+    age_group: Optional[str] = None
+    answers: Dict[str, Optional[str]] = Field(default_factory=dict)
+
+
+class ClassificationCohortMeta(BaseModel):
+    cohort_size: int
+    question_text: str
+    answer: str
+    limit: int
+    offset: int
+    has_more: bool
+    filters_applied: Optional[StudyFilterCriteria] = None
+
+
+class CohortDemographicBreakdown(BaseModel):
+    """Gender / age counts for the full cohort. Omitted when filter already pins one value."""
+    gender: Optional[Dict[str, int]] = None
+    age_group: Optional[Dict[str, int]] = None
+
+
+class ClassificationCohortResponse(BaseModel):
+    meta: ClassificationCohortMeta
+    questions: List[Dict[str, Any]] = Field(default_factory=list)
+    respondents: List[ClassificationCohortRespondent] = Field(default_factory=list)
+    cross_tabs: Dict[str, Dict[str, int]] = Field(default_factory=dict)
+    demographic_breakdown: Optional[CohortDemographicBreakdown] = None
+
+
 class StudyFilterPayload(BaseModel):
     """Request body for POST /study/{study_id}/filter (filtered regression report)."""
     filters: Optional[StudyFilterCriteria] = Field(

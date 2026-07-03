@@ -1,7 +1,8 @@
 # app/api/v1/response.py
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
+from collections import Counter, defaultdict
 from uuid import UUID
 from datetime import datetime
 
@@ -18,6 +19,7 @@ from app.core.domain import is_unilever_domain, FRAGRANCE_QUESTION_ID
 from app.db.session import get_db
 from app.models.user_model import User
 from app.models.study_model import Study, StudyMember, StudyActiveFilter
+from app.models.response_model import StudyResponse, ClassificationAnswer
 from app.schemas.response_schema import (
     StudyResponseOut, StudyResponseDetail, StudyResponseListItem,
     StartStudyRequest, StartStudyResponse, SubmitTaskRequest, SubmitTaskResponse,
@@ -38,6 +40,8 @@ from app.schemas.response_schema import (
     ActiveFilterResponse,
     AnalyticsSessionResponse,
     StudyAnalysisSettingsPayload,
+    ClassificationCohortPayload,
+    ClassificationCohortResponse,
 )
 from app.services.analysis_filter import (
     clear_active_filter,
@@ -258,6 +262,207 @@ async def _build_analytics_session(
         "has_active_filter": filters_are_active(active),
         "analysis": analysis,
     }
+
+
+def _normalize_text_key(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _extract_answer_option_texts(answer_options: Any) -> List[str]:
+    if not isinstance(answer_options, list):
+        return []
+    out: List[str] = []
+    for opt in answer_options:
+        if isinstance(opt, dict):
+            txt = opt.get("text") or opt.get("label") or opt.get("name")
+            if txt:
+                out.append(str(txt))
+    return out
+
+
+def _build_answer_options_map(answer_options: Any) -> Dict[str, str]:
+    options_map: Dict[str, str] = {}
+    if not isinstance(answer_options, list):
+        return options_map
+    for opt in answer_options:
+        if not isinstance(opt, dict):
+            continue
+        txt = opt.get("text") or opt.get("label") or opt.get("name")
+        if not txt:
+            continue
+        txt_val = str(txt).strip()
+        for key in ("id", "value", "code", "label"):
+            raw_key = opt.get(key)
+            if raw_key is not None:
+                options_map[str(raw_key)] = txt_val
+    return options_map
+
+
+def _normalize_answer_value(raw_answer: Any, options_map: Dict[str, str]) -> Optional[str]:
+    if raw_answer is None:
+        return None
+    if isinstance(raw_answer, str):
+        raw = raw_answer.strip()
+        if not raw:
+            return None
+        if options_map:
+            left = raw.split(" - ", 1)[0]
+            right = raw.split(" - ", 1)[1].strip() if " - " in raw else None
+            if raw in options_map:
+                return options_map[raw]
+            if left in options_map:
+                return options_map[left]
+            if right and right in options_map:
+                return options_map[right]
+        parts = raw.split(" - ", 1)
+        if len(parts) == 2 and parts[1].strip():
+            return parts[1].strip()
+        return raw
+    return str(raw_answer)
+
+
+def _clean_demo_label(val: Any) -> Optional[str]:
+    """Normalize gender/age labels for JSON and counting (handles numpy nan)."""
+    if val is None:
+        return None
+    try:
+        import math
+        import numpy as np
+
+        if isinstance(val, (float, np.floating)) and (math.isnan(val) or np.isnan(val)):
+            return None
+    except Exception:
+        pass
+    if isinstance(val, str):
+        s = val.strip()
+        return s if s and s.lower() != "nan" else None
+    s = str(val).strip()
+    return s if s and s.lower() != "nan" else None
+
+
+def _extract_demographics(personal_info: Any, analysis_service: StudyAnalysisService) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(personal_info, dict):
+        return None, None
+
+    gender_raw = personal_info.get("gender") or personal_info.get("Gender")
+    gender_norm = None
+    if isinstance(gender_raw, str) and gender_raw.strip():
+        gender_norm = _clean_demo_label(analysis_service._normalize_gender(gender_raw))
+
+    age_val = personal_info.get("age")
+    if age_val is None:
+        dob = (
+            personal_info.get("dob")
+            or personal_info.get("date_of_birth")
+            or personal_info.get("DateOfBirth")
+        )
+        if isinstance(dob, str) and dob.strip():
+            try:
+                import pandas as pd
+
+                age_val = int((datetime.now() - pd.to_datetime(dob)).days / 365.25)
+            except Exception:
+                try:
+                    dob_ts = datetime.fromisoformat(dob.strip().replace("Z", "+00:00"))
+                    age_val = int((datetime.now(dob_ts.tzinfo) - dob_ts).days / 365.25)
+                except Exception:
+                    age_val = None
+
+    age_bin = _clean_demo_label(analysis_service._normalize_age_to_bin(age_val))
+    return gender_norm, age_bin
+
+
+def _normalize_cohort_filters(
+    filters: Dict[str, Any],
+    analysis_service: StudyAnalysisService,
+) -> Dict[str, Any]:
+    age_vals = filters.get("age_groups") or []
+    genders = filters.get("genders") or []
+    class_filters = filters.get("classification_filters") or {}
+
+    age_out: List[str] = []
+    seen_age = set()
+    for age in age_vals:
+        if not isinstance(age, str):
+            continue
+        val = age.strip()
+        if val == "13-18":
+            val = "13-17"
+        if val and val not in seen_age:
+            seen_age.add(val)
+            age_out.append(val)
+
+    gender_out: List[str] = []
+    seen_gender = set()
+    for g in genders:
+        if not isinstance(g, str):
+            continue
+        norm_g = analysis_service._normalize_gender(g)
+        if norm_g and norm_g not in seen_gender:
+            seen_gender.add(norm_g)
+            gender_out.append(norm_g)
+
+    class_out: Dict[str, List[str]] = {}
+    for q_text, vals in class_filters.items():
+        if not isinstance(q_text, str) or not isinstance(vals, list):
+            continue
+        normalized_vals: List[str] = []
+        seen_vals = set()
+        for v in vals:
+            if not isinstance(v, str):
+                continue
+            sv = v.strip()
+            if sv and sv not in seen_vals:
+                seen_vals.add(sv)
+                normalized_vals.append(sv)
+        if normalized_vals:
+            class_out[q_text.strip()] = normalized_vals
+
+    out: Dict[str, Any] = {}
+    if age_out:
+        out["age_groups"] = age_out
+    if gender_out:
+        out["genders"] = gender_out
+    if class_out:
+        out["classification_filters"] = class_out
+    return out
+
+
+def _build_cohort_demographic_breakdown(
+    matched_ids: List[Any],
+    response_meta: Dict[Any, Dict[str, Any]],
+    *,
+    age_groups_filter: List[str],
+    genders_filter: List[str],
+) -> Dict[str, Dict[str, int]]:
+    """Count gender/age in cohort; skip dimension when filter already has one value."""
+    gender_counts: Counter = Counter()
+    age_counts: Counter = Counter()
+    for rid in matched_ids:
+        meta = response_meta.get(rid) or {}
+        g = _clean_demo_label(meta.get("gender"))
+        a = _clean_demo_label(meta.get("age_group"))
+        if g:
+            gender_counts[g] += 1
+        if a:
+            age_counts[a] += 1
+
+    out: Dict[str, Dict[str, int]] = {}
+    if len(gender_counts) > 1 and len(genders_filter) != 1:
+        out["gender"] = dict(sorted(gender_counts.items(), key=lambda x: (-x[1], x[0])))
+    if len(age_counts) > 1 and len(age_groups_filter) != 1:
+        age_order = ["13-17", "18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
+
+        def age_sort_key(item: Tuple[str, int]) -> Tuple[int, int, str]:
+            label, count = item
+            try:
+                idx = age_order.index(label)
+            except ValueError:
+                idx = 999
+            return (idx, -count, label)
+
+        out["age_group"] = dict(sorted(age_counts.items(), key=age_sort_key))
+    return out
 
 
 @router.post("/start-study", response_model=StartStudyResponse)
@@ -1763,6 +1968,217 @@ async def post_study_optimized_analysis_json(
             db.rollback()
 
     return json_report
+
+
+@router.post("/study/{study_id}/classification-cohort", response_model=ClassificationCohortResponse)
+async def get_classification_cohort(
+    study_id: UUID,
+    payload: ClassificationCohortPayload,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Drill-down endpoint for Prelim option clicks.
+    Returns only respondent-level classification profiles for the selected cohort.
+    """
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    analysis_service = StudyAnalysisService()
+    raw_filters = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
+    normalized_filters = _normalize_cohort_filters(raw_filters, analysis_service)
+    age_groups = normalized_filters.get("age_groups") or []
+    genders = normalized_filters.get("genders") or []
+    class_filters = normalized_filters.get("classification_filters") or {}
+
+    questions_sorted = sorted(
+        list(study_obj.classification_questions or []),
+        key=lambda q: (q.order if q.order is not None else 0, q.question_text or ""),
+    )
+    if not questions_sorted:
+        raise HTTPException(status_code=400, detail="Study has no classification questions")
+
+    ordered_questions: List[str] = []
+    question_lookup: Dict[str, str] = {}
+    option_maps_by_question: Dict[str, Dict[str, str]] = {}
+    question_options: Dict[str, List[str]] = {}
+    for q in questions_sorted:
+        q_text = (q.question_text or "").strip()
+        if not q_text:
+            continue
+        ordered_questions.append(q_text)
+        question_lookup[_normalize_text_key(q_text)] = q_text
+        option_maps_by_question[q_text] = _build_answer_options_map(q.answer_options)
+        question_options[q_text] = _extract_answer_option_texts(q.answer_options)
+
+    if not ordered_questions:
+        raise HTTPException(status_code=400, detail="Classification questions are not configured")
+
+    clicked_question = question_lookup.get(_normalize_text_key(payload.question_text))
+    if not clicked_question:
+        raise HTTPException(status_code=400, detail="Invalid classification question")
+
+    clicked_answer = _normalize_answer_value(
+        payload.answer,
+        option_maps_by_question.get(clicked_question, {}),
+    )
+    if not clicked_answer:
+        raise HTTPException(status_code=400, detail="Invalid classification answer")
+
+    response_rows = db.execute(
+        select(
+            StudyResponse.id,
+            StudyResponse.session_id,
+            StudyResponse.panelist_id,
+            StudyResponse.personal_info,
+        ).where(
+            StudyResponse.study_id == study_id,
+            StudyResponse.is_completed.is_(True),
+        )
+    ).all()
+
+    if not response_rows:
+        return {
+            "meta": {
+                "cohort_size": 0,
+                "question_text": clicked_question,
+                "answer": clicked_answer,
+                "limit": payload.limit,
+                "offset": payload.offset,
+                "has_more": False,
+                "filters_applied": normalized_filters if filters_are_active(normalized_filters) else None,
+            },
+            "questions": [
+                {"question_text": q, "options": question_options.get(q, [])}
+                for q in ordered_questions
+            ],
+            "respondents": [],
+            "cross_tabs": {},
+            "demographic_breakdown": None,
+        }
+
+    response_meta: Dict[Any, Dict[str, Any]] = {}
+    response_ids: List[Any] = []
+    for row in response_rows:
+        gender, age_group = _extract_demographics(row.personal_info, analysis_service)
+        response_meta[row.id] = {
+            "session_id": row.session_id,
+            "panelist_id": row.panelist_id,
+            "gender": gender,
+            "age_group": age_group,
+        }
+        response_ids.append(row.id)
+
+    answer_rows = db.execute(
+        select(
+            ClassificationAnswer.study_response_id,
+            ClassificationAnswer.question_text,
+            ClassificationAnswer.answer,
+        ).where(ClassificationAnswer.study_response_id.in_(response_ids))
+    ).all()
+
+    answers_by_response: Dict[Any, Dict[str, str]] = defaultdict(dict)
+    for row in answer_rows:
+        q_raw = (row.question_text or "").strip()
+        q_text = question_lookup.get(_normalize_text_key(q_raw), q_raw)
+        options_map = option_maps_by_question.get(q_text, {})
+        normalized_answer = _normalize_answer_value(row.answer, options_map)
+        if q_text and normalized_answer and q_text not in answers_by_response[row.study_response_id]:
+            answers_by_response[row.study_response_id][q_text] = normalized_answer
+
+    normalized_class_filters: Dict[str, set] = {}
+    for raw_q, vals in class_filters.items():
+        q_text = question_lookup.get(_normalize_text_key(raw_q))
+        if not q_text or not vals:
+            continue
+        options_map = option_maps_by_question.get(q_text, {})
+        allowed_set = {
+            norm_val
+            for norm_val in (_normalize_answer_value(v, options_map) for v in vals)
+            if norm_val
+        }
+        if allowed_set:
+            normalized_class_filters[q_text] = allowed_set
+
+    matched_ids: List[Any] = []
+    for rid in response_ids:
+        meta = response_meta.get(rid) or {}
+        if age_groups and meta.get("age_group") not in age_groups:
+            continue
+        if genders and meta.get("gender") not in genders:
+            continue
+
+        ans_map = answers_by_response.get(rid, {})
+        failed = False
+        for q_text, allowed in normalized_class_filters.items():
+            if ans_map.get(q_text) not in allowed:
+                failed = True
+                break
+        if failed:
+            continue
+
+        if ans_map.get(clicked_question) != clicked_answer:
+            continue
+        matched_ids.append(rid)
+
+    matched_ids.sort(key=lambda rid: str((response_meta.get(rid) or {}).get("session_id") or ""))
+    cohort_size = len(matched_ids)
+    page_ids = matched_ids[payload.offset : payload.offset + payload.limit]
+
+    respondents: List[Dict[str, Any]] = []
+    for idx, rid in enumerate(page_ids, start=payload.offset + 1):
+        meta = response_meta.get(rid) or {}
+        ans_map = answers_by_response.get(rid, {})
+        respondents.append(
+            {
+                "id": str(rid),
+                "label": f"Respondent {idx}",
+                "session_id": str(meta.get("session_id") or ""),
+                "panelist_id": str(meta.get("panelist_id")) if meta.get("panelist_id") else None,
+                "gender": meta.get("gender"),
+                "age_group": meta.get("age_group"),
+                "answers": {q: ans_map.get(q) for q in ordered_questions},
+            }
+        )
+
+    cross_tabs: Dict[str, Dict[str, int]] = {}
+    for q_text in ordered_questions:
+        if q_text == clicked_question:
+            continue
+        counts = Counter(
+            answer_val
+            for rid in matched_ids
+            for answer_val in [answers_by_response.get(rid, {}).get(q_text)]
+            if isinstance(answer_val, str) and answer_val
+        )
+        if counts:
+            sorted_counts = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            cross_tabs[q_text] = {k: v for k, v in sorted_counts}
+
+    demo_raw = _build_cohort_demographic_breakdown(
+        matched_ids,
+        response_meta,
+        age_groups_filter=age_groups,
+        genders_filter=genders,
+    )
+    demographic_breakdown = demo_raw if demo_raw else None
+
+    return {
+        "meta": {
+            "cohort_size": cohort_size,
+            "question_text": clicked_question,
+            "answer": clicked_answer,
+            "limit": payload.limit,
+            "offset": payload.offset,
+            "has_more": payload.offset + len(page_ids) < cohort_size,
+            "filters_applied": normalized_filters if filters_are_active(normalized_filters) else None,
+        },
+        "questions": [
+            {"question_text": q, "options": question_options.get(q, [])}
+            for q in ordered_questions
+        ],
+        "respondents": respondents,
+        "cross_tabs": cross_tabs,
+        "demographic_breakdown": demographic_breakdown,
+    }
 
 
 @router.get("/study/{study_id}/filters")
