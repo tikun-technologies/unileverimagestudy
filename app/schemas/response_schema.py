@@ -601,6 +601,25 @@ class ClassificationCohortResponse(BaseModel):
     demographic_breakdown: Optional[CohortDemographicBreakdown] = None
 
 
+class SavedFilterReportCreate(BaseModel):
+    """Create a named saved filter report."""
+    name: str = Field(..., min_length=1, max_length=255)
+    filters: StudyFilterCriteria = Field(default_factory=StudyFilterCriteria)
+
+
+class SavedFilterReportUpdate(BaseModel):
+    """Rename a saved filter report."""
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class SavedFilterReportOut(BaseModel):
+    id: UUID
+    study_id: UUID
+    name: str
+    filters: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+
+
 class StudyFilterPayload(BaseModel):
     """Request body for POST /study/{study_id}/filter (filtered regression report)."""
     filters: Optional[StudyFilterCriteria] = Field(

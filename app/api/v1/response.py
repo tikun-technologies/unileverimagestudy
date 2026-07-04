@@ -42,6 +42,9 @@ from app.schemas.response_schema import (
     StudyAnalysisSettingsPayload,
     ClassificationCohortPayload,
     ClassificationCohortResponse,
+    SavedFilterReportCreate,
+    SavedFilterReportUpdate,
+    SavedFilterReportOut,
 )
 from app.services.analysis_filter import (
     clear_active_filter,
@@ -49,8 +52,14 @@ from app.services.analysis_filter import (
     get_active_filter,
     save_active_filter,
 )
-from app.services.response import StudyResponseService, TaskSessionService
+from app.services.saved_filter_reports import (
+    create_saved_report,
+    delete_saved_report,
+    list_saved_reports,
+    update_saved_report_name,
+)
 from app.services.analysis import StudyAnalysisService
+from app.services.response import StudyResponseService
 from app.services.analysis_settings import (
     get_study_analysis_settings,
     save_study_analysis_settings,
@@ -1801,24 +1810,11 @@ async def save_study_active_filter(
     Save the user's active analytics filter and return filtered analysis JSON.
     Empty filters clears the active filter and returns full-study analysis.
     """
-    from app.models.study_model import StudyFilterHistory
-
     study_obj = _authorize_study_for_analysis(db, study_id, current_user)
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
 
     if filters_are_active(filters_dict):
         saved = save_active_filter(db, study_id, current_user.id, filters_dict)
-        try:
-            record = StudyFilterHistory(
-                study_id=study_id,
-                user_id=current_user.id,
-                filters=filters_dict or {},
-                name=None,
-            )
-            db.add(record)
-            db.commit()
-        except Exception:
-            db.rollback()
     else:
         clear_active_filter(db, study_id, current_user.id)
         saved = None
@@ -2179,6 +2175,70 @@ async def get_classification_cohort(
         "cross_tabs": cross_tabs,
         "demographic_breakdown": demographic_breakdown,
     }
+
+
+@router.get("/study/{study_id}/saved-reports", response_model=List[SavedFilterReportOut])
+async def get_study_saved_reports(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """List named saved filter reports for this study (current user). Redis-backed."""
+    _authorize_study_for_analysis(db, study_id, current_user)
+    return list_saved_reports(db, study_id, current_user.id)
+
+
+@router.post("/study/{study_id}/saved-reports", response_model=SavedFilterReportOut)
+async def create_study_saved_report(
+    study_id: UUID,
+    payload: SavedFilterReportCreate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Save a named filter report. Returns 409 if the same filters are already saved."""
+    _authorize_study_for_analysis(db, study_id, current_user)
+    filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
+    if not filters_are_active(filters_dict):
+        raise HTTPException(status_code=400, detail="Select at least one filter before saving a report.")
+    return create_saved_report(
+        db,
+        study_id,
+        current_user.id,
+        payload.name,
+        filters_dict,
+    )
+
+
+@router.put("/study/{study_id}/saved-reports/{report_id}", response_model=SavedFilterReportOut)
+async def rename_study_saved_report(
+    study_id: UUID,
+    report_id: UUID,
+    payload: SavedFilterReportUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Rename a saved filter report."""
+    _authorize_study_for_analysis(db, study_id, current_user)
+    return update_saved_report_name(
+        db,
+        study_id,
+        current_user.id,
+        report_id,
+        payload.name,
+    )
+
+
+@router.delete("/study/{study_id}/saved-reports/{report_id}")
+async def delete_study_saved_report(
+    study_id: UUID,
+    report_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a saved filter report."""
+    _authorize_study_for_analysis(db, study_id, current_user)
+    delete_saved_report(db, study_id, current_user.id, report_id)
+    return {"ok": True, "id": str(report_id)}
 
 
 @router.get("/study/{study_id}/filters")
