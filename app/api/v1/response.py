@@ -45,6 +45,7 @@ from app.schemas.response_schema import (
     SavedFilterReportCreate,
     SavedFilterReportUpdate,
     SavedFilterReportOut,
+    FlattenedCsvExportPayload,
 )
 from app.services.analysis_filter import (
     clear_active_filter,
@@ -1494,172 +1495,89 @@ async def export_study_flattened_csv(
     }
     return StreamingResponse(csv_generator(), media_type="text/csv", headers=headers)
 
-@router.get("/export/study/{study_id}/flattened-csv")
-async def export_study_analysis(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Export a comprehensive Excel report with regression analysis, segmentation, and clustering.
-    """
-    # Verify user owns the study
-    from app.services import study as study_service
-    from app.models.study_model import Study
-    from sqlalchemy.orm import defer, selectinload
-    
-    study_obj = (
-        db.query(Study)
-        .options(defer(Study.tasks))
-        .filter(Study.id == study_id)
-        .first()
-    )
-    # print(study_obj)
-    if not study_obj:
-        raise HTTPException(status_code=404, detail="Study not found")
-    
-    # Verify ownership or membership
-    is_authorized = False
-    if study_obj.creator_id == current_user.id:
-        is_authorized = True
-    else:
-        # Check membership
-        from app.models.study_model import StudyMember
-        member = db.scalar(
-            select(StudyMember).where(
-                StudyMember.study_id == study_id,
-                StudyMember.user_id == current_user.id
-            )
-        )
-        if member:
-            is_authorized = True
-
-    if not is_authorized:
-        raise HTTPException(status_code=403, detail="Access denied")
-
+def _generate_study_excel_export_response(
+    db: Session,
+    study_obj: Study,
+    current_user: User,
+    filters_dict: Optional[Dict[str, Any]] = None,
+) -> StreamingResponse:
+    """Build the full Excel analysis report, optionally filtered to a respondent cohort."""
+    study_id = study_obj.id
     unilever_format = is_unilever_domain(current_user.email or "")
-
-    # 1. Get DataFrame
     response_service = StudyResponseService(db)
     df = response_service.get_study_dataframe(
         study_id,
         unilever_format=unilever_format,
         completed_only=True,
     )
-    
-        
-    # 2. Get Study Data (JSON)
-    # We need the full study definition (elements, categories, questions)
-    # The study object from get_study might be an ORM object.
-    # We can convert it to dict or fetch the JSON representation if stored.
-    # Assuming standard Pydantic model conversion or similar.
-    # Let's use the public info helper or just dump the model.
-    
-    # We need specific fields: title, background, language, launched_at, categories, elements, classification_questions
-    # elements and categories might be relationships.
-    
-    # Let's construct the study_data dict manually from the ORM object to be safe and complete
-    # Or use the existing schema.
-    # from app.schemas.study_schema import StudyDetail
-    # Re-fetch with all relations if needed, but get_study usually loads them?
-    # Let's check get_study implementation if possible, but assuming it returns the model.
-    
-    # To be safe, let's fetch what we need using the public info service which formats it nicely?
-    # Or just use the ORM object.
-    
-    # Let's build a dict that matches what analysis service expects
-    study_data = {
-        "title": study_obj.title,
-        "study_type": study_obj.study_type,
-        "background": study_obj.background_image_url, # Mapped to background in analysis? No, analysis uses "background" text field?
-        # analysis_v2 uses: title, background, language, launched_at
-        # It seems "background" refers to "background context" text, not image.
-        # Let's check if Study model has "background" text field.
-        # If not, maybe "orientation_text"?
-        # analysis_v2: background = data.get("background", "")
-        # Let's assume it might be missing or mapped to something else.
-        
-        "language": study_obj.language,
-        "launched_at": study_obj.created_at.isoformat() if study_obj.created_at else "",
-        "categories": [],
-        "elements": [],
-        "classification_questions": []
-    }
-    
-    # Populate lists
-    # Populate lists based on study type
-    # print(study_obj.data)
-    # print(study_obj.__dict__)
-    if str(study_obj.study_type) == 'layer':
-        # Map Layers -> Categories, Images -> Elements
-        # Ensure layers are loaded. Accessing them should trigger lazy load if session is active.
-        # Sort by order
-        sorted_layers = sorted(study_obj.layers, key=lambda x: x.order)
-        
-        for layer in sorted_layers:
-            # Create a "Category" for this layer
-            cat_id = str(layer.layer_id) # Use layer_id as category_id
-            study_data["categories"].append({
-                "id": cat_id,
-                "name": layer.name,
-                "order": layer.order
-            })
-            
-            # Create "Elements" for images in this layer
-            sorted_images = sorted(layer.images, key=lambda x: x.order)
-            for img in sorted_images:
-                study_data["elements"].append({
-                    "id": str(img.image_id),
-                    "name": img.name,
-                    "content": img.url, # Use URL as content
-                    "category_id": cat_id,
-                    "category": {"name": layer.name, "order": layer.order}
-                })
-    else:
-        # Grid and text logic (both use categories and elements)
-        for cat in study_obj.categories:
-            study_data["categories"].append({
-                "id": str(cat.id),
-                "name": cat.name,
-                "order": cat.order
-            })
-            for el in cat.elements:
-                study_data["elements"].append({
-                    "id": str(el.id),
-                    "name": el.name,
-                    "content": el.content, # analysis uses content
-                    "category_id": str(cat.id),
-                    "category": {"name": cat.name, "order": cat.order} # Helper for analysis
-                })
-            
-    for q in study_obj.classification_questions:
-        study_data["classification_questions"].append({
-            "question_id": q.question_id,
-            "question_text": q.question_text,
-            "answer_options": q.answer_options,
-            "optional_classification_question": q.optional_classification_question,
-        })
-        
-    # 3. Generate Report
+    study_data = _build_study_data_dict(study_obj)
     analysis_options = get_study_analysis_settings(db, study_id, study=study_obj)
     analysis_service = StudyAnalysisService()
+    has_filters = filters_are_active(filters_dict)
+
     try:
-        excel_file = analysis_service.generate_report(df, study_data, analysis_options=analysis_options)
+        excel_file = analysis_service.generate_report(
+            df,
+            study_data,
+            analysis_options=analysis_options,
+            filters=filters_dict if has_filters else None,
+        )
+    except ValueError as e:
+        if "No respondents match the applied filters." in str(e):
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         print(f"Analysis generation failed: {e}")
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to generate analysis report: {str(e)}")
-    
-    filename = f"study_{study_id}_analysis.xlsx"
-    headers = {
-        "Content-Disposition": f"attachment; filename={filename}"
-    }
-    
+
+    filename = (
+        f"study_{study_id}_filtered_analysis.xlsx"
+        if has_filters
+        else f"study_{study_id}_analysis.xlsx"
+    )
+    headers = {"Content-Disposition": f"attachment; filename={filename}"}
     return StreamingResponse(
-        excel_file, 
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", 
-        headers=headers
+        excel_file,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
+
+@router.get("/export/study/{study_id}/flattened-csv")
+async def export_study_analysis(
+    study_id: UUID,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Export a comprehensive Excel report with regression analysis, segmentation, and clustering.
+    """
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    return _generate_study_excel_export_response(db, study_obj, current_user)
+
+
+@router.post("/export/study/{study_id}/flattened-csv")
+async def export_study_analysis_filtered(
+    study_id: UUID,
+    payload: FlattenedCsvExportPayload,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Export the full Excel analysis report for a filtered respondent cohort.
+    Uses the same filter logic as the analytics page.
+    """
+    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    if not filters_are_active(filters_dict):
+        return _generate_study_excel_export_response(db, study_obj, current_user)
+    return _generate_study_excel_export_response(
+        db,
+        study_obj,
+        current_user,
+        filters_dict=filters_dict,
     )
 
 def _authorize_study_for_analysis(db: Session, study_id: UUID, current_user: User) -> Study:

@@ -65,12 +65,35 @@ class StudyAnalysisService:
         Y = Y + rng.uniform(-0.5, 0.5, size=Y.shape) * 1e-5
         return Y
 
-    def generate_report(self, df: pd.DataFrame, study_data: Dict[str, Any], analysis_options: Optional[Dict[str, Any]] = None) -> io.BytesIO:
+    def generate_report(
+        self,
+        df: pd.DataFrame,
+        study_data: Dict[str, Any],
+        analysis_options: Optional[Dict[str, Any]] = None,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> io.BytesIO:
         """
         Generates the Excel report from the DataFrame and Study Data.
         Returns a BytesIO object containing the Excel file.
+
+        When ``filters`` is provided and non-empty, panelists are subset first via
+        ``_filter_df_by_filters`` and all sheets are computed on that cohort only.
         """
         analysis_options = self._resolve_analysis_options(analysis_options)
+        normalized_filters = self._normalize_filters_dict(filters)
+        filters_active = self._filters_are_active(normalized_filters)
+
+        if filters_active:
+            df = self._filter_df_by_filters(
+                df,
+                age_groups=normalized_filters.get("age_groups"),
+                genders=normalized_filters.get("genders"),
+                classification_filters=normalized_filters.get("classification_filters"),
+            )
+            df = df.sort_values([self.PANEL_COL, self.TASK_COL]).reset_index(drop=True) if not df.empty else df
+            if df.empty:
+                raise ValueError("No respondents match the applied filters.")
+
         # 1. Preprocess Data
         # Handle NA values if not already handled
         # df is passed in, assuming it's already reasonably clean from response service
@@ -171,6 +194,18 @@ class StudyAnalysisService:
             q_text = q.get("question_text")
             if q_text and q_text in df.columns:
                 classification_cols.append(q_text)
+
+        selected_classification_filters = normalized_filters.get("classification_filters") or {}
+        if filters_active and selected_classification_filters:
+            selected_questions = set(selected_classification_filters.keys())
+            unselected_classification_cols = [
+                col for col in classification_cols if col not in selected_questions
+            ]
+            if unselected_classification_cols:
+                df = df.drop(columns=unselected_classification_cols, errors="ignore")
+            classification_cols = [
+                col for col in classification_cols if col in selected_questions
+            ]
                 
         # 4. Run Analysis
         # 4a. Panel-level Regressions

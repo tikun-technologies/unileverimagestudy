@@ -519,6 +519,14 @@ class AnalyticsSessionResponse(BaseModel):
     analysis: Dict[str, Any] = Field(default_factory=dict)
 
 
+class FlattenedCsvExportPayload(BaseModel):
+    """Request body for POST /export/study/{study_id}/flattened-csv (filtered Excel report)."""
+    filters: Optional[StudyFilterCriteria] = Field(
+        None,
+        description="Filter criteria. Same shape as analytics filters; export is limited to matching panelists.",
+    )
+
+
 class OptimizedAnalysisPayload(BaseModel):
     """Request body for POST /study/{study_id}/optimized-analysis-json."""
     filters: Optional[StudyFilterCriteria] = Field(
