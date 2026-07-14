@@ -1422,7 +1422,8 @@ def update_study(
         study.orientation_text = payload.orientation_text
     if payload.study_type is not None:
         study.study_type = payload.study_type
-    if payload.background_image_url is not None:
+    # Explicit null clears a previously saved layer background
+    if 'background_image_url' in payload.model_fields_set:
         study.background_image_url = payload.background_image_url
     if payload.last_step is not None:
         # Only update last_step if the new value is greater (forward progress only)
@@ -1702,7 +1703,8 @@ def update_study_fast(
         study.orientation_text = payload.orientation_text
     if payload.study_type is not None:
         study.study_type = payload.study_type
-    if payload.background_image_url is not None:
+    # Explicit null clears a previously saved layer background
+    if 'background_image_url' in payload.model_fields_set:
         study.background_image_url = payload.background_image_url
     if payload.last_step is not None:
         # Only update last_step if the new value is greater (forward progress only)
@@ -1779,7 +1781,8 @@ def update_and_launch_study_fast(
         study.main_question = payload.main_question
     if payload.orientation_text is not None:
         study.orientation_text = payload.orientation_text
-    if payload.background_image_url is not None:
+    # Explicit null clears a previously saved layer background
+    if 'background_image_url' in payload.model_fields_set:
         study.background_image_url = payload.background_image_url
     if payload.rating_scale is not None:
         _validate_rating_scale(payload.rating_scale.model_dump())

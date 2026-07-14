@@ -83,6 +83,14 @@ class Settings(BaseSettings):
     TASK_GENERATION_CHUNK_SIZE: int = 50  # Process respondents in smaller chunks for memory efficiency
     MAX_MEMORY_USAGE_MB: int = 1024  # 1GB memory limit for task generation (matches Azure P2 plan)
     
+    # Template management allowlist (comma-separated emails). Add more emails here or via .env.
+    TEMPLATE_MANAGER_EMAILS: str = (
+        "tusharpareenja@gmail.com,"
+        "dlovej009@gmail.com,"
+        "j.b.fitterman@gmail.com,"
+        "kabircsecu@gmail.com"
+    )
+
     # Redis Settings (for pub/sub and app cache only — not Celery broker)
     REDIS_URL: str | None = Field(
         default=None,

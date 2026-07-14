@@ -105,3 +105,16 @@ def invalidate_study_cache(study_id: UUID | str) -> None:
     RedisCache.delete(f"study_analytics:{study_id_str}")
     # Drop any legacy optimized-analysis cache keys from older deployments
     RedisCache.delete_pattern(f"optimized_analysis:{study_id_str}:*")
+
+
+def invalidate_template_cache(template_id: UUID | str | None = None) -> None:
+    """
+    Invalidate published template caches.
+    Call on create / update / delete / publish / move-to-draft.
+    """
+    RedisCache.delete("templates:published:list")
+    RedisCache.delete_pattern("templates:published:list:*")
+    if template_id is not None:
+        RedisCache.delete(f"templates:published:item:{template_id}")
+    else:
+        RedisCache.delete_pattern("templates:published:item:*")
