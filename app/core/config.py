@@ -142,4 +142,16 @@ class Settings(BaseSettings):
     MERGE_STUDY_A: str | None = None
     MERGE_STUDY_B: str | None = None
 
+    # Analytics Assistant (GPT-4o-mini for intent only; facts are deterministic)
+    OPENAI_API_KEY: str | None = None
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    ASSISTANT_MODEL: str = "gpt-4o-mini"
+    ASSISTANT_MAX_INPUT_TOKENS: int = 1200
+    ASSISTANT_MAX_OUTPUT_TOKENS: int = 600
+    ASSISTANT_TIMEOUT_SECONDS: float = 12.0
+    ASSISTANT_RATE_LIMIT_PER_MINUTE: int = 30
+    ASSISTANT_CACHE_TTL_SECONDS: int = 300
+    ASSISTANT_MAX_RESULT_LIMIT: int = 20
+    ASSISTANT_OPTIMIZER_TIMEOUT_MS: int = 200
+
 settings = Settings()

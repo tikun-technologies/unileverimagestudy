@@ -105,6 +105,8 @@ def invalidate_study_cache(study_id: UUID | str) -> None:
     RedisCache.delete(f"study_analytics:{study_id_str}")
     # Drop any legacy optimized-analysis cache keys from older deployments
     RedisCache.delete_pattern(f"optimized_analysis:{study_id_str}:*")
+    # Verified assistant query cache
+    RedisCache.delete_pattern(f"assistant:query:{study_id_str}:*")
 
 
 def invalidate_template_cache(template_id: UUID | str | None = None) -> None:
