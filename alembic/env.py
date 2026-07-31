@@ -6,7 +6,16 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
-from app.models import user_model, study_model, response_model, panelist_model, job_model, project_model, template_model
+from app.models import (
+    user_model,
+    study_model,
+    response_model,
+    panelist_model,
+    job_model,
+    project_model,
+    template_model,
+    assistant_message_model,
+)
 
 
 # this is the Alembic Config object, which provides

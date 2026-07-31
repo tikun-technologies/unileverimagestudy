@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import unittest
 
-from app.schemas.assistant_schema import AssistantQueryRequest, AssistantToolName, RankDirection
-from app.schemas.assistant_schema import AssistantMetric
+from app.schemas.assistant_schema import (
+    AssistantMetric,
+    AssistantQueryPlan,
+    AssistantQueryRequest,
+    AssistantToolName,
+    RankDirection,
+)
 from app.services.assistant_service import (
+    _cache_key,
     _deterministic_plan,
+    _extract_must_include,
+    _has_responses,
+    _is_simple_greeting,
     _normalize_plan_for_question,
     _parse_plan,
 )
@@ -49,6 +58,62 @@ class AssistantPlannerTests(unittest.TestCase):
         )
         self.assertEqual(plan.limit, 5)
         self.assertEqual(plan.direction, RankDirection.lowest)
+
+    def test_top_two_designs_word_count(self):
+        req = AssistantQueryRequest(message="top two designs")
+        plan = _normalize_plan_for_question(
+            _deterministic_plan(req.message, req),
+            req.message,
+            "layer",
+            req,
+        )
+        self.assertEqual(plan.tool, AssistantToolName.rank_designs)
+        self.assertEqual(plan.limit, 2)
+        self.assertEqual(plan.direction, RankDirection.highest)
+
+    def test_best_three_mixes_word_count(self):
+        req = AssistantQueryRequest(message="show me the best three mixes")
+        plan = _normalize_plan_for_question(
+            _deterministic_plan(req.message, req),
+            req.message,
+            "layer",
+            req,
+        )
+        self.assertEqual(plan.tool, AssistantToolName.rank_designs)
+        self.assertEqual(plan.limit, 3)
+
+    def test_winning_package_maps_to_rank_designs(self):
+        req = AssistantQueryRequest(message="what is the winning package")
+        plan = _normalize_plan_for_question(
+            _deterministic_plan(req.message, req),
+            req.message,
+            "layer",
+            req,
+        )
+        self.assertEqual(plan.tool, AssistantToolName.rank_designs)
+        self.assertEqual(plan.limit, 1)
+
+    def test_highest_scoring_combination_is_best_design_not_element(self):
+        """Client phrasing must not treat 'highest-scoring' as a must_include element."""
+        for msg in (
+            "What is the highest-scoring combination?",
+            "what is the highest scoring combination",
+            "highest-scoring design",
+            "show the top-performing combination",
+        ):
+            self.assertEqual(_extract_must_include(msg), [], msg)
+            req = AssistantQueryRequest(message=msg)
+            # Also strip bad must_include if the model wrongly filled it.
+            dirty = AssistantQueryPlan(
+                tool=AssistantToolName.rank_designs,
+                must_include=["highest-scoring"],
+                limit=4,
+            )
+            plan = _normalize_plan_for_question(dirty, msg, "layer", req)
+            self.assertEqual(plan.tool, AssistantToolName.rank_designs, msg)
+            self.assertEqual(plan.limit, 1, msg)
+            self.assertEqual(plan.direction, RankDirection.highest, msg)
+            self.assertEqual(plan.must_include, [], msg)
 
     def test_classification_plan(self):
         req = AssistantQueryRequest(message="how many answered this classification question and what are the other options")
@@ -271,6 +336,60 @@ class AssistantPlannerTests(unittest.TestCase):
         )
         plan = _normalize_plan_for_question(model_plan, req.message, "layer", req)
         self.assertEqual(plan.segment_key, "45-54")
+
+
+class AgentRoutingTests(unittest.TestCase):
+    """Guards on when the agent is skipped in favour of the cheaper planner."""
+
+    def test_bare_pleasantries_skip_the_agent(self):
+        for message in ("hi", "Hello!", "hey", "thanks", "Good morning", "thank you"):
+            self.assertTrue(_is_simple_greeting(message), message)
+
+    def test_real_questions_do_not_look_like_greetings(self):
+        for message in (
+            "hi, which element should I show the client?",
+            "hello — compare men and women",
+            "thanks, now show the worst design",
+        ):
+            self.assertFalse(_is_simple_greeting(message), message)
+
+    def test_studies_without_responses_skip_the_agent(self):
+        self.assertFalse(_has_responses(None))
+        self.assertFalse(_has_responses({}))
+        self.assertFalse(_has_responses({"dashboard_summary": {"totalResponses": 0}}))
+        self.assertTrue(_has_responses({"dashboard_summary": {"totalResponses": 12}}))
+
+
+class ResponseCacheKeyTests(unittest.TestCase):
+    """
+    Regression: the cached final answer must be scoped to the analysis settings
+    active when it was produced. Without this, toggling something like
+    with/without intercept keeps serving the old answer text (computed under the
+    old setting) for up to ASSISTANT_CACHE_TTL_SECONDS, regardless of a page
+    refresh or clearing the chat — those don't touch this server-side cache.
+    """
+
+    def _payload(self, analysis_settings):
+        return {
+            "assistant_semantics_version": 22,
+            "message": "what is the top design combination",
+            "filters": None,
+            "metric": "T",
+            "segment_section": None,
+            "segment_key": None,
+            "follow_up": None,
+            "analysis_settings": analysis_settings,
+        }
+
+    def test_different_settings_produce_different_keys(self):
+        key_without = _cache_key("study-1", "user-1", self._payload({"use_intercept": False}))
+        key_with = _cache_key("study-1", "user-1", self._payload({"use_intercept": True}))
+        self.assertNotEqual(key_without, key_with)
+
+    def test_same_settings_reuse_the_same_key(self):
+        key_a = _cache_key("study-1", "user-1", self._payload({"use_intercept": False}))
+        key_b = _cache_key("study-1", "user-1", self._payload({"use_intercept": False}))
+        self.assertEqual(key_a, key_b)
 
 
 if __name__ == "__main__":

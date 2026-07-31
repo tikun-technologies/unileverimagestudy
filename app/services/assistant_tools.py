@@ -7,13 +7,18 @@ verified evidence packets from cached/generated analysis.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, defer, selectinload
 
+from app.core.cache import RedisCache
 from app.core.config import settings
 from app.core.domain import is_unilever_domain
 from app.models.response_model import ClassificationAnswer, StudyResponse
@@ -28,6 +33,7 @@ from app.schemas.assistant_schema import (
     AssistantQueryPlan,
     AssistantToolName,
     ClassificationOptionCount,
+    CompareMode,
     DesignElementSnapshot,
     DesignRankItem,
     ElementRankItem,
@@ -96,13 +102,76 @@ def _build_study_data_dict(study_obj: Study) -> Dict[str, Any]:
     return build_study_data_for_analysis(study_obj)
 
 
+# Small in-process memo so repeated identical-filter loads inside one request
+# (e.g. compare / cohort tools) never rebuild — even if Redis is unavailable.
+# Bounded + short TTL to avoid stale data and unbounded memory growth.
+_ANALYSIS_MEMO: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
+_ANALYSIS_MEMO_MAX = 32
+_ANALYSIS_MEMO_TTL = 20.0
+
+
+def _analysis_cache_key(
+    study_id: Any,
+    unilever_format: bool,
+    filters: Optional[Dict[str, Any]],
+    analysis_options: Optional[Dict[str, Any]] = None,
+) -> str:
+    # analysis_options must be part of the key: the report's numbers are computed
+    # from them (with/without intercept, thresholds, ...). Without this, toggling
+    # a setting silently keeps serving numbers computed under the old one until
+    # the TTL happens to expire.
+    payload = json.dumps(
+        {"filters": filters or {}, "analysis_options": analysis_options or {}},
+        sort_keys=True,
+        default=str,
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+    fmt = "uni" if unilever_format else "std"
+    return f"assistant:analysis:{study_id}:{fmt}:{digest}"
+
+
+def _analysis_memo_get(key: str) -> Optional[Dict[str, Any]]:
+    entry = _ANALYSIS_MEMO.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if (time.monotonic() - ts) > _ANALYSIS_MEMO_TTL:
+        _ANALYSIS_MEMO.pop(key, None)
+        return None
+    _ANALYSIS_MEMO.move_to_end(key)
+    return value
+
+
+def _analysis_memo_set(key: str, value: Dict[str, Any]) -> None:
+    _ANALYSIS_MEMO[key] = (time.monotonic(), value)
+    _ANALYSIS_MEMO.move_to_end(key)
+    while len(_ANALYSIS_MEMO) > _ANALYSIS_MEMO_MAX:
+        _ANALYSIS_MEMO.popitem(last=False)
+
+
 def load_analysis_for_assistant(
     db: Session,
     study_obj: Study,
     current_user: User,
     filters: Optional[Dict[str, Any]] = None,
+    *,
+    use_cache: bool = True,
 ) -> Dict[str, Any]:
     unilever_format = is_unilever_domain(current_user.email or "")
+    # Fetched before the cache lookup — it's one indexed row, and the key must
+    # include it (see _analysis_cache_key).
+    analysis_options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
+    cache_key = _analysis_cache_key(study_obj.id, unilever_format, filters, analysis_options)
+
+    if use_cache:
+        memo = _analysis_memo_get(cache_key)
+        if memo is not None:
+            return memo
+        cached = RedisCache.get(cache_key)
+        if isinstance(cached, dict) and cached:
+            _analysis_memo_set(cache_key, cached)
+            return cached
+
     response_service = StudyResponseService(db)
     df = response_service.get_study_dataframe(
         study_obj.id,
@@ -110,7 +179,6 @@ def load_analysis_for_assistant(
         completed_only=True,
     )
     study_data = _build_study_data_dict(study_obj)
-    analysis_options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
     analysis_service = StudyAnalysisService()
     report = analysis_service.generate_json_report(
         df,
@@ -119,7 +187,20 @@ def load_analysis_for_assistant(
         analysis_options=analysis_options,
         filters=filters or None,
     )
-    return report or {}
+    report = report or {}
+
+    if use_cache and report:
+        _analysis_memo_set(cache_key, report)
+        try:
+            RedisCache.set(
+                cache_key,
+                report,
+                ttl_seconds=settings.ASSISTANT_ANALYSIS_CACHE_TTL_SECONDS,
+            )
+        except Exception:
+            pass
+
+    return report
 
 
 def _segment_label(
@@ -529,8 +610,9 @@ def tool_study_overview(analysis: Dict[str, Any], context: AppliedContext) -> Di
 
 
 def _classification_questions(study_obj: Study) -> List[StudyClassificationQuestion]:
+    questions = getattr(study_obj, "classification_questions", None) or []
     return sorted(
-        list(study_obj.classification_questions or []),
+        list(questions),
         key=lambda q: (q.order if q.order is not None else 0, q.question_text or ""),
     )
 
@@ -649,6 +731,23 @@ def match_classification_options_in_text(study_obj: Study, message: str) -> List
         if len(found) >= 8:
             break
     return found
+
+
+def resolve_classification_option_hint(study_obj: Study, hint: str) -> Optional[str]:
+    """Map a short token like 'rarely' to a configured option label."""
+    hint_norm = _normalize_key(hint)
+    if len(hint_norm) < 3:
+        return None
+    best: Optional[str] = None
+    for question in _classification_questions(study_obj):
+        for label in _extract_option_texts(question.answer_options):
+            label_norm = _normalize_key(label)
+            if hint_norm == label_norm:
+                return label
+            if hint_norm in label_norm or label_norm.startswith(hint_norm):
+                if best is None or len(label) < len(best):
+                    best = label
+    return best
 
 
 def resolve_classification_question_from_options(
@@ -1511,7 +1610,16 @@ def tool_rank_designs(
         )
     ]
     actions = [
-        AssistantAction(type="open_configurator", label="Open design configurator", payload={"view": "configurator"}).model_dump(),
+        AssistantAction(
+            type="open_configurator",
+            label="Open top design in configurator",
+            payload={
+                "view": "configurator",
+                "design": verified_designs[0].model_dump(),
+                "metric": METRIC_LABELS.get(metric, metric),
+                "segment_label": _segment_label(plan.segment_section, plan.segment_key),
+            },
+        ).model_dump(),
         AssistantAction(
             type="save_design",
             label="Save top design",
@@ -1644,6 +1752,1171 @@ def tool_explain_design(
             last_limit=2,
         ).model_dump(),
         "usage": ranked_result.get("usage", {}),
+    }
+
+
+def merge_assistant_filters(
+    base: Optional[Dict[str, Any]],
+    extra: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Merge analytics filter dicts (age, gender, classification)."""
+    merged: Dict[str, Any] = dict(base or {})
+    if not extra:
+        return merged
+    for key in ("age_groups", "genders"):
+        vals = extra.get(key)
+        if vals:
+            merged[key] = list(vals)
+    extra_class = extra.get("classification_filters") or {}
+    if extra_class:
+        current = dict(merged.get("classification_filters") or {})
+        for q_text, answers in extra_class.items():
+            if not answers:
+                continue
+            current[str(q_text)] = [str(a) for a in answers]
+        merged["classification_filters"] = current
+    return merged
+
+
+def build_cohort_filter_payload(
+    study_obj: Study,
+    plan: AssistantQueryPlan,
+    *,
+    option_labels: Optional[List[str]] = None,
+    gender_key: Optional[str] = None,
+    age_key: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]], Optional[str], List[str]]:
+    """
+    Resolve classification cohort filters for ranking/compare.
+
+    Returns (question_text, filters_dict, clarify_prompt, clarify_options).
+    """
+    options = [
+        str(item).strip()
+        for item in (option_labels or plan.classification_options or [])
+        if str(item or "").strip()
+    ][:8]
+    gender = _normalize_gender_label(gender_key or plan.gender_key)
+    age = resolve_age_segment_key(age_key or plan.age_key)
+    if age == "13-17":
+        age = "13-18"
+
+    question, candidates = _resolve_classification_question(study_obj, plan.classification_question)
+    if question is None and options:
+        question, candidates = resolve_classification_question_from_options(study_obj, options)
+
+    if question is None:
+        if options and len(candidates) > 1:
+            return (
+                None,
+                None,
+                f"“{options[0]}” appears on more than one classification question. Which question do you mean?",
+                candidates[:8],
+            )
+        if options:
+            return (
+                None,
+                None,
+                "Which classification question should I use for "
+                + ", ".join(f"“{opt}”" for opt in options)
+                + "?",
+                candidates[:8],
+            )
+        return None, None, "Which classification answer should I filter to?", candidates[:8]
+
+    if not options and plan.classification_question:
+        return None, None, "Which classification answer option should I use?", _extract_option_texts(question.answer_options)[:8]
+
+    if not options:
+        return None, None, "Which classification answer should I filter to?", _extract_option_texts(question.answer_options)[:8]
+
+    payload: Dict[str, Any] = {
+        "classification_filters": {question.question_text: options[:8]},
+    }
+    if gender:
+        payload["genders"] = [gender]
+    if age:
+        payload["age_groups"] = [age]
+    return question.question_text, payload, None, []
+
+
+def _strip_compare_verb(side: str) -> str:
+    return re.sub(
+        r"^(?:please\s+)?(?:compare|show|give(?:\s+me)?|what(?:'s|\s+is)\s+the\s+)?"
+        r"(?:the\s+)?(?:difference|differences|gap|contrast)\s+(?:between\s+)?"
+        r"|(?:please\s+)?(?:compare|show|give(?:\s+me)?)\s+",
+        "",
+        (side or "").strip(" ,;:-"),
+        flags=re.IGNORECASE,
+    ).strip()
+
+
+def _message_has_both_genders(text: str) -> bool:
+    lowered = (text or "").casefold()
+    has_male = bool(re.search(r"\b(?:male|males|men|man)\b", lowered))
+    has_female = bool(re.search(r"\b(?:female|females|women|woman)\b", lowered))
+    return has_male and has_female
+
+
+def _looks_like_compare_side_pair(left: str, right: str) -> bool:
+    """True when an 'and'-split looks like two real compare targets (not prose)."""
+    g1, g2 = extract_gender_from_text(left), extract_gender_from_text(right)
+    if g1 and g2 and g1 != g2:
+        return True
+    a1 = extract_age_segment_from_text(left) or resolve_age_segment_key(left)
+    a2 = extract_age_segment_from_text(right) or resolve_age_segment_key(right)
+    if a1 and a2 and a1 != a2:
+        return True
+    r1, r2 = parse_design_rank_hint(left), parse_design_rank_hint(right)
+    if r1 and r2 and r1 != r2:
+        return True
+    p1 = left if left in {"best", "worst"} else parse_design_polarity_hint(left)
+    p2 = right if right in {"best", "worst"} else parse_design_polarity_hint(right)
+    if p1 in {"best", "worst"} and p2 in {"best", "worst"} and p1 != p2:
+        return True
+    # Soft polarity slang on either side ("bestie", "fave") still counts.
+    soft_best = re.compile(
+        r"\b(?:best|top|bestie|fave|favorite|favourite|winner|winning)\b",
+        flags=re.IGNORECASE,
+    )
+    soft_worst = re.compile(
+        r"\b(?:worst|least|lowest|bottom|loser|losing)\b",
+        flags=re.IGNORECASE,
+    )
+    if soft_best.search(left) and soft_best.search(right) and (g1 or a1) and (g2 or a2):
+        return True
+    if soft_best.search(left) and soft_worst.search(right):
+        return True
+    if soft_worst.search(left) and soft_best.search(right):
+        return True
+    return False
+
+
+def extract_compare_pair(message: str) -> Optional[Tuple[str, str]]:
+    """
+    Split free-text into left/right compare targets.
+
+    Supports vs/versus, difference between X and Y, X compared to Y, contrast,
+    and careful 'and' splits when both sides look like real targets.
+    """
+    if not message:
+        return None
+    text = message.strip()
+
+    # "difference between X and Y" / "differences between X & Y"
+    between = re.search(
+        r"\b(?:difference|differences|gap|contrast)\s+between\s+(.+?)\s+and\s+(.+?)(?:[?.!]\s*)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if between:
+        left = between.group(1).strip(" ,;:-")
+        right = between.group(2).strip(" ,;:-")
+        if left and right:
+            return left, right
+
+    # "how does X differ from Y" / "how do X and Y differ"
+    differ_from = re.search(
+        r"\bhow\s+do(?:es)?\s+(.+?)\s+differ(?:s)?\s+from\s+(.+?)(?:[?.!]\s*)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if differ_from:
+        left = differ_from.group(1).strip(" ,;:-")
+        right = differ_from.group(2).strip(" ,;:-")
+        if left and right:
+            return left, right
+
+    # "contrast X with Y" / "contrast X and Y"
+    contrast = re.search(
+        r"\bcontrast\s+(.+?)\s+(?:with|and|vs\.?|versus)\s+(.+?)(?:[?.!]\s*)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if contrast:
+        left = contrast.group(1).strip(" ,;:-")
+        right = contrast.group(2).strip(" ,;:-")
+        if left and right:
+            return left, right
+
+    # "X compared to Y" / "X compared with Y" / "X relative to Y"
+    compared = re.search(
+        r"(.+?)\s+(?:compared\s+(?:to|with)|relative\s+to)\s+(.+?)(?:[?.!]\s*)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if compared:
+        left = _strip_compare_verb(compared.group(1))
+        right = compared.group(2).strip(" ,;:-")
+        if left and right and _looks_like_compare_side_pair(left, right):
+            return left, right
+
+    match = re.search(
+        r"(.+?)\s+(?:vs\.?|versus|against)\s+(.+?)(?:[?.!]\s*)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        left = _strip_compare_verb(match.group(1))
+        right = match.group(2).strip(" ,;:-")
+        if left and right:
+            return left, right
+
+    # "compare male best design and female best design"
+    # Only accept 'and' when both sides look like real compare targets.
+    and_match = re.search(
+        r"(.+?)\s+\band\b\s+(.+?)(?:[?.!]\s*)?$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if and_match:
+        left = _strip_compare_verb(and_match.group(1))
+        right = and_match.group(2).strip(" ,;:-")
+        if left and right and _looks_like_compare_side_pair(left, right):
+            return left, right
+    return None
+
+
+def parse_design_rank_hint(text: str) -> Optional[int]:
+    match = re.search(r"\bdesign\s*#?\s*(\d+)\b", text or "", flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        rank = int(match.group(1))
+    except ValueError:
+        return None
+    return rank if 1 <= rank <= 20 else None
+
+
+_WORD_COUNTS_COMPARE = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+_BEST_POLARITY_RE = re.compile(
+    r"\b(?:best|bestie|top|highest|leading|strongest|winning|fave|favorite|favourite)\b",
+    flags=re.IGNORECASE,
+)
+_WORST_POLARITY_RE = re.compile(
+    r"\b(?:worst|least(?:[\s-]+performing)?|lowest|bottom|underperform(?:ing)?|losing)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_design_polarity_hint(text: str) -> Optional[str]:
+    """Return 'best' or 'worst' when a side clearly asks for polarity ranking."""
+    if not text:
+        return None
+    has_worst = bool(_WORST_POLARITY_RE.search(text))
+    has_best = bool(_BEST_POLARITY_RE.search(text))
+    if has_worst and not has_best:
+        return "worst"
+    if has_best and not has_worst:
+        return "best"
+    return None
+
+
+def is_best_vs_worst_design_query(message: str) -> bool:
+    """Detect 'compare top/best and worst design' / 'best vs worst' style asks."""
+    if not message:
+        return False
+    text = message.casefold()
+    # "top" / "highest" are common synonyms for best in user phrasing.
+    has_best = bool(_BEST_POLARITY_RE.search(text))
+    has_worst = bool(_WORST_POLARITY_RE.search(text))
+    if not (has_best and has_worst):
+        return False
+    # "top two designs" is a ranked pair, not best-vs-worst polarity.
+    if re.search(
+        r"\b(?:top|best|highest|leading)\s+(?:\d{1,2}|"
+        + "|".join(_WORD_COUNTS_COMPARE.keys())
+        + r")\b",
+        text,
+    ):
+        return False
+    has_design = bool(re.search(r"\b(?:design|mix|combination|package|stack|creative)s?\b", text))
+    has_compare = bool(
+        re.search(
+            r"\b(?:compare|vs|versus|against|and|difference|differences|contrast|differ)\b",
+            text,
+        )
+    )
+    # "compare best and worst" / "difference between best and worst" is still valid.
+    return has_design or has_compare
+
+
+def is_compare_top_designs_query(message: str) -> bool:
+    """
+    True only for an explicit ranked-pair ask: compare the top/best N designs
+    or Design #1 vs #2.
+
+    Intentionally narrow — “top 10 designs” alone is rank_designs, not compare.
+    Free paraphrases like “difference between male best and female best” must
+    NOT collapse to Design #1 vs #2.
+    """
+    if not message:
+        return False
+    text = message.casefold()
+    if is_best_vs_worst_design_query(text):
+        return False
+    # Male best vs Female best (any phrasing) is a segment compare.
+    if _message_has_both_genders(text):
+        return False
+    ages = re.findall(r"\b(\d{1,2}\s*[-–to]{1,3}\s*\d{1,2})\b", text)
+    if len({resolve_age_segment_key(a) or a for a in ages}) >= 2:
+        return False
+    if not re.search(r"\b(?:design|mix|combination|package|stack|creative)s?\b", text):
+        return False
+
+    # Design #1 vs #2 is always a design-pair compare.
+    if re.search(r"\bdesign\s*#?\s*1\b.+\bdesign\s*#?\s*2\b", text):
+        return True
+
+    # Must ask to compare/contrast — not merely “show top 10 designs”.
+    has_compare_verb = bool(
+        re.search(
+            r"\b(?:compare|comparison|difference\s+between|differences\s+between|"
+            r"contrast|side[\s-]?by[\s-]?side)\b",
+            text,
+        )
+    )
+    if not has_compare_verb:
+        return False
+
+    # Explicit count: "compare top two designs", "compare the best 2 mixes".
+    if re.search(
+        r"\b(?:top|best|highest|leading)\s+(?:\d{1,2}|"
+        + "|".join(_WORD_COUNTS_COMPARE.keys())
+        + r")\s+(?:design|mix|combination|package|stack|creative)s?\b",
+        text,
+    ):
+        return True
+    # "compare the top designs" / "compare the best designs" with no other sides.
+    if re.search(
+        r"\b(?:compare|difference\s+between|differences\s+between)\s+(?:the\s+)?"
+        r"(?:top|best|leading)\s+(?:design|mix|combination)s?\b",
+        text,
+    ) and not extract_compare_pair(message):
+        return True
+    return False
+
+
+def is_compare_intent(message: str) -> bool:
+    """
+    True when the user is asking for a side-by-side / difference — not only the
+    word “compare”. Covers client paraphrases like “difference between…”.
+    """
+    if not message:
+        return False
+    text = message.casefold()
+    if re.search(
+        r"\b(?:compare|comparison|versus|vs\.?|against|contrast|"
+        r"differ(?:ence|ences)?|difference\s+between|differences\s+between|"
+        r"compared\s+to|relative\s+to|side[\s-]?by[\s-]?side)\b",
+        text,
+    ):
+        return True
+    if re.search(r"\bhow\s+do(?:es)?\b.+\bdiffer\b", text):
+        return True
+    if extract_compare_pair(message):
+        return True
+    if is_best_vs_worst_design_query(text) or is_compare_top_designs_query(text):
+        return True
+    return False
+
+
+def infer_compare_mode(
+    message: str,
+    study_obj: Study,
+    plan: AssistantQueryPlan,
+) -> Tuple[Optional[CompareMode], Optional[str], Optional[str]]:
+    """Infer pairwise compare mode and targets from message + plan."""
+    left = plan.compare_left
+    right = plan.compare_right
+    if not left or not right:
+        pair = extract_compare_pair(message)
+        if pair:
+            left, right = pair
+
+    # "compare top two designs" → side-by-side of ranked Design #1 vs #2.
+    if is_compare_top_designs_query(message):
+        return CompareMode.design, "design 1", "design 2"
+
+    # Whole-message best vs worst (works with "and" as well as "vs").
+    if is_best_vs_worst_design_query(message):
+        # Prefer polarity over segment/option when both best and worst are present.
+        # Exception: "best design for males vs females" is a segment ask, not best/worst.
+        segment_pair = bool(
+            left
+            and right
+            and (
+                (extract_gender_from_text(left) and extract_gender_from_text(right))
+                or (
+                    (extract_age_segment_from_text(left) or resolve_age_segment_key(left))
+                    and (extract_age_segment_from_text(right) or resolve_age_segment_key(right))
+                )
+            )
+        )
+        if not segment_pair:
+            return CompareMode.design, "best", "worst"
+
+    if not left or not right:
+        return None, None, None
+
+    left_rank = parse_design_rank_hint(left)
+    right_rank = parse_design_rank_hint(right)
+    if left_rank and right_rank:
+        return CompareMode.design, str(left_rank), str(right_rank)
+
+    if (
+        extract_gender_from_text(left)
+        or extract_gender_from_text(right)
+        or extract_age_segment_from_text(left)
+        or extract_age_segment_from_text(right)
+        or resolve_age_segment_key(left)
+        or resolve_age_segment_key(right)
+        or re.search(r"mindset\s*\d", left, flags=re.IGNORECASE)
+        or re.search(r"mindset\s*\d", right, flags=re.IGNORECASE)
+    ):
+        return CompareMode.segment, left, right
+
+    left_opts = match_classification_options_in_text(study_obj, left)
+    right_opts = match_classification_options_in_text(study_obj, right)
+    if not left_opts:
+        hinted = resolve_classification_option_hint(study_obj, left)
+        if hinted:
+            left_opts = [hinted]
+    if not right_opts:
+        hinted = resolve_classification_option_hint(study_obj, right)
+        if hinted:
+            right_opts = [hinted]
+    if left_opts and right_opts:
+        return CompareMode.classification, left_opts[0], right_opts[0]
+    if left_opts or right_opts:
+        return CompareMode.classification, left_opts[0] if left_opts else left, right_opts[0] if right_opts else right
+
+    left_polarity = left if left in {"best", "worst"} else parse_design_polarity_hint(left)
+    right_polarity = right if right in {"best", "worst"} else parse_design_polarity_hint(right)
+    if (
+        left_polarity in {"best", "worst"}
+        and right_polarity in {"best", "worst"}
+        and left_polarity != right_polarity
+    ):
+        return CompareMode.design, "best", "worst"
+
+    if left_rank or right_rank:
+        return CompareMode.design, str(left_rank or 1), str(right_rank or 2)
+
+    return CompareMode.segment, left, right
+
+
+def _top_design_from_rank_result(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    block = next((b for b in result.get("blocks", []) if b.get("type") == "top_k_designs"), None)
+    designs = ((block or {}).get("data") or {}).get("designs") or []
+    return designs[0] if designs else None
+
+
+def _design_at_rank_from_result(result: Dict[str, Any], rank_num: int) -> Optional[Dict[str, Any]]:
+    block = next((b for b in result.get("blocks", []) if b.get("type") == "top_k_designs"), None)
+    designs = ((block or {}).get("data") or {}).get("designs") or []
+    for design in designs:
+        if int(design.get("rank") or 0) == rank_num:
+            return design
+    if 1 <= rank_num <= len(designs):
+        return designs[rank_num - 1]
+    return None
+
+
+def _top_element_from_rank_result(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    block = next((b for b in result.get("blocks", []) if b.get("type") == "top_bottom_elements"), None)
+    items = ((block or {}).get("data") or {}).get("items") or []
+    return items[0] if items else None
+
+
+def _resolve_segment_side(
+    analysis: Dict[str, Any],
+    metric: str,
+    side_text: str,
+) -> Tuple[Optional[str], Optional[str], str]:
+    """Map free text to (segment_section, segment_key, label)."""
+    label = side_text.strip()
+    gender = extract_gender_from_text(side_text)
+    age = extract_age_segment_from_text(side_text) or resolve_age_segment_key(side_text)
+    if gender and age:
+        canon = _canonical_segment_key(analysis, metric, "Gender", gender) or gender
+        return "Gender", canon, f"{gender} · {age}"
+    if gender:
+        canon = _canonical_segment_key(analysis, metric, "Gender", gender) or gender
+        return "Gender", canon, gender
+    if age:
+        canon = _canonical_segment_key(analysis, metric, "Age", age) or age
+        return "Age", canon, age
+    mindset = re.search(r"mindset\s*(\d+)", side_text, flags=re.IGNORECASE)
+    if mindset:
+        key = f"Mindset {mindset.group(1)}"
+        canon = _canonical_segment_key(analysis, metric, "Mindsets", key) or key
+        return "Mindsets", canon, canon
+    canon = _canonical_segment_key(analysis, metric, "Age", side_text)
+    if canon:
+        return "Age", canon, canon
+    canon = _canonical_segment_key(analysis, metric, "Gender", side_text)
+    if canon:
+        return "Gender", canon, canon
+    return None, None, label
+
+
+def _compare_side_snapshot(
+    analysis: Dict[str, Any],
+    study_obj: Study,
+    plan: AssistantQueryPlan,
+    *,
+    label: str,
+    segment_section: Optional[str] = None,
+    segment_key: Optional[str] = None,
+    gender_key: Optional[str] = None,
+    age_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    metric = metric_prefix((plan.metric or AssistantMetric.T).value)
+    side_plan = plan.model_copy(
+        update={
+            "segment_section": segment_section,
+            "segment_key": segment_key,
+            "gender_key": gender_key,
+            "age_key": age_key,
+            "limit": 1,
+            "direction": RankDirection.highest,
+        }
+    )
+    design_result = tool_rank_designs(analysis, study_obj, side_plan)
+    element_result = tool_rank_elements(analysis, study_obj, side_plan)
+    top_design = _top_design_from_rank_result(design_result)
+    top_element = _top_element_from_rank_result(element_result)
+    return {
+        "label": label,
+        "segment_section": segment_section,
+        "segment_key": segment_key,
+        "gender_key": gender_key,
+        "age_key": age_key,
+        "top_design": top_design,
+        "top_element": top_element,
+        "design_answer": design_result.get("answer_text"),
+        "element_answer": element_result.get("answer_text"),
+        "available": bool(top_design or top_element),
+    }
+
+
+def _biggest_gender_element_gap(analysis: Dict[str, Any], metric: str) -> Optional[Dict[str, Any]]:
+    section = analysis.get(section_key_for(metric, "Gender")) or {}
+    categories = section.get("categories") or []
+    if not categories:
+        return None
+    best_gap = 0.0
+    best_row: Optional[Dict[str, Any]] = None
+    for category in categories:
+        for element in category.get("elements") or []:
+            values = element.get("values") or {}
+            if not isinstance(values, dict):
+                continue
+            male_raw = values.get("Male")
+            female_raw = values.get("Female")
+            if male_raw is None or female_raw is None:
+                continue
+            male_val = float(male_raw.get("value") if isinstance(male_raw, dict) else male_raw or 0)
+            female_val = float(female_raw.get("value") if isinstance(female_raw, dict) else female_raw or 0)
+            gap = round(abs(male_val - female_val), 4)
+            if gap >= best_gap:
+                best_gap = gap
+                leader = "Male" if male_val >= female_val else "Female"
+                best_row = {
+                    "element": element.get("name"),
+                    "category": category.get("name"),
+                    "male": male_val,
+                    "female": female_val,
+                    "gap": gap,
+                    "leader": leader,
+                }
+    return best_row
+
+
+def _biggest_age_element_gap(analysis: Dict[str, Any], metric: str) -> Optional[Dict[str, Any]]:
+    section = analysis.get(section_key_for(metric, "Age")) or {}
+    categories = section.get("categories") or []
+    segments = list((section.get("segments") or {}).keys())
+    if len(segments) < 2 or not categories:
+        return None
+    seg_a, seg_b = segments[0], segments[1]
+    best_gap = 0.0
+    best_row: Optional[Dict[str, Any]] = None
+    for category in categories:
+        for element in category.get("elements") or []:
+            values = element.get("values") or {}
+            if not isinstance(values, dict):
+                continue
+            raw_a = values.get(seg_a)
+            raw_b = values.get(seg_b)
+            if raw_a is None or raw_b is None:
+                continue
+            val_a = float(raw_a.get("value") if isinstance(raw_a, dict) else raw_a or 0)
+            val_b = float(raw_b.get("value") if isinstance(raw_b, dict) else raw_b or 0)
+            gap = round(abs(val_a - val_b), 4)
+            if gap >= best_gap:
+                best_gap = gap
+                leader = seg_a if val_a >= val_b else seg_b
+                best_row = {
+                    "element": element.get("name"),
+                    "category": category.get("name"),
+                    "left_segment": seg_a,
+                    "right_segment": seg_b,
+                    "left_value": val_a,
+                    "right_value": val_b,
+                    "gap": gap,
+                    "leader": leader,
+                }
+    return best_row
+
+
+def _top_classification_split(db: Session, study_obj: Study) -> Optional[Dict[str, Any]]:
+    questions = _classification_questions(study_obj)
+    if not questions:
+        return None
+    question = questions[0]
+    labels, lookup = _option_answer_maps(question.answer_options)
+    if not labels:
+        return None
+    response_ids = _filter_completed_responses_by_demographics(db, study_obj.id, None, None)
+    if not response_ids:
+        return None
+    rows = db.execute(
+        select(ClassificationAnswer.study_response_id, ClassificationAnswer.answer).where(
+            ClassificationAnswer.study_response_id.in_(response_ids),
+            ClassificationAnswer.question_text == question.question_text,
+        )
+    ).all()
+    counts: Dict[str, int] = {label: 0 for label in labels}
+    answered = 0
+    for _rid, raw in rows:
+        mapped = _map_classification_answer(str(raw or ""), lookup)
+        if mapped in counts:
+            counts[mapped] += 1
+            answered += 1
+    if answered <= 0:
+        return None
+    top_option = max(counts.items(), key=lambda item: (item[1], item[0].casefold()))
+    pct = round(100.0 * top_option[1] / answered, 1)
+    return {
+        "question": question.question_text,
+        "option": top_option[0],
+        "count": top_option[1],
+        "answered": answered,
+        "percentage": pct,
+    }
+
+
+def tool_compare(
+    db: Session,
+    analysis: Dict[str, Any],
+    study_obj: Study,
+    current_user: User,
+    plan: AssistantQueryPlan,
+    filters: Optional[Dict[str, Any]],
+    message: str,
+) -> Dict[str, Any]:
+    """Side-by-side compare for two segments, designs, or classification cohorts."""
+    metric = metric_prefix((plan.metric or AssistantMetric.T).value)
+    mode, left, right = infer_compare_mode(message, study_obj, plan)
+    if not mode or not left or not right:
+        return {
+            "status": "needs_clarification",
+            "answer_text": "What should I compare side by side? Try “Male vs Female”, “18-24 vs 45-54”, or “Design #1 vs Design #2”.",
+            "clarification_options": [
+                "Best design for Male vs Female",
+                "Compare best vs worst design",
+                "Design #1 vs Design #2",
+            ],
+            "blocks": [],
+            "evidence": [],
+            "follow_ups": [],
+            "actions": [],
+        }
+
+    evidence: List[EvidenceFact] = []
+    sides: List[Dict[str, Any]] = []
+
+    if mode == CompareMode.design:
+        left_polarity = left if left in {"best", "worst"} else parse_design_polarity_hint(left)
+        right_polarity = right if right in {"best", "worst"} else parse_design_polarity_hint(right)
+        use_best_worst = (
+            left_polarity in {"best", "worst"}
+            and right_polarity in {"best", "worst"}
+            and left_polarity != right_polarity
+        ) or (left == "best" and right == "worst")
+
+        if use_best_worst:
+            best_plan = plan.model_copy(
+                update={"limit": 1, "direction": RankDirection.highest, "must_include": []}
+            )
+            worst_plan = plan.model_copy(
+                update={"limit": 1, "direction": RankDirection.lowest, "must_include": []}
+            )
+            best_ranked = tool_rank_designs(analysis, study_obj, best_plan)
+            worst_ranked = tool_rank_designs(analysis, study_obj, worst_plan)
+            design_left = _top_design_from_rank_result(best_ranked)
+            design_right = _top_design_from_rank_result(worst_ranked)
+            if not design_left or not design_right:
+                return {
+                    "status": "answered",
+                    "answer_text": (
+                        "I could not find both a best and worst verified design to compare. "
+                        "Make sure analysis has enough valid designs."
+                    ),
+                    "blocks": [],
+                    "evidence": (best_ranked.get("evidence") or []) + (worst_ranked.get("evidence") or []),
+                    "follow_ups": ["Show best 10 designs", "Show the least-performing designs"],
+                    "actions": [],
+                }
+            # Relabel for UI clarity (rank #1 appears on both highest/lowest lists).
+            design_left = {**design_left, "rank": 1}
+            design_right = {**design_right, "rank": 1}
+            delta = round(float(design_left.get("score") or 0) - float(design_right.get("score") or 0), 4)
+            evidence.extend(
+                [
+                    _fact("C1", "Best design", design_left.get("score")),
+                    _fact("C2", "Worst design", design_right.get("score")),
+                    _fact("C3", "Best–worst score gap", abs(delta)),
+                ]
+            )
+            sides = [
+                {"label": "Best design", "top_design": design_left, "polarity": "best"},
+                {"label": "Worst design", "top_design": design_right, "polarity": "worst"},
+            ]
+            answer = (
+                f"The best design scores {design_left.get('score')} vs "
+                f"{design_right.get('score')} for the worst design "
+                f"(gap {abs(delta)}) [C3]."
+            )
+            strong_names = {el.get("name") for el in design_left.get("elements") or []}
+            weak_names = {el.get("name") for el in design_right.get("elements") or []}
+            unique_best = sorted(n for n in (strong_names - weak_names) if n)
+            unique_worst = sorted(n for n in (weak_names - strong_names) if n)
+            if unique_best:
+                answer += f" The best side uniquely includes “{unique_best[0]}”."
+            if unique_worst:
+                answer += f" The worst side uniquely includes “{unique_worst[0]}”."
+        else:
+            left_rank = parse_design_rank_hint(left) or 1
+            right_rank = parse_design_rank_hint(right) or 2
+            rank_plan = plan.model_copy(
+                update={"limit": max(left_rank, right_rank), "direction": RankDirection.highest}
+            )
+            ranked = tool_rank_designs(analysis, study_obj, rank_plan)
+            design_left = _design_at_rank_from_result(ranked, left_rank)
+            design_right = _design_at_rank_from_result(ranked, right_rank)
+            if not design_left or not design_right:
+                return {
+                    "status": "answered",
+                    "answer_text": "I could not find both designs to compare. Make sure analysis has enough valid ranked designs.",
+                    "blocks": [],
+                    "evidence": ranked.get("evidence") or [],
+                    "follow_ups": ["Show best 10 designs", "Explain why the top design wins"],
+                    "actions": [],
+                }
+            delta = round(float(design_left.get("score") or 0) - float(design_right.get("score") or 0), 4)
+            winner_rank = left_rank if delta >= 0 else right_rank
+            evidence.extend(
+                [
+                    _fact("C1", f"Design #{left_rank}", design_left.get("score")),
+                    _fact("C2", f"Design #{right_rank}", design_right.get("score")),
+                    _fact("C3", "Score gap", abs(delta)),
+                ]
+            )
+            sides = [
+                {"label": f"Design #{left_rank}", "top_design": design_left},
+                {"label": f"Design #{right_rank}", "top_design": design_right},
+            ]
+            answer = (
+                f"Design #{winner_rank} leads by {abs(delta)} coefficient points "
+                f"({design_left.get('score')} vs {design_right.get('score')}) [C3]."
+            )
+            if delta != 0:
+                stronger = design_left if delta > 0 else design_right
+                weaker = design_right if delta > 0 else design_left
+                strong_names = {el.get("name") for el in stronger.get("elements") or []}
+                weak_names = {el.get("name") for el in weaker.get("elements") or []}
+                diff = sorted(strong_names - weak_names)
+                if diff:
+                    answer += f" Unique lift drivers in the leader include “{diff[0]}”."
+
+    elif mode == CompareMode.classification:
+        left_opts = match_classification_options_in_text(study_obj, left) or [
+            resolve_classification_option_hint(study_obj, left) or left
+        ]
+        right_opts = match_classification_options_in_text(study_obj, right) or [
+            resolve_classification_option_hint(study_obj, right) or right
+        ]
+        shared_gender = plan.gender_key or extract_gender_from_text(message)
+        shared_age = plan.age_key or extract_age_segment_from_text(message)
+
+        for idx, (side_label, opts) in enumerate(
+            ((left, left_opts[:1]), (right, right_opts[:1])),
+            start=1,
+        ):
+            side_plan = plan.model_copy(
+                update={
+                    "classification_options": opts,
+                    "gender_key": shared_gender,
+                    "age_key": shared_age,
+                }
+            )
+            question_text, cohort_filters, clarify, options = build_cohort_filter_payload(
+                study_obj, side_plan, option_labels=opts, gender_key=shared_gender, age_key=shared_age
+            )
+            if clarify:
+                return {
+                    "status": "needs_clarification",
+                    "answer_text": clarify,
+                    "clarification_options": options[:8],
+                    "blocks": [],
+                    "evidence": [],
+                    "follow_ups": [],
+                    "actions": [],
+                }
+            merged = merge_assistant_filters(filters, cohort_filters)
+            # Reuse the already-built base analysis when the cohort filter is a
+            # no-op or identical to the request filter — avoids a redundant
+            # full analysis rebuild for one side of the comparison.
+            if not merged or merged == (filters or {}):
+                cohort_analysis = analysis
+            else:
+                cohort_analysis = load_analysis_for_assistant(
+                    db, study_obj, current_user, filters=merged
+                )
+            meta = cohort_analysis.get("filter_meta") or {}
+            panelists = meta.get("panelists_after_filter")
+            if panelists == 0:
+                sides.append(
+                    {
+                        "label": opts[0],
+                        "available": False,
+                        "top_design": None,
+                        "filters": cohort_filters,
+                    }
+                )
+                continue
+            snap = _compare_side_snapshot(
+                cohort_analysis,
+                study_obj,
+                plan,
+                label=opts[0],
+            )
+            snap["filters"] = cohort_filters
+            snap["question"] = question_text
+            sides.append(snap)
+            if snap.get("top_design"):
+                evidence.append(
+                    _fact(f"C{idx}", opts[0], snap["top_design"].get("score"), panelists=panelists)
+                )
+
+        available_sides = [s for s in sides if s.get("top_design")]
+        if len(available_sides) < 2:
+            empty = [s.get("label") for s in sides if not s.get("top_design")]
+            return {
+                "status": "answered",
+                "answer_text": (
+                    "One or both cohorts have no completed responses after filtering"
+                    + (f" ({', '.join(empty)})" if empty else "")
+                    + ". Try broader segments or check classification answers."
+                ),
+                "blocks": [],
+                "evidence": [e.model_dump() for e in evidence],
+                "follow_ups": ["Show classification answer counts", "Show best design overall"],
+                "actions": [],
+            }
+        score_a = float(available_sides[0]["top_design"].get("score") or 0)
+        score_b = float(available_sides[1]["top_design"].get("score") or 0)
+        delta = round(score_a - score_b, 4)
+        leader = available_sides[0]["label"] if delta >= 0 else available_sides[1]["label"]
+        answer = (
+            f"Best design for “{available_sides[0]['label']}” scores {score_a} vs "
+            f"{score_b} for “{available_sides[1]['label']}”. "
+            f"“{leader}” leads by {abs(delta)} points [C3]."
+        )
+        evidence.append(_fact("C3", "Cohort design gap", abs(delta)))
+
+    else:
+        left_section, left_key, left_label = _resolve_segment_side(analysis, metric, left)
+        right_section, right_key, right_label = _resolve_segment_side(analysis, metric, right)
+        if not left_key or not right_key:
+            return {
+                "status": "answered",
+                "answer_text": "I could not map both sides to available study segments.",
+                "blocks": [],
+                "evidence": [],
+                "follow_ups": ["Compare Male vs Female", "Compare 18-24 vs 45-54"],
+                "actions": [],
+            }
+        left_snap = _compare_side_snapshot(
+            analysis, study_obj, plan, label=left_label, segment_section=left_section, segment_key=left_key
+        )
+        right_snap = _compare_side_snapshot(
+            analysis, study_obj, plan, label=right_label, segment_section=right_section, segment_key=right_key
+        )
+        sides = [left_snap, right_snap]
+        if not left_snap.get("available") or not right_snap.get("available"):
+            missing = [s["label"] for s in sides if not s.get("available")]
+            return {
+                "status": "answered",
+                "answer_text": f"No verified coefficients are available for: {', '.join(missing)}.",
+                "blocks": [],
+                "evidence": [],
+                "follow_ups": ["Show study overview", "Compare another segment"],
+                "actions": [],
+            }
+        left_design = left_snap["top_design"] or {}
+        right_design = right_snap["top_design"] or {}
+        left_score = float(left_design.get("score") or 0)
+        right_score = float(right_design.get("score") or 0)
+        delta = round(left_score - right_score, 4)
+        leader = left_label if delta >= 0 else right_label
+        left_el = (left_snap.get("top_element") or {}).get("name")
+        right_el = (right_snap.get("top_element") or {}).get("name")
+        answer = (
+            f"For {left_label}, the best design scores {left_score}; for {right_label}, {right_score}. "
+            f"{leader} leads by {abs(delta)} points [C3]."
+        )
+        if left_el and right_el:
+            answer += f" Top elements: “{left_el}” vs “{right_el}”."
+        evidence.extend(
+            [
+                _fact("C1", left_label, left_score, top_element=left_el),
+                _fact("C2", right_label, right_score, top_element=right_el),
+                _fact("C3", "Best-design gap", abs(delta)),
+            ]
+        )
+
+    actions: List[AssistantAction] = []
+    if mode == CompareMode.classification:
+        for side in sides:
+            cohort = side.get("filters") or {}
+            if cohort:
+                actions.append(
+                    AssistantAction(
+                        type="apply_filter",
+                        label=f"Filter to {side.get('label')}",
+                        payload={"filters": cohort},
+                    )
+                )
+
+    info = analysis.get("Information Block") or {}
+    left_score = float(((sides[0] or {}).get("top_design") or {}).get("score") or 0) if sides else 0.0
+    right_score = float(((sides[1] or {}).get("top_design") or {}).get("score") or 0) if len(sides) > 1 else 0.0
+    score_gap = round(abs(left_score - right_score), 4)
+    leader_label = None
+    if sides and len(sides) >= 2 and (sides[0].get("top_design") or sides[1].get("top_design")):
+        if left_score >= right_score and sides[0].get("top_design"):
+            leader_label = sides[0].get("label")
+        elif sides[1].get("top_design"):
+            leader_label = sides[1].get("label")
+
+    block = AssistantBlock(
+        type="side_by_side_compare",
+        title="Side-by-side comparison",
+        data={
+            "mode": mode.value if mode else "segment",
+            "metric": METRIC_LABELS.get(metric, metric),
+            "study_type": str(study_obj.study_type or "grid").lower(),
+            "background_url": info.get("Study Background") or info.get("background_image_url"),
+            "aspect_ratio": info.get("Aspect Ratio") or "9 / 16",
+            "left": sides[0] if sides else None,
+            "right": sides[1] if len(sides) > 1 else None,
+            "sides": sides,
+            "score_gap": score_gap,
+            "leader_label": leader_label,
+            "left_score": left_score,
+            "right_score": right_score,
+        },
+    )
+    return {
+        "status": "answered",
+        "answer_text": answer,
+        "blocks": [block.model_dump()],
+        "evidence": [e.model_dump() for e in evidence],
+        "follow_ups": [
+            "Explain why the leading side wins",
+            "Show use / avoid recommendations",
+            "Give me an executive summary",
+        ],
+        "actions": [a.model_dump() for a in actions],
+        "follow_up_context": AssistantFollowUpContext(
+            metric=plan.metric or AssistantMetric.T,
+            last_tool=AssistantToolName.compare,
+        ).model_dump(),
+    }
+
+
+def tool_executive_summary(
+    db: Session,
+    analysis: Dict[str, Any],
+    study_obj: Study,
+    plan: AssistantQueryPlan,
+    context: AppliedContext,
+) -> Dict[str, Any]:
+    """Deterministic stakeholder summary from existing verified tools."""
+    metric = metric_prefix((plan.metric or AssistantMetric.T).value)
+    summary = analysis.get("dashboard_summary") or {}
+    panelists = int(summary.get("uniquePanelists") or 0)
+    bullets: List[Dict[str, Any]] = []
+    evidence: List[EvidenceFact] = []
+
+    if panelists <= 0:
+        return {
+            "status": "answered",
+            "answer_text": "This study does not have completed responses yet, so an executive summary is not available.",
+            "blocks": [],
+            "evidence": [],
+            "follow_ups": ["Show study overview"],
+            "actions": [],
+        }
+
+    design_plan = plan.model_copy(
+        update={"tool": AssistantToolName.rank_designs, "limit": 1, "direction": RankDirection.highest}
+    )
+    top_design_result = tool_rank_designs(analysis, study_obj, design_plan)
+    top_design = _top_design_from_rank_result(top_design_result)
+    if top_design:
+        bullets.append(
+            {
+                "title": "Top design",
+                "text": f"Best overall design scores {top_design.get('score')} coefficient points.",
+                "fact_id": "X1",
+            }
+        )
+        evidence.append(_fact("X1", "Top design score", top_design.get("score")))
+
+    element_plan = plan.model_copy(
+        update={"tool": AssistantToolName.rank_elements, "limit": 3, "direction": RankDirection.highest}
+    )
+    element_result = tool_rank_elements(analysis, study_obj, element_plan)
+    top_elements = ((element_result.get("blocks") or [{}])[0].get("data") or {}).get("items") or []
+    if top_elements:
+        names = ", ".join(f"“{item.get('name')}”" for item in top_elements[:3])
+        bullets.append(
+            {
+                "title": "Top elements",
+                "text": f"Strongest lift comes from {names}.",
+                "fact_id": "X2",
+            }
+        )
+        evidence.append(_fact("X2", "Top element", top_elements[0].get("value"), names=names))
+
+    gender_gap = _biggest_gender_element_gap(analysis, metric)
+    if gender_gap and gender_gap.get("gap", 0) > 0:
+        bullets.append(
+            {
+                "title": "Biggest gender gap",
+                "text": (
+                    f"“{gender_gap['element']}” differs most by gender "
+                    f"(Male {gender_gap['male']} vs Female {gender_gap['female']}, gap {gender_gap['gap']})."
+                ),
+                "fact_id": "X3",
+            }
+        )
+        evidence.append(_fact("X3", "Gender gap", gender_gap["gap"], element=gender_gap["element"]))
+    else:
+        age_gap = _biggest_age_element_gap(analysis, metric)
+        if age_gap and age_gap.get("gap", 0) > 0:
+            bullets.append(
+                {
+                    "title": "Biggest age gap",
+                    "text": (
+                        f"“{age_gap['element']}” differs most between "
+                        f"{age_gap['left_segment']} ({age_gap['left_value']}) and "
+                        f"{age_gap['right_segment']} ({age_gap['right_value']})."
+                    ),
+                    "fact_id": "X3",
+                }
+            )
+            evidence.append(_fact("X3", "Age gap", age_gap["gap"], element=age_gap["element"]))
+
+    class_split = _top_classification_split(db, study_obj)
+    if class_split:
+        bullets.append(
+            {
+                "title": "Classification split",
+                "text": (
+                    f"On “{class_split['question']}”, "
+                    f"“{class_split['option']}” leads at {class_split['percentage']}% "
+                    f"({class_split['count']} of {class_split['answered']})."
+                ),
+                "fact_id": "X4",
+            }
+        )
+        evidence.append(
+            _fact("X4", class_split["option"], class_split["percentage"], count=class_split["count"])
+        )
+
+    use_plan = plan.model_copy(update={"tool": AssistantToolName.use_avoid_elements})
+    use_result = tool_use_avoid(analysis, study_obj, use_plan)
+    use_block = next((b for b in use_result.get("blocks", []) if b.get("type") == "use_avoid"), None)
+    use_items = ((use_block or {}).get("data") or {}).get("use") or []
+    avoid_items = ((use_block or {}).get("data") or {}).get("avoid") or []
+    if use_items or avoid_items:
+        use_name = use_items[0]["name"] if use_items else None
+        avoid_name = avoid_items[0]["name"] if avoid_items else None
+        if use_name and avoid_name:
+            text = f"Prefer “{use_name}”; avoid “{avoid_name}”."
+        elif use_name:
+            text = f"Prefer “{use_name}”."
+        else:
+            text = f"Avoid “{avoid_name}”."
+        bullets.append({"title": "Use / avoid", "text": text, "fact_id": "X5"})
+        evidence.append(_fact("X5", "Use / avoid", use_name or avoid_name))
+
+    bullets = bullets[:5]
+    for idx, bullet in enumerate(bullets, start=1):
+        bullet["rank"] = idx
+
+    if not bullets:
+        return {
+            "status": "answered",
+            "answer_text": "Not enough verified analytics are available yet to build an executive summary.",
+            "blocks": [],
+            "evidence": [],
+            "follow_ups": ["Show study overview"],
+            "actions": [],
+        }
+
+    answer_bits = [f"{b['rank']}. {b['text']} [{b['fact_id']}]" for b in bullets]
+    answer = "Here are the most important verified findings:\n" + "\n".join(answer_bits)
+
+    return {
+        "status": "answered",
+        "answer_text": answer,
+        "blocks": [
+            AssistantBlock(
+                type="executive_summary",
+                title="Executive summary",
+                data={"bullets": bullets, "study_title": context.study_title},
+            ).model_dump()
+        ],
+        "evidence": [e.model_dump() for e in evidence],
+        "follow_ups": [
+            "Compare Male vs Female",
+            "Show best design for a classification segment",
+            "Show top 10 elements",
+        ],
+        "actions": [],
+        "follow_up_context": AssistantFollowUpContext(
+            metric=plan.metric or AssistantMetric.T,
+            last_tool=AssistantToolName.executive_summary,
+        ).model_dump(),
     }
 
 
@@ -1938,6 +3211,7 @@ def execute_tool(
     analysis: Dict[str, Any],
     filters: Optional[Dict[str, Any]],
     context: AppliedContext,
+    message: str = "",
 ) -> Dict[str, Any]:
     tool = plan.tool
     if tool == AssistantToolName.greeting:
@@ -2005,11 +3279,53 @@ def execute_tool(
     if tool == AssistantToolName.rank_elements:
         return tool_rank_elements(analysis, study_obj, plan)
     if tool == AssistantToolName.rank_designs:
-        return tool_rank_designs(analysis, study_obj, plan)
+        cohort_filters: Optional[Dict[str, Any]] = None
+        if plan.classification_options or plan.classification_question:
+            _q, cohort_filters, clarify, options = build_cohort_filter_payload(study_obj, plan)
+            if clarify:
+                return {
+                    "status": "needs_clarification",
+                    "answer_text": clarify,
+                    "clarification_options": options[:8],
+                    "blocks": [],
+                    "evidence": [],
+                    "follow_ups": [],
+                    "actions": [],
+                }
+            merged = merge_assistant_filters(filters, cohort_filters)
+            if merged and merged != (filters or {}):
+                try:
+                    analysis = load_analysis_for_assistant(
+                        db, study_obj, current_user, filters=merged or None
+                    )
+                except Exception:
+                    pass
+        result = tool_rank_designs(analysis, study_obj, plan)
+        if cohort_filters and result.get("status", "answered") == "answered":
+            actions = list(result.get("actions") or [])
+            label = ", ".join(
+                vals[0]
+                for vals in (cohort_filters.get("classification_filters") or {}).values()
+                if vals
+            )
+            actions.insert(
+                0,
+                AssistantAction(
+                    type="apply_filter",
+                    label=f"Apply filter ({label})" if label else "Apply cohort filter",
+                    payload={"filters": cohort_filters},
+                ).model_dump(),
+            )
+            result["actions"] = actions
+        return result
     if tool == AssistantToolName.explain_design:
         return tool_explain_design(analysis, study_obj, plan)
+    if tool == AssistantToolName.compare:
+        return tool_compare(db, analysis, study_obj, current_user, plan, filters, message)
     if tool == AssistantToolName.compare_segments:
         return tool_compare_segments(analysis, plan)
+    if tool == AssistantToolName.executive_summary:
+        return tool_executive_summary(db, analysis, study_obj, plan, context)
     if tool == AssistantToolName.use_avoid_elements:
         return tool_use_avoid(analysis, study_obj, plan)
     if tool == AssistantToolName.response_time_summary:

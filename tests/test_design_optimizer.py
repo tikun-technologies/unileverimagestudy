@@ -274,6 +274,80 @@ class DesignOptimizerTests(unittest.TestCase):
         )
         self.assertEqual(designs[0].score, -17)
 
+    def _brute_force_best_worst(self, categories):
+        """Exhaustively compute the true min/max full-layer-stack totals."""
+        import itertools
+
+        option_values = [[el.value for el in cat.elements] for cat in categories]
+        totals = [sum(combo) for combo in itertools.product(*option_values)]
+        return min(totals), max(totals)
+
+    def test_worst_design_matches_brute_force_on_large_all_positive_study(self):
+        # Reproduces the real-world defect: many layers with all-positive
+        # coefficients. If the search explores highest-first while minimizing,
+        # a tight timeout returns a badly non-optimal "worst" design. The true
+        # worst is simply the lowest element in every layer.
+        import random
+
+        rng = random.Random(1234)
+        categories = []
+        for layer_idx in range(9):
+            elements = []
+            option_count = rng.randint(3, 5)
+            for opt_idx in range(option_count):
+                elements.append(
+                    _el(
+                        f"L{layer_idx}",
+                        f"e{layer_idx}_{opt_idx}",
+                        round(rng.uniform(1.0, 12.0), 1),
+                        layer_id=f"l{layer_idx}",
+                        image_id=f"i{layer_idx}_{opt_idx}",
+                        z_index=layer_idx,
+                    )
+                )
+            categories.append(
+                OptimizerCategory(
+                    key=f"L{layer_idx}",
+                    name=f"L{layer_idx}",
+                    z_index=layer_idx,
+                    elements=elements,
+                )
+            )
+
+        expected_min, expected_max = self._brute_force_best_worst(categories)
+
+        worst, worst_meta = rank_designs(
+            categories,
+            study_type="layer",
+            direction="lowest",
+            limit=3,
+            design_constraints=[],
+            require_all_layers=True,
+            timeout_ms=200,
+        )
+        best, best_meta = rank_designs(
+            categories,
+            study_type="layer",
+            direction="highest",
+            limit=3,
+            design_constraints=[],
+            require_all_layers=True,
+            timeout_ms=200,
+        )
+
+        self.assertFalse(worst_meta.get("timed_out"), "worst search should complete")
+        self.assertFalse(best_meta.get("timed_out"), "best search should complete")
+        self.assertAlmostEqual(worst[0].score, expected_min, places=4)
+        self.assertAlmostEqual(best[0].score, expected_max, places=4)
+        # Every returned design must be a complete stack (one element per layer).
+        self.assertTrue(all(len(d.selected_by_category) == len(categories) for d in worst))
+        self.assertTrue(all(len(d.selected_by_category) == len(categories) for d in best))
+        # Worst list is strictly ascending, best list strictly descending.
+        self.assertEqual([d.score for d in worst], sorted(d.score for d in worst))
+        self.assertEqual(
+            [d.score for d in best], sorted((d.score for d in best), reverse=True)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

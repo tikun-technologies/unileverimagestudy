@@ -105,7 +105,20 @@ def invalidate_study_cache(study_id: UUID | str) -> None:
     RedisCache.delete(f"study_analytics:{study_id_str}")
     # Drop any legacy optimized-analysis cache keys from older deployments
     RedisCache.delete_pattern(f"optimized_analysis:{study_id_str}:*")
-    # Verified assistant query cache
+    # Verified assistant query cache + heavy analysis report cache
+    RedisCache.delete_pattern(f"assistant:query:{study_id_str}:*")
+    RedisCache.delete_pattern(f"assistant:analysis:{study_id_str}:*")
+
+
+def invalidate_assistant_analysis_cache(study_id: UUID | str) -> None:
+    """
+    Invalidate only the assistant's cached analysis report + query answers for a study.
+
+    Call this whenever the underlying response data changes (new completion,
+    reset, synthetic respondent) so the assistant never serves stale numbers.
+    """
+    study_id_str = str(study_id)
+    RedisCache.delete_pattern(f"assistant:analysis:{study_id_str}:*")
     RedisCache.delete_pattern(f"assistant:query:{study_id_str}:*")
 
 

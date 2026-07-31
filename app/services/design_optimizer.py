@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-ALGORITHM_VERSION = "1.0.0"
+ALGORITHM_VERSION = "1.1.0"
 MAX_NON_LAYER_SELECTIONS = 4
 
 
@@ -515,23 +515,31 @@ def rank_designs(
                 c.name.lower(),
             ),
         )
+        # Explore best-first for maximize and worst-first for minimize so the
+        # branch-and-bound finds strong candidates early, prunes aggressively,
+        # and reaches the true optimum well before the timeout. Exploring in the
+        # wrong order (e.g. highest-first while minimizing) can cause a timeout
+        # to return a wildly non-optimal "worst" design.
         ordered_elements = []
         for cat in layer_categories:
-            elements = sorted(cat.elements, key=lambda el: _element_sort_key(el, True))
+            elements = sorted(cat.elements, key=lambda el: _element_sort_key(el, maximize))
             if cat.key in forced:
                 elements = [el for el in elements if el.element_id == forced[cat.key]]
             ordered_elements.append(elements)
 
-        # Suffix bound for pruning (optimistic remaining score)
+        # Suffix bound for pruning (optimistic remaining score). Computed from
+        # explicit per-layer min/max so it stays correct regardless of the
+        # exploration order chosen above.
         suffix_best = [0.0] * (len(layer_categories) + 1)
         for idx in range(len(layer_categories) - 1, -1, -1):
-            best_val = ordered_elements[idx][0].value if ordered_elements[idx] else 0.0
-            worst_val = ordered_elements[idx][-1].value if ordered_elements[idx] else 0.0
+            values = [el.value for el in ordered_elements[idx]]
+            layer_max = max(values) if values else 0.0
+            layer_min = min(values) if values else 0.0
             # For maximize, remaining can add up to max(0, best); for minimize, down to min(0, worst)
             if maximize:
-                suffix_best[idx] = suffix_best[idx + 1] + max(0.0, best_val)
+                suffix_best[idx] = suffix_best[idx + 1] + max(0.0, layer_max)
             else:
-                suffix_best[idx] = suffix_best[idx + 1] + min(0.0, worst_val)
+                suffix_best[idx] = suffix_best[idx + 1] + min(0.0, layer_min)
 
         def search(index: int, selected: List[OptimizerElement], selected_map: Dict[str, str], score: float) -> None:
             meta["explored"] += 1

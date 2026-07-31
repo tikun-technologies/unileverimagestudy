@@ -87,6 +87,13 @@ class Study(Base):
     analysis_settings = relationship("StudyAnalysisSettings", back_populates="study", cascade="all, delete-orphan", lazy="noload", uselist=False)
     saved_designs = relationship("StudySavedDesign", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     task_assignments = relationship("StudyTaskAssignment", back_populates="study", cascade="all, delete-orphan", lazy="noload")
+    assistant_conversations = relationship(
+        "AssistantConversation",
+        back_populates="study",
+        cascade="all, delete-orphan",
+        lazy="noload",
+        passive_deletes=True,
+    )
 
     __table_args__ = (
         UniqueConstraint('share_token', name='uq_studies_share_token'),

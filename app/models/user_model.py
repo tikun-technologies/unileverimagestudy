@@ -77,6 +77,13 @@ class User(Base):
         lazy="noload",
         passive_deletes=True,
     )
+    assistant_conversations = relationship(
+        "AssistantConversation",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        lazy="noload",
+        passive_deletes=True,
+    )
 
     # Indexes for better query performance
     __table_args__ = (

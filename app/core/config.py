@@ -151,7 +151,20 @@ class Settings(BaseSettings):
     ASSISTANT_TIMEOUT_SECONDS: float = 12.0
     ASSISTANT_RATE_LIMIT_PER_MINUTE: int = 30
     ASSISTANT_CACHE_TTL_SECONDS: int = 300
+    # Cross-request cache for the heavy analysis report (per study/format/filters).
+    ASSISTANT_ANALYSIS_CACHE_TTL_SECONDS: int = 120
     ASSISTANT_MAX_RESULT_LIMIT: int = 20
-    ASSISTANT_OPTIMIZER_TIMEOUT_MS: int = 200
+    ASSISTANT_OPTIMIZER_TIMEOUT_MS: int = 1500
+
+    # Dynamic tool-calling agent. Composes several verified tools per question so
+    # arbitrary questions get answered instead of falling through to "clarify".
+    # Falls back to the single-tool planner whenever it cannot produce a grounded
+    # answer, so turning this off is always safe.
+    ASSISTANT_AGENT_ENABLED: bool = True
+    ASSISTANT_AGENT_MODEL: str = "gpt-4o-mini"
+    # Tool rounds, not LLM calls: N rounds allows at most N+1 calls.
+    ASSISTANT_AGENT_MAX_ROUNDS: int = 2
+    ASSISTANT_AGENT_MAX_TOOL_CALLS: int = 4
+    ASSISTANT_AGENT_TOTAL_TIMEOUT_SECONDS: float = 24.0
 
 settings = Settings()

@@ -5,10 +5,17 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import UUID
+from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.response_schema import StudyFilterCriteria
+
+
+class CompareMode(str, Enum):
+    segment = "segment"
+    design = "design"
+    classification = "classification"
 
 
 class AssistantToolName(str, Enum):
@@ -18,7 +25,9 @@ class AssistantToolName(str, Enum):
     rank_elements = "rank_elements"
     rank_designs = "rank_designs"
     explain_design = "explain_design"
+    compare = "compare"
     compare_segments = "compare_segments"
+    executive_summary = "executive_summary"
     use_avoid_elements = "use_avoid_elements"
     response_time_summary = "response_time_summary"
     fatigue_summary = "fatigue_summary"
@@ -65,6 +74,8 @@ class AssistantQueryRequest(BaseModel):
     segment_key: Optional[str] = None
     follow_up: Optional[AssistantFollowUpContext] = None
     conversation_id: Optional[str] = Field(None, max_length=64)
+    # Stable client UUID for optimistic UI + idempotent retries.
+    client_message_id: Optional[str] = Field(None, max_length=64)
 
     @field_validator("message")
     @classmethod
@@ -73,6 +84,14 @@ class AssistantQueryRequest(BaseModel):
         if not cleaned:
             raise ValueError("Message cannot be empty")
         return cleaned
+
+    @field_validator("client_message_id")
+    @classmethod
+    def clean_client_message_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned[:64] if cleaned else None
 
 
 class AssistantQueryPlan(BaseModel):
@@ -88,6 +107,10 @@ class AssistantQueryPlan(BaseModel):
     classification_question: Optional[str] = None
     # Classification option labels mentioned by the user (may appear on multiple questions).
     classification_options: List[str] = Field(default_factory=list, max_length=8)
+    # Pairwise compare (segments, designs, or classification cohorts).
+    compare_mode: Optional[CompareMode] = None
+    compare_left: Optional[str] = Field(None, max_length=120)
+    compare_right: Optional[str] = Field(None, max_length=120)
     # User-requested required ingredients, e.g. element names or "white colour".
     must_include: List[str] = Field(default_factory=list, max_length=8)
     clarification_prompt: Optional[str] = Field(None, max_length=400)
@@ -230,3 +253,36 @@ class AssistantQueryResponse(BaseModel):
     follow_up_context: Optional[AssistantFollowUpContext] = None
     usage: Dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
+    # Canonical persisted IDs for optimistic reconciliation.
+    user_message_id: Optional[UUID] = None
+    assistant_message_id: Optional[UUID] = None
+    conversation_id: Optional[UUID] = None
+
+
+class AssistantHistoryItem(BaseModel):
+    id: UUID
+    role: Literal["user", "assistant"]
+    content: str
+    created_at: datetime
+    client_message_id: Optional[str] = None
+    parent_message_id: Optional[UUID] = None
+    status: str = "complete"
+    response: Optional[AssistantQueryResponse] = None
+
+
+class AssistantHistoryMeta(BaseModel):
+    limit: int
+    has_more: bool
+    next_cursor: Optional[str] = None
+    conversation_id: Optional[UUID] = None
+
+
+class AssistantHistoryPage(BaseModel):
+    items: List[AssistantHistoryItem] = Field(default_factory=list)
+    meta: AssistantHistoryMeta
+    follow_up_context: Optional[AssistantFollowUpContext] = None
+
+
+class AssistantClearHistoryResponse(BaseModel):
+    deleted: int = 0
+    conversation_id: Optional[UUID] = None

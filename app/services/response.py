@@ -2545,6 +2545,15 @@ class StudyResponseService:
         study.abandoned_responses = abandoned_responses
         
         self.db.commit()
+
+        # Response data changed → drop the assistant's cached analysis so it
+        # never serves stale numbers. Best-effort; never block the write path.
+        try:
+            from app.core.cache import invalidate_assistant_analysis_cache
+
+            invalidate_assistant_analysis_cache(study_id)
+        except Exception:
+            pass
     
     def _get_element_heatmap_ultra_fast(self, study_id: UUID) -> Dict[str, Any]:
         """Get element interaction heatmap data - ultra-fast with raw SQL and minimal data."""

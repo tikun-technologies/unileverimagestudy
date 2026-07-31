@@ -14,12 +14,14 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from app.core.cache import RedisCache
 from app.core.config import settings
+from app.core.redis import get_sync_redis
 from app.models.user_model import User
 from app.schemas.assistant_schema import (
     AssistantFollowUpContext,
@@ -28,17 +30,32 @@ from app.schemas.assistant_schema import (
     AssistantQueryRequest,
     AssistantQueryResponse,
     AssistantToolName,
+    CompareMode,
     RankDirection,
 )
 from app.services.analysis_filter import get_active_filter
+from app.services.analysis_settings import get_study_analysis_settings
+from app.services.assistant_agent import AgentUnavailable, run_agent_query
+from app.services.assistant_message_service import (
+    get_assistant_reply_for_parent,
+    get_or_create_conversation,
+    insert_assistant_message,
+    insert_user_message,
+    response_from_assistant_message,
+)
 from app.services.assistant_tools import (
     AssistantToolError,
     authorize_study_for_assistant,
     build_applied_context,
     execute_tool,
     extract_age_segment_from_text,
+    extract_compare_pair,
     extract_gender_from_text,
     find_classification_question_by_text,
+    infer_compare_mode,
+    is_best_vs_worst_design_query,
+    is_compare_intent,
+    is_compare_top_designs_query,
     load_analysis_for_assistant,
     match_classification_options_in_text,
     resolve_age_segment_key,
@@ -58,49 +75,83 @@ except ImportError:
 PLANNER_SYSTEM = """You convert study analytics questions into a tiny JSON query plan.
 Return ONLY valid JSON with keys:
 tool, metric, direction, limit, segment_section, segment_key, gender_key, age_key,
-classification_question, classification_options, must_include, clarification_prompt,
-clarification_options, unsupported_reason, confidence.
+classification_question, classification_options, compare_mode, compare_left, compare_right,
+must_include, clarification_prompt, clarification_options, unsupported_reason, confidence.
 
 Allowed tools:
 greeting, study_overview, classification_distribution, rank_elements, rank_designs,
-compare_segments, use_avoid_elements, response_time_summary, fatigue_summary,
+compare, compare_segments, executive_summary, use_avoid_elements, response_time_summary, fatigue_summary,
 explain_mindset, explain_design, list_saved_designs, clarify, unsupported.
+
+Your job is INTENT understanding. Clients paraphrase freely — slang, typos, and
+informal wording are normal. Map MEANING, never require exact keywords.
 
 Rules:
 - metric must be T, B, or R (default T).
 - direction must be highest or lowest.
-- A singular request ("best design", "best statement") has limit=1.
+- A singular request ("best design", "best statement", "winning mix", "bestie design") has limit=1.
 - A plural request without a number has limit=4.
-- An explicit count ("top 10" or "top 2-3") must be respected (use the upper bound for ranges).
+- An explicit count must be respected: digits ("top 10", "top 2-3" → 3) and words
+  ("top two", "best three designs", "five worst") → that count.
 - must_include is an array of required design ingredients from the user question.
-  Examples:
-  - "best design with A4-largecap-white-transp" -> must_include=["A4-largecap-white-transp"]
-  - "top 2 combinations which has A6-silver-clinical" -> must_include=["A6-silver-clinical"]
-  - "top combinations with holographic tick and silver-clinical"
-    -> must_include=["holographic tick","silver-clinical"]
-  - "top combinations with a white colour" -> must_include=["white"]
-  - "best mix including antibacterial and DMC-green" -> must_include=["antibacterial","DMC-green"]
-- Copy must_include strings from the user question exactly; do not invent or shorten
-  element names (keep "A6-silver-clinical", never reduce it to "silver").
+  Copy strings from the user question exactly; do not invent or shorten element names
+  (keep "A6-silver-clinical", never reduce it to "silver").
+  NEVER put ranking adjectives in must_include (highest-scoring, top-performing,
+  best, worst, etc.). Those set direction/limit, not ingredients.
 - Never invent numbers or element names.
-- If ambiguous, use tool=clarify with short options.
+- "What is the highest-scoring combination?" / "best mix" / "winning package"
+  → tool=rank_designs, limit=1, direction=highest, must_include=[].
+- Soft synonyms for ranking polarity: bestie/fave/favorite/winner ≈ best;
+  loser/least/bottom ≈ worst. Soft synonyms for gender: men/guys/males ≈ Male;
+  women/ladies/females ≈ Female.
+- If the request is ambiguous between designs vs elements, or two valid intents, use
+  tool=clarify with a short clarification_prompt and 2-5 clarification_options the user
+  can tap (e.g. "Best 2 designs", "Top 2 elements", "Compare best vs worst").
 - If outside verified study analytics/design, use tool=unsupported.
-- rank_designs for best/worst mixes/designs/combinations, including "with <element>" requests.
-- rank_elements for top/bottom concepts/elements/claims.
-- explain_design for why a design is best/better/not better.
-- greeting for hi/hello/hey/thanks and other conversational greetings.
-- classification_distribution for classification/prelim questions and option counts.
-  Examples:
-  - "how many answered How often do you cook meals at home?"
-  - "how many selected A few times per month" -> classification_options=["A few times per month"]
-  - "how many chose Daily or almost daily and Rarely or never"
-  - "how many selected Daily or almost daily in male segment 22 years old"
-    -> classification_options=["Daily or almost daily"], gender_key="Male", age_key="18-24"
-  - Copy option labels from the user question into classification_options.
-  - Options can repeat across questions; questions are unique. If option is ambiguous, still
-    set classification_options and leave classification_question null so the tool can clarify.
-  - gender_key is Male/Female; age_key is a study bucket (18-24, 25-34, ...). Single ages snap
-    to buckets (22 -> 18-24). Both gender_key and age_key may be set together.
+- confidence: 0.85-1.0 when intent is clear; 0.5-0.7 when guessed; below 0.45 only with clarify.
+
+Tool mapping (paraphrases count as the same intent):
+- rank_designs: designs / mixes / combinations / stacks / packages / creatives that win or lose.
+  Examples → tool=rank_designs:
+  - "top two designs" / "best 2 designs" / "show me the two best mixes" → limit=2, direction=highest
+  - "worst three combinations" / "least performing designs" → limit=3, direction=lowest
+  - "winning package" / "best overall design" / "what's the bestie design" → limit=1
+  - "designs with A6-silver-clinical" → must_include=["A6-silver-clinical"]
+  - "best design for people who selected Daily or almost daily"
+    → classification_options=["Daily or almost daily"]
+- rank_elements: statements / elements / concepts / claims / ingredients by themselves.
+- explain_design: why a design wins / is better / beats the runner-up.
+- compare: ANY side-by-side of two sides. Trigger words include compare, difference,
+  differences between, contrast, versus, vs, against, compared to, how do X and Y differ,
+  side by side — wording does not need to include the word "compare".
+  - "Male vs Female", "men versus women", "difference between male and female"
+    → compare_mode=segment, compare_left=Male, compare_right=Female
+  - "difference between male best design and female best design"
+    / "male bestie vs female bestie" / "how does male best differ from female best"
+    → compare_mode=segment, left=Male, right=Female (best design per segment)
+  - "18-24 vs 45-54" / "difference between 18-24 and 45-54" → compare_mode=segment
+  - "Design #1 vs Design #2" / "first vs second design" → compare_mode=design
+  - "compare top two designs" / "compare the best 2 designs" → compare_mode=design,
+    compare_left="design 1", compare_right="design 2" (side-by-side of the top 2, NOT a list of 4)
+  - "best vs worst design" / "difference between best and worst"
+    → compare_mode=design, left=best, right=worst
+  - two classification options → compare_mode=classification
+- NEVER map a two-segment ask (Male vs Female, two ages) to Design #1 vs Design #2.
+- Do NOT use rank_designs when the user wants a side-by-side / difference — use tool=compare.
+- compare_segments: compare ALL segments in Gender/Age/Mindsets at once.
+- executive_summary: key findings / stakeholder summary / “most important findings”.
+- classification_distribution: how many answered/selected/chose a prelim option.
+- use_avoid_elements: what to use or avoid.
+- greeting: hi/hello/hey/thanks.
+- clarify: when you truly cannot tell what they want.
+
+Classification examples:
+- "how many selected A few times per month" -> classification_options=["A few times per month"]
+- "how many selected Daily or almost daily in male segment 22 years old"
+  -> classification_options=["Daily or almost daily"], gender_key="Male", age_key="18-24"
+- Options can repeat across questions; if ambiguous, set classification_options and leave
+  classification_question null so the tool can clarify.
+- gender_key is Male/Female; age_key is a study bucket (18-24, 25-34, ...).
 """
 
 
@@ -115,8 +166,12 @@ def _openai_client():
 
 _RATE_BUCKET: Dict[str, list] = {}
 
+# Dedicated pool so the LLM planner (network I/O) overlaps the analysis build.
+# Small and bounded — planner calls are short-lived and I/O-bound.
+_PLANNER_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="assistant-planner")
 
-def _rate_limit_ok(user_id: str) -> bool:
+
+def _rate_limit_ok_local(user_id: str) -> bool:
     now = time.time()
     window = 60.0
     limit = settings.ASSISTANT_RATE_LIMIT_PER_MINUTE
@@ -128,9 +183,106 @@ def _rate_limit_ok(user_id: str) -> bool:
     return True
 
 
+def _rate_limit_ok(user_id: str) -> bool:
+    """
+    Fixed-window rate limit shared across workers via Redis (atomic INCR).
+
+    Falls back to the in-process limiter when Redis is unavailable so a single
+    worker is still protected.
+    """
+    limit = settings.ASSISTANT_RATE_LIMIT_PER_MINUTE
+    try:
+        client = get_sync_redis()
+        if client is not None:
+            window_bucket = int(time.time() // 60)
+            key = f"assistant:ratelimit:{user_id}:{window_bucket}"
+            count = client.incr(key)
+            if count == 1:
+                # First hit in this window — expire slightly after the window.
+                client.expire(key, 70)
+            return int(count) <= limit
+    except Exception as exc:
+        logger.debug("Redis rate limit failed, using local limiter: %s", exc)
+    return _rate_limit_ok_local(user_id)
+
+
 def _cache_key(study_id: str, user_id: str, payload: Dict[str, Any]) -> str:
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
     return f"assistant:query:{study_id}:{user_id}:{digest}"
+
+
+def _is_executive_summary_query(text: str) -> bool:
+    return any(
+        phrase in text
+        for phrase in (
+            "executive summary",
+            "most important findings",
+            "important findings",
+            "key findings",
+            "stakeholder summary",
+            "summarize this study",
+            "summary of findings",
+        )
+    )
+
+
+def _is_cohort_rank_query(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:best|top|worst|leading)\s+(?:overall\s+)?(?:design|mix|combination)s?\b",
+            text,
+        )
+        and any(
+            token in text
+            for token in (
+                "selected",
+                "chose",
+                "chosen",
+                "who selected",
+                "who chose",
+                "people who",
+                "respondents who",
+                "users who",
+                "for those who",
+                "for people who",
+            )
+        )
+    )
+
+
+def _apply_compare_plan(message: str, plan: AssistantQueryPlan, study_obj: Any) -> AssistantQueryPlan:
+    if is_compare_top_designs_query(message):
+        plan.compare_left = "design 1"
+        plan.compare_right = "design 2"
+        plan.compare_mode = CompareMode.design
+        plan.tool = AssistantToolName.compare
+        plan.limit = 2
+        return plan
+    if is_best_vs_worst_design_query(message):
+        mode, left, right = infer_compare_mode(message, study_obj, plan)
+        if mode == CompareMode.design and left == "best" and right == "worst":
+            plan.compare_left = "best"
+            plan.compare_right = "worst"
+            plan.compare_mode = CompareMode.design
+            plan.tool = AssistantToolName.compare
+            return plan
+    pair = extract_compare_pair(message)
+    if not pair:
+        # Still resolve mode from the full message when possible.
+        mode, left, right = infer_compare_mode(message, study_obj, plan)
+        if mode and left and right:
+            plan.compare_left = str(left)[:120]
+            plan.compare_right = str(right)[:120]
+            plan.compare_mode = mode
+            plan.tool = AssistantToolName.compare
+        return plan
+    left, right = pair
+    plan.compare_left = left[:120]
+    plan.compare_right = right[:120]
+    mode, _, _ = infer_compare_mode(message, study_obj, plan)
+    plan.compare_mode = mode
+    plan.tool = AssistantToolName.compare
+    return plan
 
 
 def _deterministic_plan(message: str, request: AssistantQueryRequest) -> AssistantQueryPlan:
@@ -210,6 +362,87 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
         segment_section = segment_section or "Gender"
         segment_key = segment_key or gender_key
 
+    if _is_executive_summary_query(text):
+        return AssistantQueryPlan(tool=AssistantToolName.executive_summary, confidence=0.95)
+
+    if is_compare_intent(message):
+        plan = AssistantQueryPlan(
+            tool=AssistantToolName.compare,
+            metric=metric,
+            segment_section=segment_section,
+            segment_key=segment_key,
+            gender_key=gender_key,
+            age_key=age_key,
+            confidence=0.9,
+        )
+        pair = extract_compare_pair(message)
+        if pair:
+            plan.compare_left, plan.compare_right = pair[0][:120], pair[1][:120]
+        # Narrow override: only explicit "top N designs" → Design #1 vs #2.
+        if is_compare_top_designs_query(text):
+            plan.compare_left = "design 1"
+            plan.compare_right = "design 2"
+            plan.compare_mode = CompareMode.design
+            plan.limit = 2
+            return plan
+        # Force polarity only when this is truly best-vs-worst, not "best for A vs B".
+        if is_best_vs_worst_design_query(text):
+            left_side = plan.compare_left
+            right_side = plan.compare_right
+            segment_pair = bool(
+                left_side
+                and right_side
+                and (
+                    (extract_gender_from_text(left_side) and extract_gender_from_text(right_side))
+                    or (
+                        (extract_age_segment_from_text(left_side) or resolve_age_segment_key(left_side))
+                        and (extract_age_segment_from_text(right_side) or resolve_age_segment_key(right_side))
+                    )
+                )
+            )
+            if not segment_pair:
+                plan.compare_left = "best"
+                plan.compare_right = "worst"
+                plan.compare_mode = CompareMode.design
+                return plan
+        # Male best vs Female best (or two ages) → segment compare; never a single gender filter.
+        left_g = extract_gender_from_text(plan.compare_left or "")
+        right_g = extract_gender_from_text(plan.compare_right or "")
+        left_a = extract_age_segment_from_text(plan.compare_left or "") or resolve_age_segment_key(
+            plan.compare_left or ""
+        )
+        right_a = extract_age_segment_from_text(plan.compare_right or "") or resolve_age_segment_key(
+            plan.compare_right or ""
+        )
+        if left_g and right_g and left_g != right_g:
+            plan.compare_mode = CompareMode.segment
+            plan.compare_left = left_g
+            plan.compare_right = right_g
+            plan.gender_key = None
+            plan.segment_section = None
+            plan.segment_key = None
+        elif left_a and right_a and left_a != right_a:
+            plan.compare_mode = CompareMode.segment
+            plan.compare_left = left_a
+            plan.compare_right = right_a
+            plan.age_key = None
+            plan.segment_section = None
+            plan.segment_key = None
+        return plan
+
+    if _is_cohort_rank_query(text):
+        return AssistantQueryPlan(
+            tool=AssistantToolName.rank_designs,
+            metric=metric,
+            direction=direction,
+            limit=explicit_limit or 1,
+            segment_section=segment_section,
+            segment_key=segment_key,
+            gender_key=gender_key,
+            age_key=age_key,
+            confidence=0.9,
+        )
+
     # Classification / prelim option counts.
     # Also continue a clarification turn when the previous tool was classification.
     classification_follow = bool(
@@ -279,22 +512,56 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
             confidence=0.9,
         )
     must_include = _extract_must_include(message)
-    if any(
+    design_intent = any(
         token in text
         for token in (
             "best mix",
             "best design",
             "top design",
+            "top designs",
+            "best designs",
             "worst design",
+            "worst designs",
             "least performing design",
+            "least performing designs",
+            "winning design",
+            "winning mix",
+            "winning package",
             "combinations",
             "configurator",
             "performing combination",
             "performing combinations",
             "performing design",
+            "performing designs",
             "performing mix",
+            "scoring combination",
+            "scoring design",
+            "scoring mix",
+            "highest-scoring",
+            "highest scoring",
+            "lowest-scoring",
+            "lowest scoring",
+            "creative",
+            "creatives",
+            "package",
+            "packages",
+            "stack",
+            "stacks",
         )
-    ) or (
+    ) or bool(
+        re.search(
+            r"\b(?:top|best|worst|lowest|highest)\s+(?:two|three|four|five|\d{1,2})\s+"
+            r"(?:design|designs|mix|mixes|combination|combinations|package|packages)\b",
+            text,
+        )
+    ) or bool(
+        re.search(
+            r"\b(?:highest|lowest|best|worst|top)[- ](?:scoring|performing)\s+"
+            r"(?:design|mix|combination|package|stack|creative)s?\b",
+            text,
+        )
+    )
+    if design_intent or (
         must_include
         and any(
             token in text
@@ -343,7 +610,7 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
             segment_key=segment_key,
             confidence=0.9,
         )
-    if any(token in text for token in ("compare", "vs", "versus")) and any(
+    if any(token in text for token in ("compare all", "all segments", "every segment")) and any(
         token in text for token in ("gender", "age", "mindset", "segment")
     ):
         return AssistantQueryPlan(
@@ -362,7 +629,9 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
             segment_key=segment_key,
             confidence=0.9,
         )
-    if any(token in text for token in ("overview", "summary", "how many respondents", "kpi", "dashboard")):
+    if any(token in text for token in ("overview", "how many respondents", "kpi", "dashboard")) or (
+        "summary" in text and not _is_executive_summary_query(text)
+    ):
         return AssistantQueryPlan(tool=AssistantToolName.study_overview, confidence=0.9)
 
     # Generic ranking language
@@ -384,15 +653,16 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
 
     return AssistantQueryPlan(
         tool=AssistantToolName.clarify,
-        clarification_prompt="What would you like me to analyze?",
+        clarification_prompt="I’m not sure what you mean — what should I analyze?",
         clarification_options=[
-            "Study overview",
+            "Best design overall",
+            "Top 2 designs",
             "Top 10 elements",
-            "Best 10 designs",
+            "Compare best vs worst design",
+            "Study overview",
             "Classification answer counts",
-            "Use / avoid recommendations",
         ],
-        confidence=0.4,
+        confidence=0.35,
     )
 
 
@@ -477,12 +747,35 @@ def _parse_plan(raw: Dict[str, Any], request: AssistantQueryRequest) -> Assistan
             else (request.follow_up.classification_question if request.follow_up else None)
         ),
         classification_options=classification_options,
+        compare_mode=(
+            CompareMode(str(raw["compare_mode"]))
+            if raw.get("compare_mode") in {m.value for m in CompareMode}
+            else None
+        ),
+        compare_left=(str(raw["compare_left"])[:120] if raw.get("compare_left") else None),
+        compare_right=(str(raw["compare_right"])[:120] if raw.get("compare_right") else None),
         must_include=must_include,
         clarification_prompt=(str(raw.get("clarification_prompt") or "")[:400] or None),
         clarification_options=options,
         unsupported_reason=(str(raw.get("unsupported_reason") or "")[:400] or None),
         confidence=max(0.0, min(1.0, confidence)),
     )
+
+
+_WORD_COUNTS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
 
 
 def _extract_result_count(text: str) -> Optional[int]:
@@ -499,6 +792,22 @@ def _extract_result_count(text: str) -> Optional[int]:
     if range_match:
         upper = max(int(range_match.group(1)), int(range_match.group(2)))
         return max(1, min(upper, settings.ASSISTANT_MAX_RESULT_LIMIT))
+
+    word_alt = "|".join(_WORD_COUNTS.keys())
+    word_patterns = (
+        rf"\b(?:top|best|worst|bottom|lowest|highest|least)\s+(?:performing\s+)?({word_alt})\b",
+        rf"\b({word_alt})\s+(?:top|best|worst|bottom|lowest|highest|least)\s+"
+        rf"(?:performing\s+)?(?:design|designs|mix|mixes|combination|combinations|"
+        rf"element|elements|statement|statements)\b",
+        rf"\b(?:give(?:\s+me)?|show(?:\s+me)?|get)\s+(?:the\s+)?({word_alt})\s+"
+        rf"(?:top|best|worst|bottom|lowest|highest|least)\b",
+    )
+    for pattern in word_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            value = _WORD_COUNTS.get(match.group(1))
+            if value:
+                return max(1, min(value, settings.ASSISTANT_MAX_RESULT_LIMIT))
 
     patterns = (
         # "worst performing 5", "best performing 10"
@@ -546,8 +855,15 @@ _STOP_INCLUDE_WORDS = {
     "design",
     "designs",
     "mix",
+    "mixes",
     "combination",
     "combinations",
+    "package",
+    "packages",
+    "stack",
+    "stacks",
+    "creative",
+    "creatives",
     "element",
     "elements",
     "layer",
@@ -556,15 +872,70 @@ _STOP_INCLUDE_WORDS = {
     "for",
     "overall",
     "best",
+    "bestie",
     "top",
+    "worst",
+    "lowest",
+    "highest",
+    "leading",
+    "winning",
     "performing",
+    "scoring",
+    "score",
+    "scored",
+    "strongest",
+    "weakest",
+    "favorite",
+    "favourite",
+    "fave",
+    "what",
+    "which",
+    "is",
+    "are",
+    "show",
+    "give",
+    "me",
 }
+
+# Hyphenated ranking adjectives that look like element codes but aren't
+# (e.g. "highest-scoring", "top-performing").
+_RANKING_ADJECTIVE_RE = re.compile(
+    r"^(?:"
+    r"(?:highest|lowest|best|worst|top|bottom|least|most|leading|winning)"
+    r"[-_]?"
+    r"(?:scoring|performing|rated|ranked|valued)?"
+    r"|"
+    r"(?:high|low)[-_]?scor(?:e|ing|ed)"
+    r")$",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_ranking_phrase_token(value: str) -> bool:
+    """True for polarity/ranking words that must never become must_include."""
+    text = str(value or "").strip().casefold().replace("_", "-")
+    if not text:
+        return False
+    if text in _STOP_INCLUDE_WORDS:
+        return True
+    if _RANKING_ADJECTIVE_RE.fullmatch(text):
+        return True
+    # "highest scoring" / "top performing" as multi-word leftovers
+    if re.fullmatch(
+        r"(?:highest|lowest|best|worst|top|bottom|least|most)\s+"
+        r"(?:scoring|performing|rated|ranked)",
+        text,
+    ):
+        return True
+    return False
 
 
 def _looks_like_element_code(value: str) -> bool:
     """True for codes like A6-silver-clinical / silver-clinical (not age ranges)."""
     text = str(value or "").strip()
     if not text or " " in text:
+        return False
+    if _is_ranking_phrase_token(text):
         return False
     if re.fullmatch(r"\d{1,3}\s*[-–]\s*\d{1,3}", text):
         return False
@@ -590,11 +961,18 @@ def _extract_must_include(message: str) -> List[str]:
         if not cleaned:
             return
         # Drop leading filler words but keep meaningful tokens like "white".
-        parts = [p for p in re.split(r"\s+", cleaned) if p.casefold() not in _STOP_INCLUDE_WORDS]
+        parts = [
+            p
+            for p in re.split(r"\s+", cleaned)
+            if p.casefold() not in _STOP_INCLUDE_WORDS and not _is_ranking_phrase_token(p)
+        ]
         if not parts and cleaned.casefold() not in _STOP_INCLUDE_WORDS:
             parts = [cleaned]
         value = " ".join(parts).strip(" -_")
         if len(value) < 2:
+            return
+        # Never treat ranking adjectives as required ingredients.
+        if _is_ranking_phrase_token(value):
             return
         # Avoid capturing whole question tails.
         if len(value) > 80:
@@ -680,6 +1058,20 @@ def _normalize_plan_for_question(
         plan.limit = 1
         return plan
 
+    # Keep AI/deterministic clarification intact — do not remap to a guessed tool.
+    if plan.tool == AssistantToolName.clarify:
+        if not plan.clarification_prompt:
+            plan.clarification_prompt = "I’m not sure what you mean — what should I analyze?"
+        if not plan.clarification_options:
+            plan.clarification_options = [
+                "Best design overall",
+                "Top 2 designs",
+                "Top 10 elements",
+                "Compare best vs worst design",
+                "Study overview",
+            ]
+        return plan
+
     # No metric in the user's words always means T. UI tab state must not
     # silently change the meaning of an otherwise "overall" question.
     if "bottom up" in text or re.search(r"\bmetric\s*b\b|\busing\s+b\b|\(b\)", text):
@@ -696,12 +1088,22 @@ def _normalize_plan_for_question(
         plan.segment_key = None
 
     # Demographic filters: Gender and Age can both be present (classification).
-    gender_from_text = extract_gender_from_text(text)
+    # Dual-gender / dual-age compares must NOT collapse to a single filter.
+    dual_gender_compare = bool(
+        re.search(r"\b(?:male|males|men|man)\b", text)
+        and re.search(r"\b(?:female|females|women|woman)\b", text)
+    )
+    gender_from_text = None if dual_gender_compare else extract_gender_from_text(text)
     age_from_text = extract_age_segment_from_text(text)
     if gender_from_text:
         plan.gender_key = gender_from_text
-    elif plan.gender_key:
+    elif plan.gender_key and not dual_gender_compare:
         plan.gender_key = extract_gender_from_text(str(plan.gender_key)) or plan.gender_key
+    if dual_gender_compare:
+        plan.gender_key = None
+        if str(plan.segment_section or "").casefold() == "gender":
+            plan.segment_section = None
+            plan.segment_key = None
     if age_from_text:
         plan.age_key = age_from_text
     elif plan.age_key:
@@ -711,7 +1113,9 @@ def _normalize_plan_for_question(
     # sections use canonical keys. Normalize before deterministic lookup.
     requested_segment = str(plan.segment_key or "").strip()
     requested_lower = requested_segment.casefold()
-    if re.search(r"\b(?:men|man|male)\b", text) or requested_lower in {"men", "man", "males", "male"}:
+    if dual_gender_compare:
+        pass
+    elif re.search(r"\b(?:men|man|male)\b", text) or requested_lower in {"men", "man", "males", "male"}:
         plan.gender_key = plan.gender_key or "Male"
         if not plan.age_key:
             plan.segment_section = "Gender"
@@ -751,6 +1155,18 @@ def _normalize_plan_for_question(
             if item.casefold() not in {value.casefold() for value in merged}:
                 merged.append(item)
         plan.must_include = merged[:8]
+    elif plan.must_include:
+        # Keep model must_include only when they look like real ingredients —
+        # drop ranking adjectives the LLM sometimes copies from the question.
+        plan.must_include = [
+            item for item in plan.must_include if not _is_ranking_phrase_token(item)
+        ][:8]
+    else:
+        plan.must_include = []
+    # Final safety: strip ranking tokens even if both sources contributed them.
+    plan.must_include = [
+        item for item in (plan.must_include or []) if not _is_ranking_phrase_token(item)
+    ][:8]
     if plan.must_include and plan.tool in {
         AssistantToolName.clarify,
         AssistantToolName.rank_elements,
@@ -774,9 +1190,33 @@ def _normalize_plan_for_question(
             plan.tool = AssistantToolName.rank_designs
 
     explicit_count = _explicit_result_count(text)
+    # Singular best/worst design asks — covers "highest-scoring combination",
+    # "what is the best mix", "winning package", etc.
+    _design_noun = r"(?:design|mix|combination|package|stack|creative)"
     singular_design = bool(
-        re.search(r"\b(best|worst|top|lowest|highest)\s+(?:overall\s+)?(?:design|mix|combination)\b", text)
-        or re.search(r"\bwhich\s+(?:design|mix)\s+is\s+(?:the\s+)?best\b", text)
+        re.search(
+            rf"\b(best|worst|top|lowest|highest)\s+(?:overall\s+)?{_design_noun}\b",
+            text,
+        )
+        or re.search(
+            rf"\b(?:best|worst|top|lowest|highest)[- ](?:scoring|performing|rated|ranked)\s+"
+            rf"(?:overall\s+)?{_design_noun}\b",
+            text,
+        )
+        or re.search(
+            rf"\b(?:winning|leading|strongest|weakest)\s+{_design_noun}\b",
+            text,
+        )
+        or re.search(
+            rf"\b(?:which|what)\s+(?:is\s+)?(?:the\s+)?(?:best|worst|top|highest[- ]scoring|"
+            rf"highest[- ]performing|lowest[- ]scoring)\s+{_design_noun}\b",
+            text,
+        )
+        or re.search(
+            rf"\b(?:which|what)\s+(?:{_design_noun})\s+is\s+(?:the\s+)?"
+            rf"(?:best|worst|highest[- ]scoring|top[- ]performing)\b",
+            text,
+        )
         or (
             plan.must_include
             and re.search(r"\b(?:which|what)\s+is\s+(?:the\s+)?(?:top|best)\b", text)
@@ -785,13 +1225,86 @@ def _normalize_plan_for_question(
     )
     singular_element = bool(
         re.search(r"\b(best|worst|top|lowest|highest)\s+(?:overall\s+)?(?:statement|element|concept|claim)\b", text)
+        or re.search(
+            r"\b(?:best|worst|top|lowest|highest)[- ](?:scoring|performing)\s+"
+            r"(?:overall\s+)?(?:statement|element|concept|claim)\b",
+            text,
+        )
         or re.search(r"\bwhich\s+(?:statement|element|concept|claim)\s+is\s+(?:the\s+)?best\b", text)
     )
     plural_element = bool(re.search(r"\b(statements|elements|concepts|claims)\b", text))
-    plural_design = bool(re.search(r"\b(designs|mixes|combinations)\b", text))
+    plural_design = bool(
+        re.search(r"\b(designs|mixes|combinations|packages|stacks|creatives)\b", text)
+    )
 
     if plan.tool == AssistantToolName.explain_design:
         plan.limit = 2
+        return plan
+
+    if _is_executive_summary_query(text):
+        plan.tool = AssistantToolName.executive_summary
+        return plan
+
+    # Compare / difference / contrast — trust free-text intent. Static rules only
+    # correct clear special cases (top N designs, best vs worst).
+    if plan.tool == AssistantToolName.compare or is_compare_intent(message):
+        plan.tool = AssistantToolName.compare
+        # Prefer extracted sides from the question; keep model sides if extract finds none.
+        pair = extract_compare_pair(message)
+        if pair:
+            plan.compare_left, plan.compare_right = pair[0][:120], pair[1][:120]
+        if is_compare_top_designs_query(text):
+            plan.compare_left = "design 1"
+            plan.compare_right = "design 2"
+            plan.compare_mode = CompareMode.design
+            plan.limit = 2
+            return plan
+        if is_best_vs_worst_design_query(text):
+            left_side = plan.compare_left
+            right_side = plan.compare_right
+            segment_pair = bool(
+                left_side
+                and right_side
+                and (
+                    (extract_gender_from_text(left_side) and extract_gender_from_text(right_side))
+                    or (
+                        (extract_age_segment_from_text(left_side) or resolve_age_segment_key(left_side))
+                        and (extract_age_segment_from_text(right_side) or resolve_age_segment_key(right_side))
+                    )
+                )
+            )
+            if not segment_pair:
+                plan.compare_left = "best"
+                plan.compare_right = "worst"
+                plan.compare_mode = CompareMode.design
+                return plan
+        left_g = extract_gender_from_text(plan.compare_left or "")
+        right_g = extract_gender_from_text(plan.compare_right or "")
+        left_a = extract_age_segment_from_text(plan.compare_left or "") or resolve_age_segment_key(
+            plan.compare_left or ""
+        )
+        right_a = extract_age_segment_from_text(plan.compare_right or "") or resolve_age_segment_key(
+            plan.compare_right or ""
+        )
+        if left_g and right_g and left_g != right_g:
+            plan.compare_mode = CompareMode.segment
+            plan.compare_left = left_g
+            plan.compare_right = right_g
+            plan.gender_key = None
+            plan.segment_section = None
+            plan.segment_key = None
+        elif left_a and right_a and left_a != right_a:
+            plan.compare_mode = CompareMode.segment
+            plan.compare_left = left_a
+            plan.compare_right = right_a
+            plan.age_key = None
+            plan.segment_section = None
+            plan.segment_key = None
+        return plan
+
+    if _is_cohort_rank_query(text):
+        plan.tool = AssistantToolName.rank_designs
+        plan.limit = explicit_count or 1
         return plan
 
     if singular_design:
@@ -802,9 +1315,9 @@ def _normalize_plan_for_question(
         plan.limit = explicit_count or 1
     elif explicit_count and plan.tool in {AssistantToolName.rank_elements, AssistantToolName.rank_designs}:
         plan.limit = explicit_count
-    elif plural_element and plan.tool == AssistantToolName.rank_elements:
+    elif plural_element and plan.tool == AssistantToolName.rank_elements and not explicit_count:
         plan.limit = 4
-    elif plural_design and plan.tool == AssistantToolName.rank_designs:
+    elif plural_design and plan.tool == AssistantToolName.rank_designs and not explicit_count:
         plan.limit = 4
 
     # "Which is the best overall?" is naturally study-type dependent.
@@ -860,12 +1373,48 @@ def plan_query(message: str, request: AssistantQueryRequest) -> Tuple[AssistantQ
             "prompt_tokens": getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0,
             "completion_tokens": getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0,
         }
-        # If model is low-confidence, blend with deterministic fallback
+        # Prefer the model's clarification when it is unsure — that is the product
+        # contract ("ask what you mean") instead of guessing wrongly.
+        if plan.tool == AssistantToolName.clarify:
+            if not plan.clarification_prompt:
+                plan.clarification_prompt = "I’m not sure what you mean — what should I analyze?"
+            if not plan.clarification_options:
+                plan.clarification_options = [
+                    "Best design overall",
+                    "Top 2 designs",
+                    "Top 10 elements",
+                    "Compare best vs worst design",
+                    "Study overview",
+                ]
+            return plan, usage
+        # Low-confidence non-clarify guesses: try deterministic; if that is also
+        # unsure, ask the user instead of executing a weak guess.
         if plan.confidence < 0.45:
             fallback = _deterministic_plan(message, request)
             if fallback.tool != AssistantToolName.clarify:
                 plan = fallback
                 usage["planner"] = "openai+deterministic_fallback"
+            else:
+                plan = AssistantQueryPlan(
+                    tool=AssistantToolName.clarify,
+                    clarification_prompt=(
+                        plan.clarification_prompt
+                        or fallback.clarification_prompt
+                        or "I’m not sure what you mean — what should I analyze?"
+                    ),
+                    clarification_options=(
+                        plan.clarification_options
+                        or fallback.clarification_options
+                        or [
+                            "Best design overall",
+                            "Top 2 designs",
+                            "Top 10 elements",
+                            "Compare best vs worst design",
+                        ]
+                    ),
+                    confidence=0.35,
+                )
+                usage["planner"] = "openai+clarify"
         return plan, usage
     except Exception as exc:
         logger.warning("Assistant planner failed, using deterministic fallback: %s", exc)
@@ -881,8 +1430,18 @@ def _enrich_classification_plan_with_study(
 ) -> AssistantQueryPlan:
     """Resolve classification question/options using the study's configured catalog."""
     follow = request.follow_up
+    text = message.casefold()
     matched_question = find_classification_question_by_text(study_obj, message)
     matched_options = match_classification_options_in_text(study_obj, message)
+
+    if plan.tool in {
+        AssistantToolName.executive_summary,
+        AssistantToolName.compare_segments,
+    }:
+        return plan
+
+    if plan.tool == AssistantToolName.compare:
+        return _apply_compare_plan(message, plan, study_obj)
 
     pending: List[str] = []
     for opt in list(plan.classification_options or []) + list(
@@ -902,7 +1461,22 @@ def _enrich_classification_plan_with_study(
     if not plan.age_key:
         plan.age_key = extract_age_segment_from_text(message)
 
-    if matched_question:
+    if _is_cohort_rank_query(text) or (
+        plan.tool == AssistantToolName.rank_designs and plan.classification_options
+    ):
+        plan.tool = AssistantToolName.rank_designs
+        if not plan.classification_question and plan.classification_options:
+            resolved, _ = resolve_classification_question_from_options(
+                study_obj, plan.classification_options
+            )
+            if resolved:
+                plan.classification_question = resolved.question_text
+        return plan
+
+    if matched_question and plan.tool not in {
+        AssistantToolName.rank_designs,
+        AssistantToolName.compare,
+    }:
         plan.tool = AssistantToolName.classification_distribution
         plan.classification_question = matched_question.question_text
         return plan
@@ -915,6 +1489,16 @@ def _enrich_classification_plan_with_study(
         return plan
 
     if matched_options:
+        if _is_cohort_rank_query(text):
+            plan.tool = AssistantToolName.rank_designs
+            plan.limit = plan.limit or 1
+            if not plan.classification_question:
+                resolved, _ = resolve_classification_question_from_options(
+                    study_obj, plan.classification_options or matched_options
+                )
+                if resolved:
+                    plan.classification_question = resolved.question_text
+            return plan
         plan.tool = AssistantToolName.classification_distribution
         # Options can repeat across questions — only auto-bind when unique.
         if not plan.classification_question:
@@ -933,6 +1517,86 @@ def _enrich_classification_plan_with_study(
         return plan
 
     return plan
+
+
+_GREETING_RE = re.compile(
+    r"\s*(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|thanks|thank\s+you)[!?.\s]*",
+)
+
+
+def _is_simple_greeting(message: str) -> bool:
+    """Bare pleasantries need no data lookup — answer them without the agent."""
+    return bool(_GREETING_RE.fullmatch((message or "").casefold()))
+
+
+def _has_responses(analysis: Optional[Dict[str, Any]]) -> bool:
+    summary = (analysis or {}).get("dashboard_summary") or {}
+    return int(summary.get("totalResponses") or 0) > 0
+
+
+def _finalize_agent_response(
+    db: Session,
+    *,
+    request_id: str,
+    study_obj: Any,
+    analysis: Dict[str, Any],
+    filters: Optional[Dict[str, Any]],
+    agent_result: Dict[str, Any],
+    conversation: Any,
+    user_message: Any,
+    cache_key: str,
+) -> AssistantQueryResponse:
+    """Turn an agent result into the same response shape the planner produces."""
+    primary_tool = agent_result.get("agent_primary_tool") or AssistantToolName.study_overview
+    plan = agent_result.get("agent_plan") or AssistantQueryPlan(tool=primary_tool)
+    plan.tool = primary_tool
+
+    context = build_applied_context(study_obj, analysis, plan, filters)
+    # An answer with no tool behind it (off-topic, or a question about the tool
+    # itself) must not wear the verified badge.
+    context.verified = bool(agent_result.get("agent_data_backed"))
+
+    follow_up_ctx = agent_result.get("follow_up_context")
+    follow_up_model = None
+    if isinstance(follow_up_ctx, dict):
+        try:
+            follow_up_model = AssistantFollowUpContext(**follow_up_ctx)
+        except Exception:
+            follow_up_model = None
+
+    response = AssistantQueryResponse(
+        request_id=request_id,
+        status="answered",
+        answer_text=agent_result.get("answer_text") or "",
+        tool=primary_tool,
+        applied_context=context,
+        blocks=agent_result.get("blocks") or [],
+        evidence=agent_result.get("evidence") or [],
+        follow_ups=agent_result.get("follow_ups") or [],
+        actions=agent_result.get("actions") or [],
+        clarification_options=[],
+        follow_up_context=follow_up_model,
+        usage=agent_result.get("usage") or {},
+        conversation_id=conversation.id,
+        user_message_id=user_message.id,
+    )
+
+    assistant_row = insert_assistant_message(
+        db,
+        conversation=conversation,
+        parent_message=user_message,
+        content=response.answer_text,
+        response=response,
+        status="complete",
+    )
+    response.assistant_message_id = assistant_row.id
+
+    RedisCache.set(
+        cache_key,
+        json.loads(response.model_dump_json()),
+        ttl_seconds=settings.ASSISTANT_CACHE_TTL_SECONDS,
+    )
+    return response
 
 
 def _filters_dict(request: AssistantQueryRequest, db: Session, study_id, user_id) -> Optional[Dict[str, Any]]:
@@ -989,15 +1653,59 @@ def run_assistant_query(
             error=exc.message,
         )
 
+    # Private per-user conversation + durable user message (idempotent).
+    conversation = get_or_create_conversation(
+        db,
+        study_id=study_obj.id,
+        user_id=current_user.id,
+    )
+    client_message_id = request.client_message_id or str(uuid.uuid4())
+    user_message = insert_user_message(
+        db,
+        conversation=conversation,
+        content=request.message,
+        client_message_id=client_message_id,
+    )
+
+    # Exact retry: if a successful assistant reply already exists, return it.
+    # Failed replies are removed so the client can retry the same client_message_id.
+    existing_reply = get_assistant_reply_for_parent(db, parent_message_id=user_message.id)
+    if existing_reply:
+        if existing_reply.status in {"error", "failed"}:
+            db.delete(existing_reply)
+            db.commit()
+        else:
+            cached_response = response_from_assistant_message(
+                existing_reply,
+                fallback_request_id=request_id,
+            )
+            if cached_response is not None:
+                cached_response.conversation_id = conversation.id
+                cached_response.usage = {
+                    **(cached_response.usage or {}),
+                    "history_replay": True,
+                }
+                return cached_response
+            db.delete(existing_reply)
+            db.commit()
+
     filters = _filters_dict(request, db, study_id, current_user.id)
+    # The rendered answer bakes in whatever analysis settings were active when it
+    # was computed (with/without intercept, thresholds, ...) — this must be part
+    # of the key, or toggling a setting keeps serving the old answer text for up
+    # to ASSISTANT_CACHE_TTL_SECONDS regardless of the new numbers.
+    analysis_options_for_cache = get_study_analysis_settings(db, study_id, study=study_obj)
     cache_payload = {
-        "assistant_semantics_version": 11,
+        # Bumped for the tool-calling agent: cached template answers from the
+        # single-tool planner must not be replayed over the new behaviour.
+        "assistant_semantics_version": 22,
         "message": request.message,
         "filters": filters,
         "metric": request.metric.value if request.metric else None,
         "segment_section": request.segment_section,
         "segment_key": request.segment_key,
         "follow_up": request.follow_up.model_dump() if request.follow_up else None,
+        "analysis_settings": analysis_options_for_cache,
     }
     cache_key = _cache_key(str(study_id), str(current_user.id), cache_payload)
     cached = RedisCache.get(cache_key)
@@ -1005,11 +1713,98 @@ def run_assistant_query(
         cached["request_id"] = request_id
         cached.setdefault("usage", {})["cache_hit"] = True
         try:
-            return AssistantQueryResponse(**cached)
+            response = AssistantQueryResponse(**cached)
+            response.conversation_id = conversation.id
+            response.user_message_id = user_message.id
+            # Persist cache hit as a normal chat turn so history stays complete.
+            assistant_row = insert_assistant_message(
+                db,
+                conversation=conversation,
+                parent_message=user_message,
+                content=response.answer_text,
+                response=response,
+                status="complete" if response.status != "error" else "error",
+            )
+            response.assistant_message_id = assistant_row.id
+            return response
         except Exception:
             pass
 
-    plan, planner_usage = plan_query(request.message, request)
+    # The agent builds its study dictionary from the analysis, so its first call
+    # cannot start until the analysis is ready — there is nothing to overlap.
+    # On the fallback path the planner still runs concurrently with the prefetch
+    # (network I/O releases the GIL). Only the main thread touches `db`, and
+    # plan_query is pure network/regex, so that overlap stays safe.
+    use_agent = bool(settings.ASSISTANT_AGENT_ENABLED) and not _is_simple_greeting(request.message)
+    plan_future = None if use_agent else _PLANNER_POOL.submit(plan_query, request.message, request)
+
+    prefetched_analysis: Optional[Dict[str, Any]] = None
+    prefetch_error: Optional[Exception] = None
+    try:
+        prefetched_analysis = load_analysis_for_assistant(
+            db, study_obj, current_user, filters=filters
+        )
+    except Exception as exc:
+        logger.exception("Speculative analysis prefetch failed")
+        prefetch_error = exc
+
+    # A study with no completed responses has nothing to look up; the legacy
+    # path already says so in one step, without spending tokens on it.
+    if use_agent and not _has_responses(prefetched_analysis):
+        use_agent = False
+
+    agent_result: Optional[Dict[str, Any]] = None
+    if use_agent and prefetched_analysis is not None:
+        try:
+            agent_result = run_agent_query(
+                db,
+                study_obj=study_obj,
+                current_user=current_user,
+                request=request,
+                analysis=prefetched_analysis,
+                filters=filters,
+                conversation_id=conversation.id,
+                user_message_id=user_message.id,
+            )
+        except AgentUnavailable as exc:
+            logger.info("Assistant agent deferred to the planner: %s", exc)
+        except Exception:
+            logger.exception("Assistant agent failed; falling back to the planner")
+
+    if agent_result is not None:
+        return _finalize_agent_response(
+            db,
+            request_id=request_id,
+            study_obj=study_obj,
+            analysis=prefetched_analysis or {},
+            filters=filters,
+            agent_result=agent_result,
+            conversation=conversation,
+            user_message=user_message,
+            cache_key=cache_key,
+        )
+
+    if plan_future is not None:
+        try:
+            plan, planner_usage = plan_future.result()
+        except Exception as exc:
+            logger.warning("Planner thread failed, using deterministic fallback: %s", exc)
+            plan = _deterministic_plan(request.message, request)
+            planner_usage = {"planner": "deterministic", "planner_error": str(exc)[:200]}
+    else:
+        # Agent path was tried and declined; plan inline.
+        try:
+            plan, planner_usage = plan_query(request.message, request)
+            planner_usage = {**planner_usage, "agent_fallback": True}
+        except Exception as exc:
+            logger.warning("Inline planner failed, using deterministic fallback: %s", exc)
+            plan = _deterministic_plan(request.message, request)
+            planner_usage = {
+                "planner": "deterministic",
+                "planner_error": str(exc)[:200],
+                "agent_fallback": True,
+            }
+
     plan = _normalize_plan_for_question(
         plan,
         request.message,
@@ -1029,11 +1824,19 @@ def run_assistant_query(
     analysis: Dict[str, Any] = {}
     if needs_analysis or plan.tool == AssistantToolName.study_overview:
         try:
-            analysis = load_analysis_for_assistant(db, study_obj, current_user, filters=filters)
+            # Reuse the concurrent prefetch when it succeeded; otherwise build now.
+            if prefetched_analysis is not None:
+                analysis = prefetched_analysis
+            elif prefetch_error is not None:
+                raise prefetch_error
+            else:
+                analysis = load_analysis_for_assistant(
+                    db, study_obj, current_user, filters=filters
+                )
         except Exception as exc:
             logger.exception("Failed to load analysis for assistant")
             context = build_applied_context(study_obj, {}, plan, filters)
-            return AssistantQueryResponse(
+            response = AssistantQueryResponse(
                 request_id=request_id,
                 status="error",
                 answer_text="I could not load verified analysis for this study right now.",
@@ -1041,14 +1844,29 @@ def run_assistant_query(
                 applied_context=context,
                 error=str(exc)[:200],
                 usage=planner_usage,
+                conversation_id=conversation.id,
+                user_message_id=user_message.id,
             )
+            assistant_row = insert_assistant_message(
+                db,
+                conversation=conversation,
+                parent_message=user_message,
+                content=response.answer_text,
+                response=response,
+                status="error",
+            )
+            response.assistant_message_id = assistant_row.id
+            return response
 
     # Classification can still benefit from empty analysis context
     if plan.tool == AssistantToolName.classification_distribution and not analysis:
-        try:
-            analysis = load_analysis_for_assistant(db, study_obj, current_user, filters=filters)
-        except Exception:
-            analysis = {}
+        if prefetched_analysis is not None:
+            analysis = prefetched_analysis
+        else:
+            try:
+                analysis = load_analysis_for_assistant(db, study_obj, current_user, filters=filters)
+            except Exception:
+                analysis = {}
 
     context = build_applied_context(study_obj, analysis, plan, filters)
     result = execute_tool(
@@ -1059,6 +1877,7 @@ def run_assistant_query(
         analysis=analysis,
         filters=filters,
         context=context,
+        message=request.message,
     )
 
     status = result.get("status") or "answered"
@@ -1086,7 +1905,19 @@ def run_assistant_query(
         follow_up_context=follow_up_model,
         usage=usage,
         error=result.get("error"),
+        conversation_id=conversation.id,
+        user_message_id=user_message.id,
     )
+
+    assistant_row = insert_assistant_message(
+        db,
+        conversation=conversation,
+        parent_message=user_message,
+        content=response.answer_text,
+        response=response,
+        status="complete" if status != "error" else "error",
+    )
+    response.assistant_message_id = assistant_row.id
 
     if status == "answered":
         RedisCache.set(cache_key, json.loads(response.model_dump_json()), ttl_seconds=settings.ASSISTANT_CACHE_TTL_SECONDS)
