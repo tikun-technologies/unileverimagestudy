@@ -235,7 +235,7 @@ def _generate_study_analysis_json(
     return _sanitize_analysis_json(json_report)
 
 
-async def _load_study_dataframe_for_analysis(
+def _load_study_dataframe_for_analysis(
     db: Session,
     study_id: UUID,
     current_user: User,
@@ -250,14 +250,14 @@ async def _load_study_dataframe_for_analysis(
     return df, unilever_format
 
 
-async def _build_analytics_session(
+def _build_analytics_session(
     db: Session,
     study_obj: Study,
     current_user: User,
 ) -> Dict[str, Any]:
     study_id = study_obj.id
     active = get_active_filter(db, study_id, current_user.id)
-    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
     analysis = _generate_study_analysis_json(
         db,
         study_obj,
@@ -476,7 +476,7 @@ def _build_cohort_demographic_breakdown(
 
 
 @router.post("/start-study", response_model=StartStudyResponse)
-async def start_study(
+def start_study(
     request: StartStudyRequest,
     http_request: Request,
     db: Session = Depends(get_db)
@@ -521,7 +521,7 @@ def check_panelist_participation(
 
 
 @router.post("/submit-task", response_model=SubmitTaskResponse)
-async def submit_task(
+def submit_task(
     session_id: str,
     request: SubmitTaskRequest,
     db: Session = Depends(get_db)
@@ -545,7 +545,7 @@ async def submit_task(
     return result
 
 @router.post("/submit-tasks-bulk", response_model=BulkSubmitTasksResponse)
-async def submit_tasks_bulk(
+def submit_tasks_bulk(
     session_id: str,
     request: BulkSubmitTasksRequest,
     db: Session = Depends(get_db)
@@ -569,7 +569,7 @@ async def submit_tasks_bulk(
     return result
 
 @router.post("/submit-classification", response_model=SubmitClassificationResponse)
-async def submit_classification(
+def submit_classification(
     session_id: str,
     request: SubmitClassificationRequest,
     db: Session = Depends(get_db)
@@ -624,15 +624,15 @@ async def submit_synthetic_respondent(
     else:
         study_id = request.study_id
         payload = request.payload
-    result = service.submit_synthetic_respondent(study_id, payload)
-    
+    result = await asyncio.to_thread(service.submit_synthetic_respondent, study_id, payload)
+
     # Invalidate analytics caches
     invalidate_study_cache(study_id)
     
     return SubmitSyntheticRespondentResponse(**result)
 
 @router.post("/abandon-study", response_model=AbandonStudyResponse)
-async def abandon_study(
+def abandon_study(
     session_id: str,
     request: AbandonStudyRequest,
     db: Session = Depends(get_db)
@@ -649,7 +649,7 @@ async def abandon_study(
     )
 
 @router.get("/session/{session_id}/status")
-async def get_session_status(
+def get_session_status(
     session_id: str,
     db: Session = Depends(get_db)
 ):
@@ -665,7 +665,7 @@ async def get_session_status(
     }
 
 @router.get("/session/{session_id}", response_model=StudyResponseDetail)
-async def get_session(
+def get_session(
     session_id: str,
     db: Session = Depends(get_db)
 ):
@@ -873,7 +873,7 @@ async def get_session(
     return response_dict
 
 @router.put("/session/{session_id}/user-details")
-async def update_user_details(
+def update_user_details(
     session_id: str,
     request: UpdateUserDetailsRequest,
     db: Session = Depends(get_db)
@@ -892,7 +892,7 @@ async def update_user_details(
     }
 
 @router.post("/session/{session_id}/product-id", response_model=SubmitProductIdResponse)
-async def submit_product_id(
+def submit_product_id(
     session_id: str,
     request: SubmitProductIdRequest,
     db: Session = Depends(get_db)
@@ -916,7 +916,7 @@ async def submit_product_id(
     )
 
 @router.post("/session/{session_id}/panelist", response_model=SubmitPanelistResponse)
-async def submit_panelist(
+def submit_panelist(
     session_id: str,
     request: SubmitPanelistRequest,
     db: Session = Depends(get_db)
@@ -944,7 +944,7 @@ async def submit_panelist(
 # ---------- Study Response Management (Authenticated) ----------
 
 @router.get("/", response_model=List[StudyResponseListItem])
-async def list_responses(
+def list_responses(
     study_id: Optional[UUID] = Query(None, description="Filter by study ID"),
     is_completed: Optional[bool] = Query(None, description="Filter by completion status"),
     is_abandoned: Optional[bool] = Query(None, description="Filter by abandonment status"),
@@ -1010,7 +1010,7 @@ async def list_responses(
     return responses
 
 @router.get("/{response_id}", response_model=StudyResponseDetail)
-async def get_response(
+def get_response(
     response_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1034,7 +1034,7 @@ async def get_response(
     return response
 
 @router.delete("/{response_id}")
-async def delete_response(
+def delete_response(
     response_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1067,7 +1067,7 @@ async def delete_response(
 
 
 @router.delete("/study/{study_id}/session/{session_id}")
-async def delete_response_by_study_session(
+def delete_response_by_study_session(
     study_id: UUID,
     session_id: str,
     db: Session = Depends(get_db),
@@ -1094,7 +1094,7 @@ async def delete_response_by_study_session(
 # ---------- Analytics Endpoints ----------
 
 @router.get("/analytics/study/{study_id}", response_model=StudyAnalytics)
-async def get_study_analytics(
+def get_study_analytics(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1156,7 +1156,7 @@ async def get_study_analytics(
 
 
 @router.get("/analytics/study/{study_id}/stream")
-async def stream_study_analytics(
+def stream_study_analytics(
     study_id: UUID,
     interval_seconds: int = Query(10, ge=5, le=60),  # Increased minimum for scalability
     current_user: User = Depends(get_current_active_user),
@@ -1205,7 +1205,7 @@ async def stream_study_analytics(
             # Smart caching: Use cache for most requests, refresh occasionally
             cache_key = f"study_analytics:{study_id}"
             if request_count % 2 == 0:  # Refresh every 2nd request (every 20 seconds with 10s interval)
-                analytics = service.get_study_analytics(study_id)
+                analytics = await asyncio.to_thread(service.get_study_analytics, study_id)
                 RedisCache.set(cache_key, analytics.model_dump(), ttl_seconds=60)
             else:
                 # Use cached data for faster response
@@ -1213,7 +1213,7 @@ async def stream_study_analytics(
                 if cached_data:
                     analytics = StudyAnalytics(**cached_data)
                 else:
-                    analytics = service.get_study_analytics(study_id)
+                    analytics = await asyncio.to_thread(service.get_study_analytics, study_id)
                     RedisCache.set(cache_key, analytics.model_dump(), ttl_seconds=60)
             
             payload = json.dumps(analytics.model_dump())
@@ -1228,7 +1228,7 @@ async def stream_study_analytics(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @router.get("/analytics/response/{response_id}", response_model=ResponseAnalytics)
-async def get_response_analytics(
+def get_response_analytics(
     response_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1260,7 +1260,7 @@ async def get_response_analytics(
 
 
 @router.post("/check-abandoned-sessions")
-async def check_abandoned_sessions(
+def check_abandoned_sessions(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
@@ -1279,7 +1279,7 @@ async def check_abandoned_sessions(
 
 
 @router.post("/check-study-completion")
-async def check_study_completion(
+def check_study_completion(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
@@ -1298,7 +1298,7 @@ async def check_study_completion(
 # ---------- Task Session Endpoints ----------
 
 @router.post("/task-sessions/", response_model=TaskSessionOut)
-async def create_task_session(
+def create_task_session(
     session_data: TaskSessionCreate,
     db: Session = Depends(get_db)
 ):
@@ -1309,7 +1309,7 @@ async def create_task_session(
     return service.create_task_session(session_data)
 
 @router.get("/task-sessions/{session_id}/{task_id}", response_model=TaskSessionOut)
-async def get_task_session(
+def get_task_session(
     session_id: str,
     task_id: str,
     db: Session = Depends(get_db)
@@ -1329,7 +1329,7 @@ async def get_task_session(
     return task_session
 
 @router.post("/task-sessions/{session_id}/{task_id}/page-transition")
-async def add_page_transition(
+def add_page_transition(
     session_id: str,
     task_id: str,
     page_name: str,
@@ -1350,7 +1350,7 @@ async def add_page_transition(
     return {"message": "Page transition added successfully"}
 
 @router.post("/task-sessions/{session_id}/{task_id}/element-interaction")
-async def add_element_interaction(
+def add_element_interaction(
     session_id: str,
     task_id: str,
     interaction_data: ElementInteractionCreate,
@@ -1373,7 +1373,7 @@ async def add_element_interaction(
 # ---------- Export Endpoints ----------
 
 @router.get("/export/study/{study_id}/responses")
-async def export_study_responses(
+def export_study_responses(
     study_id: UUID,
     format: str = Query("csv", regex="^(csv|json)$", description="Export format"),
     current_user: User = Depends(get_current_active_user),
@@ -1438,7 +1438,7 @@ async def export_study_responses(
         }
 
 @router.get("/export/response/{response_id}/detailed")
-async def export_response_detailed(
+def export_response_detailed(
     response_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1470,7 +1470,7 @@ async def export_response_detailed(
 
 
 @router.get("/export/study/{study_id}/flattened-csv2")
-async def export_study_flattened_csv(
+def export_study_flattened_csv(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1546,7 +1546,7 @@ def _generate_study_excel_export_response(
 
 
 @router.get("/export/study/{study_id}/flattened-csv")
-async def export_study_analysis(
+def export_study_analysis(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -1559,7 +1559,7 @@ async def export_study_analysis(
 
 
 @router.post("/export/study/{study_id}/flattened-csv")
-async def export_study_analysis_filtered(
+def export_study_analysis_filtered(
     study_id: UUID,
     payload: FlattenedCsvExportPayload,
     current_user: User = Depends(get_current_active_user),
@@ -1605,7 +1605,7 @@ def _authorize_study_for_analysis(db: Session, study_id: UUID, current_user: Use
 
 
 @router.get("/study/{study_id}/analysis-json")
-async def export_study_analysis_json(
+def export_study_analysis_json(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -1638,7 +1638,7 @@ async def export_study_analysis_json(
 
 
 @router.get("/study/{study_id}/analysis-settings")
-async def get_study_analysis_settings_endpoint(
+def get_study_analysis_settings_endpoint(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -1649,7 +1649,7 @@ async def get_study_analysis_settings_endpoint(
 
 
 @router.put("/study/{study_id}/analysis-settings")
-async def save_study_analysis_settings_endpoint(
+def save_study_analysis_settings_endpoint(
     study_id: UUID,
     payload: StudyAnalysisSettingsPayload,
     current_user: User = Depends(get_current_active_user),
@@ -1671,7 +1671,7 @@ async def save_study_analysis_settings_endpoint(
 
 
 @router.get("/study/{study_id}/analytics-session")
-async def get_study_analytics_session(
+def get_study_analytics_session(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -1682,7 +1682,7 @@ async def get_study_analytics_session(
     """
     study_obj = _authorize_study_for_analysis(db, study_id, current_user)
     try:
-        return await _build_analytics_session(db, study_obj, current_user)
+        return _build_analytics_session(db, study_obj, current_user)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1693,7 +1693,7 @@ async def get_study_analytics_session(
 
 
 @router.get("/study/{study_id}/active-filter")
-async def get_study_active_filter(
+def get_study_active_filter(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -1718,7 +1718,7 @@ async def get_study_active_filter(
 
 
 @router.post("/study/{study_id}/active-filter")
-async def save_study_active_filter(
+def save_study_active_filter(
     study_id: UUID,
     payload: ActiveFilterPayload,
     current_user: User = Depends(get_current_active_user),
@@ -1737,7 +1737,7 @@ async def save_study_active_filter(
         clear_active_filter(db, study_id, current_user.id)
         saved = None
 
-    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
     try:
         analysis = _generate_study_analysis_json(
             db,
@@ -1773,7 +1773,7 @@ async def save_study_active_filter(
 
 
 @router.delete("/study/{study_id}/active-filter")
-async def reset_study_active_filter(
+def reset_study_active_filter(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -1782,7 +1782,7 @@ async def reset_study_active_filter(
     study_obj = _authorize_study_for_analysis(db, study_id, current_user)
     clear_active_filter(db, study_id, current_user.id)
 
-    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
     try:
         analysis = _generate_study_analysis_json(
             db,
@@ -1810,7 +1810,7 @@ async def reset_study_active_filter(
 
 
 @router.get("/study/{study_id}/optimized-analysis-json")
-async def export_study_optimized_analysis_json(
+def export_study_optimized_analysis_json(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -1819,7 +1819,7 @@ async def export_study_optimized_analysis_json(
     Export analytics JSON for the frontend without the heavy RawData payload.
     Raw-derived overview widgets read the compact dashboard_summary instead.
     """
-    return await export_study_analysis_json(
+    return export_study_analysis_json(
         study_id=study_id,
         current_user=current_user,
         db=db,
@@ -1828,7 +1828,7 @@ async def export_study_optimized_analysis_json(
 
 
 @router.post("/study/{study_id}/optimized-analysis-json")
-async def post_study_optimized_analysis_json(
+def post_study_optimized_analysis_json(
     study_id: UUID,
     payload: OptimizedAnalysisPayload,
     current_user: User = Depends(get_current_active_user),
@@ -1848,7 +1848,7 @@ async def post_study_optimized_analysis_json(
     else:
         clear_active_filter(db, study_id, current_user.id)
 
-    df, unilever_format = await _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
 
     try:
         json_report = _generate_study_analysis_json(
@@ -1885,7 +1885,7 @@ async def post_study_optimized_analysis_json(
 
 
 @router.post("/study/{study_id}/classification-cohort", response_model=ClassificationCohortResponse)
-async def get_classification_cohort(
+def get_classification_cohort(
     study_id: UUID,
     payload: ClassificationCohortPayload,
     current_user: User = Depends(get_current_active_user),
@@ -2096,7 +2096,7 @@ async def get_classification_cohort(
 
 
 @router.get("/study/{study_id}/saved-reports", response_model=List[SavedFilterReportOut])
-async def get_study_saved_reports(
+def get_study_saved_reports(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -2107,7 +2107,7 @@ async def get_study_saved_reports(
 
 
 @router.post("/study/{study_id}/saved-reports", response_model=SavedFilterReportOut)
-async def create_study_saved_report(
+def create_study_saved_report(
     study_id: UUID,
     payload: SavedFilterReportCreate,
     current_user: User = Depends(get_current_active_user),
@@ -2128,7 +2128,7 @@ async def create_study_saved_report(
 
 
 @router.put("/study/{study_id}/saved-reports/{report_id}", response_model=SavedFilterReportOut)
-async def rename_study_saved_report(
+def rename_study_saved_report(
     study_id: UUID,
     report_id: UUID,
     payload: SavedFilterReportUpdate,
@@ -2147,7 +2147,7 @@ async def rename_study_saved_report(
 
 
 @router.delete("/study/{study_id}/saved-reports/{report_id}")
-async def delete_study_saved_report(
+def delete_study_saved_report(
     study_id: UUID,
     report_id: UUID,
     current_user: User = Depends(get_current_active_user),
@@ -2160,7 +2160,7 @@ async def delete_study_saved_report(
 
 
 @router.get("/study/{study_id}/filters")
-async def list_study_filter_history(
+def list_study_filter_history(
     study_id: UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -2214,7 +2214,7 @@ async def list_study_filter_history(
 
 
 @router.post("/study/{study_id}/filter")
-async def filter_study_regression_report(
+def filter_study_regression_report(
     study_id: UUID,
     payload: StudyFilterPayload,
     current_user: User = Depends(get_current_active_user),
@@ -2458,7 +2458,7 @@ async def filter_study_regression_report(
 from app.core.cache import RedisCache
 
 @router.get("/respondent/preview/study/{study_id}/info")
-async def get_preview_study_info(
+def get_preview_study_info(
     study_id: UUID,
     db: Session = Depends(get_db)
 ):
@@ -2473,7 +2473,7 @@ async def get_preview_study_info(
         return cached_data
         
     # Reuse the logic from get_respondent_study_info with respondent_id=1
-    result = await get_respondent_study_info(respondent_id=1, study_id=study_id, db=db, skip_cache=True)
+    result = get_respondent_study_info(respondent_id=1, study_id=study_id, db=db, skip_cache=True)
     
     # Cache the result
     RedisCache.set(cache_key, result, ttl_seconds=300)
@@ -2481,7 +2481,7 @@ async def get_preview_study_info(
 
 
 @router.get("/respondent/{respondent_id}/study/{study_id}/info")
-async def get_respondent_study_info(
+def get_respondent_study_info(
     respondent_id: int,
     study_id: UUID,
     db: Session = Depends(get_db),

@@ -120,7 +120,7 @@ async def websocket_analytics(
                     db = SessionLocal()
                     try:
                         service = StudyResponseService(db)
-                        analytics = service.get_study_analytics(study_id)
+                        analytics = await asyncio.to_thread(service.get_study_analytics, study_id)
                         payload = analytics.model_dump()
                         payload_str = str(payload)
 

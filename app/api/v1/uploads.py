@@ -14,7 +14,7 @@ router = APIRouter()
 
 
 @router.post("/image")
-async def upload_image(
+def upload_image(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -29,7 +29,7 @@ async def upload_image(
 
 
 @router.post("/image-base64")
-async def upload_image_base64(
+def upload_image_base64(
     payload: dict,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
@@ -81,7 +81,7 @@ async def upload_images(
 
 
 @router.delete("")
-async def delete_asset(
+def delete_asset(
     public_id: str,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),

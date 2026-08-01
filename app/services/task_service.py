@@ -23,6 +23,49 @@ class TaskService:
     def __init__(self, db: Session):
         self.db = db
     
+    def get_respondent_task_list(
+        self, study_id: UUID, respondent_id: int
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Per-respondent equivalent of ``get_all_tasks_as_dict(study_id).get(str(respondent_id))``.
+
+        Returns the same list that the full-study dict would yield for this respondent,
+        or None when the respondent has no entry — mirroring ``dict.get`` so callers can
+        fall through to their next candidate key. Reading one respondent instead of the
+        whole study keeps submission cost flat as a study's respondent pool grows.
+
+        Unlike the other readers this never calls rollback(): it runs inside request
+        transactions that already hold pending writes.
+        """
+        try:
+            rows = self.db.execute(
+                select(StudyTaskAssignment)
+                .where(
+                    StudyTaskAssignment.study_id == study_id,
+                    StudyTaskAssignment.respondent_id == respondent_id,
+                )
+                .order_by(StudyTaskAssignment.task_index)
+            ).scalars().all()
+            if rows:
+                return [self._assignment_to_dict(a) for a in rows]
+
+            # No rows for this respondent. Distinguish "study uses normalized storage but
+            # this respondent isn't in it" (-> None, same as a missing dict key) from
+            # "study has no normalized rows at all" (-> fall back to legacy JSONB).
+            study_has_assignments = self.db.execute(
+                select(StudyTaskAssignment.id)
+                .where(StudyTaskAssignment.study_id == study_id)
+                .limit(1)
+            ).scalar_one_or_none()
+            if study_has_assignments is not None:
+                return None
+        except Exception as e:
+            # Table may not exist on older databases - fall through to legacy.
+            logger.debug(f"study_task_assignments lookup failed, using legacy: {e}")
+
+        legacy_value = self._get_legacy_tasks(study_id).get(str(respondent_id))
+        return legacy_value if isinstance(legacy_value, list) else None
+
     def get_all_tasks_as_dict(self, study_id: UUID) -> Dict[str, List[Dict[str, Any]]]:
         """
         Get all tasks for a study in the original dict format:

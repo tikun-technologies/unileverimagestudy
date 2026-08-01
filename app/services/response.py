@@ -10,7 +10,7 @@ import pandas as pd
 
 from sqlalchemy.orm import Session, selectinload, load_only
 from sqlalchemy import select, func, desc, and_, or_, text, delete
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from fastapi import HTTPException, status
 
 from app.models.response_model import (
@@ -138,14 +138,39 @@ class StudyResponseService:
         )
         return not optional_question_ids.issubset(answered_question_ids)
 
+    # Postgres SQLSTATE for a lock_timeout expiry.
+    _LOCK_NOT_AVAILABLE = "55P03"
+
     def _get_response_by_session_for_update(self, session_id: str) -> Optional[StudyResponse]:
-        """Get a study response by session ID with row-level lock for safe progress updates."""
+        """Get a study response by session ID with row-level lock for safe progress updates.
+
+        The row lock is load-bearing for correctness, not just for progress counters:
+        completed_tasks has no unique constraint, so this lock is the only thing stopping
+        concurrent submissions for one session from inserting duplicate task rows.
+
+        The wait for it is bounded. Unbounded, simultaneous submissions for the same
+        session each block while holding a pooled DB connection, which drains the pool and
+        cascades into timeouts across unrelated endpoints. On expiry we surface a
+        retryable 409 so the client backs off and retries instead of piling on.
+        """
+        bind = getattr(self.db, "bind", None)
+        if getattr(getattr(bind, "dialect", None), "name", None) == "postgresql":
+            self.db.execute(text("SET LOCAL lock_timeout = '5s'"))
         stmt = (
             select(StudyResponse)
             .where(StudyResponse.session_id == session_id)
             .with_for_update()
         )
-        return self.db.execute(stmt).scalars().first()
+        try:
+            return self.db.execute(stmt).scalars().first()
+        except OperationalError as exc:
+            if getattr(getattr(exc, "orig", None), "pgcode", None) != self._LOCK_NOT_AVAILABLE:
+                raise
+            self.db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Another submission for this session is already in progress. Please retry.",
+            ) from exc
 
     def _completed_task_exists(
         self,
@@ -901,6 +926,55 @@ class StudyResponseService:
             task_service = TaskService(self.db)
             tasks_dict = task_service.get_all_tasks_as_dict(response.study_id)
 
+        # Grid/text enrichment below resolves the same respondent's task definitions for
+        # every item in this payload, so resolve them once per request. This used to run
+        # inside the task loop AND read the whole study's task matrix, so a 15-task
+        # payload re-read every respondent's assignments 15 times.
+        _respondent_tasks_resolved = False
+        _respondent_tasks: Optional[List[Dict[str, Any]]] = None
+
+        def _get_respondent_tasks_once() -> Optional[List[Dict[str, Any]]]:
+            nonlocal _respondent_tasks_resolved, _respondent_tasks
+            if not _respondent_tasks_resolved:
+                _respondent_tasks_resolved = True
+                # Same candidate keys as before: respondent_id, then respondent_id - 1.
+                candidate_ids = [
+                    response.respondent_id,
+                    max(0, (response.respondent_id or 0) - 1),
+                ]
+                if tasks_dict:
+                    # Hybrid already loaded the full matrix; reuse it rather than re-query.
+                    for rid in candidate_ids:
+                        val = tasks_dict.get(str(rid))
+                        if isinstance(val, list):
+                            _respondent_tasks = val
+                            break
+                else:
+                    from app.services.task_service import TaskService as _TaskService
+                    _ts = _TaskService(self.db)
+                    for rid in candidate_ids:
+                        val = _ts.get_respondent_task_list(response.study_id, rid)
+                        if isinstance(val, list):
+                            _respondent_tasks = val
+                            break
+            return _respondent_tasks
+
+        # Same story for layer studies: the layer -> z-index map was re-queried for
+        # every task in the payload even though it cannot change mid-request.
+        _layer_z_index_cache: Optional[Dict[str, int]] = None
+
+        def _get_layer_z_index_once() -> Dict[str, int]:
+            nonlocal _layer_z_index_cache
+            if _layer_z_index_cache is None:
+                from app.models.study_model import StudyLayer
+                layers = self.db.execute(
+                    select(StudyLayer)
+                    .where(StudyLayer.study_id == study_row.id)
+                    .order_by(StudyLayer.order)
+                ).scalars().all()
+                _layer_z_index_cache = {layer.name: layer.z_index for layer in layers}
+            return _layer_z_index_cache
+
         tasks_to_insert: List[CompletedTask] = []
         interactions_to_insert: List[ElementInteraction] = []
         submitted = 0
@@ -948,20 +1022,9 @@ class StudyResponseService:
             
             # For layer studies, enhance elements_shown_in_task with z-index information
             if study_row and str(study_row.study_type) == 'layer' and isinstance(elements_shown_in_task, dict):
-                from app.models.study_model import StudyLayer, LayerImage
-                
-                # Get layer structure with z-index information
-                layers = self.db.execute(
-                    select(StudyLayer)
-                    .where(StudyLayer.study_id == study_row.id)
-                    .order_by(StudyLayer.order)
-                ).scalars().all()
-                
-                # Create layer name to z-index mapping
-                layer_name_to_z_index: Dict[str, int] = {}
-                for layer in layers:
-                    layer_name_to_z_index[layer.name] = layer.z_index
-                
+                # Layer z-index map is the same for every task, so load it once per request
+                layer_name_to_z_index: Dict[str, int] = _get_layer_z_index_once()
+
                 # Enhance elements_shown_in_task with z-index information
                 enhanced_elements_shown = {}
                 for key, value in elements_shown_in_task.items():
@@ -1029,24 +1092,7 @@ class StudyResponseService:
                 # Try: resolve from tasks_dict using actual_task_index (NOT parsed from task_id)
                 # because task_id can be duplicated across phases (e.g., "5_0" in both grid and text)
                 try:
-                    # If tasks_dict not preloaded for hybrid, load now
-                    if not tasks_dict:
-                        from app.services.task_service import TaskService
-                        _task_service = TaskService(self.db)
-                        tasks_dict_local = _task_service.get_all_tasks_as_dict(response.study_id)
-                    else:
-                        tasks_dict_local = tasks_dict
-                    
-                    # Candidate respondent keys
-                    candidate_keys = [
-                        str(response.respondent_id), str(max(0, (response.respondent_id or 0) - 1))
-                    ]
-                    tasks_for_r = None
-                    for key in candidate_keys:
-                        val = tasks_dict_local.get(key)
-                        if isinstance(val, list):
-                            tasks_for_r = val
-                            break
+                    tasks_for_r = _get_respondent_tasks_once()
                     if isinstance(tasks_for_r, list) and 0 <= actual_task_index < len(tasks_for_r):
                         tdef = tasks_for_r[actual_task_index]
                         if isinstance(tdef, dict):

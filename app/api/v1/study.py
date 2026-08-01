@@ -2058,7 +2058,7 @@ def get_simulate_ai_respondents_status(
 
 
 @router.get("/simulate-ai-respondents/stream/{job_id}")
-async def stream_simulate_ai_respondents_progress(
+def stream_simulate_ai_respondents_progress(
     job_id: str,
     interval_seconds: float = Query(1.5, ge=0.5, le=10, description="Poll interval in seconds"),
     current_user: User = Depends(get_current_active_user),
@@ -2091,7 +2091,7 @@ async def stream_simulate_ai_respondents_progress(
         while True:
             db = SessionLocal()
             try:
-                j = db.query(Job).filter_by(job_id=job_id).first()
+                j = await asyncio.to_thread(lambda: db.query(Job).filter_by(job_id=job_id).first())
                 if not j:
                     break
                 status_val = j.status.value if hasattr(j.status, "value") else str(j.status)

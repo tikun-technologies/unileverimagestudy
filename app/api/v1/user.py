@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 @router.post("/register", response_model=UserLoginResponse, status_code=status.HTTP_201_CREATED)
-async def register_user(user_data: UserRegister, db: Session = Depends(get_db)):
+def register_user(user_data: UserRegister, db: Session = Depends(get_db)):
     """
     Register a new user and return user data with JWT tokens
     """
@@ -59,7 +59,7 @@ async def register_user(user_data: UserRegister, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=UserLoginResponse)
-async def login_user(login_data: UserLogin, db: Session = Depends(get_db)):
+def login_user(login_data: UserLogin, db: Session = Depends(get_db)):
     """
     Login user with email and password, return JWT tokens
     """
@@ -79,7 +79,7 @@ async def login_user(login_data: UserLogin, db: Session = Depends(get_db)):
 
 
 @router.post("/oauth-login", response_model=OAuthLoginResponse)
-async def oauth_login_endpoint(oauth_data: OAuthData, db: Session = Depends(get_db)):
+def oauth_login_endpoint(oauth_data: OAuthData, db: Session = Depends(get_db)):
     """
     OAuth login endpoint - handles both new and existing users
     """
@@ -102,7 +102,7 @@ async def oauth_login_endpoint(oauth_data: OAuthData, db: Session = Depends(get_
 
 
 @router.post("/refresh", response_model=TokenRefreshResponse)
-async def refresh_tokens(token_data: TokenRefresh, db: Session = Depends(get_db)):
+def refresh_tokens(token_data: TokenRefresh, db: Session = Depends(get_db)):
     """
     Refresh access token using refresh token
     """
@@ -140,7 +140,7 @@ def _validate_token_response(
 
 
 @router.post("/validate-token", response_model=ValidateTokenResponse)
-async def validate_token(request: ValidateTokenRequest, db: Session = Depends(get_db)):
+def validate_token(request: ValidateTokenRequest, db: Session = Depends(get_db)):
     """
     Validate access token and return onboarding status for the authenticated user.
     """
@@ -168,7 +168,7 @@ async def validate_token(request: ValidateTokenRequest, db: Session = Depends(ge
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_profile(current_user: User = Depends(get_current_active_user)):
+def get_current_user_profile(current_user: User = Depends(get_current_active_user)):
     """
     Get current user profile information
     """
@@ -274,7 +274,7 @@ def dismiss_notification_endpoint(
 
 
 @router.put("/me", response_model=UserResponse)
-async def update_user_profile(
+def update_user_profile(
     user_data: UserUpdate,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -295,7 +295,7 @@ async def update_user_profile(
 
 
 @router.post("/change-password")
-async def change_password(
+def change_password(
     password_data: PasswordChange,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -316,7 +316,7 @@ async def change_password(
 
 
 @router.get("/users", response_model=List[UserResponse])
-async def get_users(
+def get_users(
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_active_user),
@@ -331,7 +331,7 @@ async def get_users(
 
 
 @router.get("/users/{user_id}", response_model=UserResponse)
-async def get_user_by_id(
+def get_user_by_id(
     user_id: uuid.UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -352,7 +352,7 @@ async def get_user_by_id(
 
 
 @router.get("/search", response_model=List[UserResponse])
-async def search_users(
+def search_users(
     q: str,
     skip: int = 0,
     limit: int = 50,
@@ -368,7 +368,7 @@ async def search_users(
 
 
 @router.post("/verify/{user_id}")
-async def verify_user(
+def verify_user(
     user_id: uuid.UUID,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
@@ -389,7 +389,7 @@ async def verify_user(
 
 
 @router.delete("/me")
-async def deactivate_user(
+def deactivate_user(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
@@ -411,7 +411,7 @@ async def deactivate_user(
 
 
 @router.get("/check-email/{email}")
-async def check_email_available(
+def check_email_available(
     email: str,
     db: Session = Depends(get_db)
 ):
@@ -428,7 +428,7 @@ async def check_email_available(
 
 
 @router.post("/forgot-password", response_model=PasswordResetResponse)
-async def forgot_password(
+def forgot_password(
     request: ForgotPasswordRequest,
     db: Session = Depends(get_db)
 ):
@@ -458,7 +458,7 @@ async def forgot_password(
 
 
 @router.post("/reset-password", response_model=PasswordResetResponse)
-async def reset_password_endpoint(
+def reset_password_endpoint(
     request: ResetPasswordRequest,
     db: Session = Depends(get_db)
 ):
@@ -498,7 +498,7 @@ async def reset_password_endpoint(
 
 
 @router.get("/validate-reset-token/{token}")
-async def validate_reset_token(
+def validate_reset_token(
     token: str,
     db: Session = Depends(get_db)
 ):
@@ -529,7 +529,7 @@ async def validate_reset_token(
         )
 
 @router.post("/onboarding/dashboard/complete", response_model=OnboardingStatusResponse)
-async def complete_dashboard_onboarding(
+def complete_dashboard_onboarding(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
@@ -538,7 +538,7 @@ async def complete_dashboard_onboarding(
 
 
 @router.post("/onboarding/dashboard/skip", response_model=OnboardingStatusResponse)
-async def skip_dashboard_onboarding(
+def skip_dashboard_onboarding(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
@@ -547,7 +547,7 @@ async def skip_dashboard_onboarding(
 
 
 @router.post("/onboarding/create-study/complete", response_model=OnboardingStatusResponse)
-async def complete_create_study_onboarding(
+def complete_create_study_onboarding(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
@@ -556,7 +556,7 @@ async def complete_create_study_onboarding(
 
 
 @router.post("/onboarding/create-study/skip", response_model=OnboardingStatusResponse)
-async def skip_create_study_onboarding(
+def skip_create_study_onboarding(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
@@ -565,7 +565,7 @@ async def skip_create_study_onboarding(
 
 
 @router.post("/onboarding/reset", response_model=OnboardingStatusResponse)
-async def reset_onboarding(
+def reset_onboarding(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db),
 ):
