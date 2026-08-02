@@ -1698,7 +1698,7 @@ def run_assistant_query(
     cache_payload = {
         # Bumped for the tool-calling agent: cached template answers from the
         # single-tool planner must not be replayed over the new behaviour.
-        "assistant_semantics_version": 22,
+        "assistant_semantics_version": 23,
         "message": request.message,
         "filters": filters,
         "metric": request.metric.value if request.metric else None,

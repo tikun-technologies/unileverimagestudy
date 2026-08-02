@@ -2761,6 +2761,28 @@ def tool_compare(
     }
 
 
+def _element_image_url_by_name(analysis: Dict[str, Any], element_name: Optional[str]) -> Optional[str]:
+    """Best-effort image URL lookup from Information Block / category elements."""
+    if not element_name:
+        return None
+    target = str(element_name).strip().casefold()
+    if not target:
+        return None
+    info = analysis.get("Information Block") or {}
+    categories = info.get("Categories") or []
+    if not isinstance(categories, list):
+        return None
+    for category in categories:
+        for element in (category or {}).get("elements") or []:
+            name = str(element.get("name") or element.get("code") or "").strip()
+            if name.casefold() != target:
+                continue
+            url = element.get("url") or element.get("image_url")
+            if url:
+                return str(url)
+    return None
+
+
 def tool_executive_summary(
     db: Session,
     analysis: Dict[str, Any],
@@ -2774,6 +2796,9 @@ def tool_executive_summary(
     panelists = int(summary.get("uniquePanelists") or 0)
     bullets: List[Dict[str, Any]] = []
     evidence: List[EvidenceFact] = []
+    info = analysis.get("Information Block") or {}
+    background_url = info.get("Study Background") or info.get("background_image_url")
+    aspect_ratio = info.get("Aspect Ratio")
 
     if panelists <= 0:
         return {
@@ -2791,11 +2816,24 @@ def tool_executive_summary(
     top_design_result = tool_rank_designs(analysis, study_obj, design_plan)
     top_design = _top_design_from_rank_result(top_design_result)
     if top_design:
+        design_elements = top_design.get("elements") or []
+        first_el_url = None
+        for el in design_elements:
+            if el.get("image_url"):
+                first_el_url = el.get("image_url")
+                break
         bullets.append(
             {
                 "title": "Top design",
                 "text": f"Best overall design scores {top_design.get('score')} coefficient points.",
                 "fact_id": "X1",
+                "image_url": first_el_url,
+                "images": [
+                    {"name": el.get("name"), "image_url": el.get("image_url")}
+                    for el in design_elements
+                    if el.get("image_url")
+                ][:8],
+                "design": top_design,
             }
         )
         evidence.append(_fact("X1", "Top design score", top_design.get("score")))
@@ -2812,12 +2850,19 @@ def tool_executive_summary(
                 "title": "Top elements",
                 "text": f"Strongest lift comes from {names}.",
                 "fact_id": "X2",
+                "image_url": top_elements[0].get("image_url"),
+                "images": [
+                    {"name": item.get("name"), "image_url": item.get("image_url"), "value": item.get("value")}
+                    for item in top_elements[:3]
+                    if item.get("image_url")
+                ],
             }
         )
         evidence.append(_fact("X2", "Top element", top_elements[0].get("value"), names=names))
 
     gender_gap = _biggest_gender_element_gap(analysis, metric)
     if gender_gap and gender_gap.get("gap", 0) > 0:
+        gap_url = _element_image_url_by_name(analysis, gender_gap.get("element"))
         bullets.append(
             {
                 "title": "Biggest gender gap",
@@ -2826,12 +2871,17 @@ def tool_executive_summary(
                     f"(Male {gender_gap['male']} vs Female {gender_gap['female']}, gap {gender_gap['gap']})."
                 ),
                 "fact_id": "X3",
+                "image_url": gap_url,
+                "images": (
+                    [{"name": gender_gap["element"], "image_url": gap_url}] if gap_url else []
+                ),
             }
         )
         evidence.append(_fact("X3", "Gender gap", gender_gap["gap"], element=gender_gap["element"]))
     else:
         age_gap = _biggest_age_element_gap(analysis, metric)
         if age_gap and age_gap.get("gap", 0) > 0:
+            gap_url = _element_image_url_by_name(analysis, age_gap.get("element"))
             bullets.append(
                 {
                     "title": "Biggest age gap",
@@ -2841,6 +2891,10 @@ def tool_executive_summary(
                         f"{age_gap['right_segment']} ({age_gap['right_value']})."
                     ),
                     "fact_id": "X3",
+                    "image_url": gap_url,
+                    "images": (
+                        [{"name": age_gap["element"], "image_url": gap_url}] if gap_url else []
+                    ),
                 }
             )
             evidence.append(_fact("X3", "Age gap", age_gap["gap"], element=age_gap["element"]))
@@ -2876,7 +2930,20 @@ def tool_executive_summary(
             text = f"Prefer “{use_name}”."
         else:
             text = f"Avoid “{avoid_name}”."
-        bullets.append({"title": "Use / avoid", "text": text, "fact_id": "X5"})
+        images = []
+        for item in (use_items[:1] + avoid_items[:1]):
+            if item.get("image_url"):
+                images.append({"name": item.get("name"), "image_url": item.get("image_url")})
+        bullets.append(
+            {
+                "title": "Use / avoid",
+                "text": text,
+                "fact_id": "X5",
+                "image_url": (use_items[0].get("image_url") if use_items else None)
+                or (avoid_items[0].get("image_url") if avoid_items else None),
+                "images": images,
+            }
+        )
         evidence.append(_fact("X5", "Use / avoid", use_name or avoid_name))
 
     bullets = bullets[:5]
@@ -2903,7 +2970,13 @@ def tool_executive_summary(
             AssistantBlock(
                 type="executive_summary",
                 title="Executive summary",
-                data={"bullets": bullets, "study_title": context.study_title},
+                data={
+                    "bullets": bullets,
+                    "study_title": context.study_title,
+                    "study_type": str(study_obj.study_type or "grid"),
+                    "background_url": background_url,
+                    "aspect_ratio": aspect_ratio,
+                },
             ).model_dump()
         ],
         "evidence": [e.model_dump() for e in evidence],

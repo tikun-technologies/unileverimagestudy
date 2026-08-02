@@ -54,15 +54,43 @@ def _analysis_fixture():
                 {
                     "name": "Layer A",
                     "elements": [
-                        {"name": "A1", "url": "https://example.com/a1.png", "layer_id": "la", "image_id": "ia1", "z_index": 0},
-                        {"name": "A2", "url": "https://example.com/a2.png", "layer_id": "la", "image_id": "ia2", "z_index": 0},
+                        {
+                            "name": "A1",
+                            "url": "https://example.com/a1.png",
+                            "image_url": "https://example.com/a1.png",
+                            "layer_id": "la",
+                            "image_id": "ia1",
+                            "z_index": 0,
+                        },
+                        {
+                            "name": "A2",
+                            "url": "https://example.com/a2.png",
+                            "image_url": "https://example.com/a2.png",
+                            "layer_id": "la",
+                            "image_id": "ia2",
+                            "z_index": 0,
+                        },
                     ],
                 },
                 {
                     "name": "Layer B",
                     "elements": [
-                        {"name": "B1", "url": "https://example.com/b1.png", "layer_id": "lb", "image_id": "ib1", "z_index": 1},
-                        {"name": "B2", "url": "https://example.com/b2.png", "layer_id": "lb", "image_id": "ib2", "z_index": 1},
+                        {
+                            "name": "B1",
+                            "url": "https://example.com/b1.png",
+                            "image_url": "https://example.com/b1.png",
+                            "layer_id": "lb",
+                            "image_id": "ib1",
+                            "z_index": 1,
+                        },
+                        {
+                            "name": "B2",
+                            "url": "https://example.com/b2.png",
+                            "image_url": "https://example.com/b2.png",
+                            "layer_id": "lb",
+                            "image_id": "ib2",
+                            "z_index": 1,
+                        },
                     ],
                 },
             ],
@@ -75,16 +103,52 @@ def _analysis_fixture():
                     "name": "Layer A",
                     "z_index": 0,
                     "elements": [
-                        {"code": "A1", "name": "A1", "value": 12, "above_threshold": True, "layer_id": "la", "image_id": "ia1"},
-                        {"code": "A2", "name": "A2", "value": -3, "above_threshold": False, "layer_id": "la", "image_id": "ia2"},
+                        {
+                            "code": "A1",
+                            "name": "A1",
+                            "value": 12,
+                            "above_threshold": True,
+                            "layer_id": "la",
+                            "image_id": "ia1",
+                            "url": "https://example.com/a1.png",
+                            "image_url": "https://example.com/a1.png",
+                        },
+                        {
+                            "code": "A2",
+                            "name": "A2",
+                            "value": -3,
+                            "above_threshold": False,
+                            "layer_id": "la",
+                            "image_id": "ia2",
+                            "url": "https://example.com/a2.png",
+                            "image_url": "https://example.com/a2.png",
+                        },
                     ],
                 },
                 {
                     "name": "Layer B",
                     "z_index": 1,
                     "elements": [
-                        {"code": "B1", "name": "B1", "value": 8, "above_threshold": True, "layer_id": "lb", "image_id": "ib1"},
-                        {"code": "B2", "name": "B2", "value": 1, "above_threshold": False, "layer_id": "lb", "image_id": "ib2"},
+                        {
+                            "code": "B1",
+                            "name": "B1",
+                            "value": 8,
+                            "above_threshold": True,
+                            "layer_id": "lb",
+                            "image_id": "ib1",
+                            "url": "https://example.com/b1.png",
+                            "image_url": "https://example.com/b1.png",
+                        },
+                        {
+                            "code": "B2",
+                            "name": "B2",
+                            "value": 1,
+                            "above_threshold": False,
+                            "layer_id": "lb",
+                            "image_id": "ib2",
+                            "url": "https://example.com/b2.png",
+                            "image_url": "https://example.com/b2.png",
+                        },
                     ],
                 },
             ],
@@ -427,10 +491,15 @@ class CompareToolTests(unittest.TestCase):
         db.execute.return_value.all.return_value = []
         result = tool_executive_summary(db, _analysis_fixture(), study, plan, ctx)
         self.assertEqual(result["status"], "answered")
-        bullets = result["blocks"][0]["data"]["bullets"]
+        data = result["blocks"][0]["data"]
+        bullets = data["bullets"]
         self.assertGreaterEqual(len(bullets), 2)
         self.assertLessEqual(len(bullets), 5)
         self.assertEqual(result["blocks"][0]["type"], "executive_summary")
+        # Summary findings should carry clickable image payloads when available.
+        imaged = [b for b in bullets if b.get("image_url") or b.get("images") or b.get("design")]
+        self.assertGreaterEqual(len(imaged), 1)
+        self.assertEqual(data.get("background_url"), "https://example.com/bg.png")
 
     def test_partial_option_hint_resolves(self):
         study = _study_with_questions()
