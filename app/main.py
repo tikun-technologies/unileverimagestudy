@@ -17,6 +17,7 @@ from app.api.v1.template import router as template_router
 from app.api.v1.assistant import router as assistant_router
 from app.core.config import settings
 from app.core.cloudinary_config import init_cloudinary
+from app.core.build_info import APP_VERSION, BUILD_TIME
 
 _appinsights_cs = (settings.APPLICATIONINSIGHTS_CONNECTION_STRING or "").strip()
 if _appinsights_cs:
@@ -42,6 +43,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_build_version_header(request: Request, call_next):
+    """Tag every response with the running image's version/build time so a
+    deploy can be confirmed from a HAR/curl instead of guessed at."""
+    response = await call_next(request)
+    response.headers["X-App-Version"] = APP_VERSION
+    response.headers["X-Build-Time"] = BUILD_TIME
+    return response
 
 # Include API routes
 app.include_router(api_router, prefix="/api/v1")
@@ -73,7 +84,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {"status": "healthy", "app_version": APP_VERSION, "build_time": BUILD_TIME}
 
 
 @app.on_event("startup")

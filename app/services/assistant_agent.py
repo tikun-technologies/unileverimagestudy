@@ -308,6 +308,14 @@ DATA_TOOLS: List[Dict[str, Any]] = [
         {"metric": _METRIC_PROP},
     ),
     _fn("list_saved_designs", "Designs this team has saved for this study.", {}),
+    _fn(
+        "generate_ppt",
+        "Create a branded MindSurve PowerPoint / PPT / presentation deck of this "
+        "study's analytics (overview, findings, top/worst elements and designs, "
+        "classification, segments). Use when the user asks to generate, create, "
+        "export, or download a PPT, PowerPoint, presentation, deck, or slides.",
+        {},
+    ),
 ]
 
 RESPOND_TOOL = _fn(
@@ -356,6 +364,7 @@ _TOOL_TO_ASSISTANT_NAME = {
     "explain_mindset": AssistantToolName.explain_mindset,
     "explain_design": AssistantToolName.explain_design,
     "list_saved_designs": AssistantToolName.list_saved_designs,
+    "generate_ppt": AssistantToolName.generate_ppt,
 }
 
 
@@ -408,7 +417,9 @@ AMBIGUITY — ANSWER, DO NOT INTERROGATE
 OFF-TOPIC
 - For anything outside this study's data, say plainly that you only cover this
   study's analytics, name two things you can answer, and set data_backed false.
-- For greetings, greet briefly and suggest two questions. No tools needed."""
+- For greetings, greet briefly and suggest two questions. No tools needed.
+- For PowerPoint / PPT / presentation / deck requests, call `generate_ppt` then
+  `respond`. Tell the user the deck is ready and to use Download PowerPoint."""
 
 
 # --------------------------------------------------------------------------- #
@@ -713,7 +724,7 @@ def _execute_agent_tool(
     elif name == "use_or_avoid_elements":
         plan = _plan_for(AssistantToolName.use_avoid_elements, metric=metric)
     elif name in {"study_overview", "executive_summary", "response_time_summary",
-                  "fatigue_summary", "list_saved_designs"}:
+                  "fatigue_summary", "list_saved_designs", "generate_ppt"}:
         plan = _plan_for(_TOOL_TO_ASSISTANT_NAME[name], metric=metric)
     else:
         raise AgentUnavailable(f"unknown tool {name}")

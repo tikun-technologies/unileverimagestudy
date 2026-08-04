@@ -742,10 +742,11 @@ async def websocket_user_jobs(
         )
         snapshot = payload.get("jobs") or payload.get("notifications") or []
         active = [j for j in snapshot if j.get("status") in ("pending", "started", "processing")]
+        # Cap matches REST list window so unread/history parity holds without a separate hydrate call
         recent_terminal = [
             j for j in snapshot
             if j.get("status") in ("completed", "failed", "cancelled")
-        ][:10]
+        ][:50]
         snapshot = active + recent_terminal
     finally:
         db_snapshot.close()

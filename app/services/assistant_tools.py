@@ -3275,6 +3275,91 @@ def tool_list_saved_designs(db: Session, study_obj: Study) -> Dict[str, Any]:
     }
 
 
+def tool_generate_ppt(
+    *,
+    db: Session,
+    study_obj: Study,
+    analysis: Dict[str, Any],
+    plan: AssistantQueryPlan,
+    context: AppliedContext,
+    filters: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Prepare a branded analytics PowerPoint download for the study."""
+    summary = analysis.get("dashboard_summary") or {}
+    panelists = int(summary.get("uniquePanelists") or 0)
+    responses = int(summary.get("totalResponses") or 0)
+    if responses <= 0:
+        return {
+            "status": "answered",
+            "answer_text": (
+                "This study does not have completed responses yet, so I cannot generate "
+                "an analytics PowerPoint."
+            ),
+            "blocks": [],
+            "evidence": [],
+            "follow_ups": ["Show study overview"],
+            "actions": [],
+        }
+
+    from app.services.ppt_export import _pptx_filename
+
+    study_title = context.study_title or study_obj.title or "Study"
+    filename = _pptx_filename(study_title)
+    answer = (
+        f"I’ve prepared a MindSurve analytics PowerPoint for “{study_title}” "
+        f"({panelists} panelists, {responses} responses). "
+        "It includes the study overview, executive findings, top/worst elements, "
+        "top/worst designs, classification insights, segment gaps, use/avoid guidance, "
+        "and next steps. Click Download PowerPoint to save the deck."
+    )
+    return {
+        "status": "answered",
+        "answer_text": answer,
+        "blocks": [
+            AssistantBlock(
+                type="ppt_export",
+                title="Analytics PowerPoint",
+                data={
+                    "filename": filename,
+                    "study_title": study_title,
+                    "slide_count": 15,
+                    "panelists": panelists,
+                    "responses": responses,
+                },
+            ).model_dump()
+        ],
+        "evidence": [
+            _fact("P1", "Panelists", panelists),
+            _fact("P2", "Responses", responses),
+            _fact("P3", "Deck slides", 15),
+        ],
+        "follow_ups": [
+            "Show the most important findings",
+            "Show top 5 designs",
+            "Show top 5 elements",
+        ],
+        "actions": [
+            AssistantAction(
+                type="download_ppt",
+                label="Download PowerPoint",
+                payload={
+                    "filename": filename,
+                    "filters": filters or {},
+                    "metric": (plan.metric or AssistantMetric.T).value,
+                    "segment_section": plan.segment_section,
+                    "segment_key": plan.segment_key,
+                },
+            ).model_dump()
+        ],
+        "follow_up_context": AssistantFollowUpContext(
+            metric=plan.metric or AssistantMetric.T,
+            segment_section=plan.segment_section,
+            segment_key=plan.segment_key,
+            last_tool=AssistantToolName.generate_ppt,
+        ).model_dump(),
+    }
+
+
 def execute_tool(
     *,
     db: Session,
@@ -3335,6 +3420,7 @@ def execute_tool(
     if int(summary.get("totalResponses") or 0) <= 0 and tool not in {
         AssistantToolName.study_overview,
         AssistantToolName.list_saved_designs,
+        AssistantToolName.generate_ppt,
     }:
         return {
             "status": "answered",
@@ -3409,6 +3495,15 @@ def execute_tool(
         return tool_explain_mindset(analysis, study_obj, plan)
     if tool == AssistantToolName.list_saved_designs:
         return tool_list_saved_designs(db, study_obj)
+    if tool == AssistantToolName.generate_ppt:
+        return tool_generate_ppt(
+            db=db,
+            study_obj=study_obj,
+            analysis=analysis,
+            plan=plan,
+            context=context,
+            filters=filters,
+        )
 
     return {
         "status": "unsupported",

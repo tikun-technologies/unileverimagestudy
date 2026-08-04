@@ -32,7 +32,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:$PATH" \
     PORT=8000 \
-    WEB_CONCURRENCY=2 \
+    WEB_CONCURRENCY=4 \
     GUNICORN_TIMEOUT=600 \
     GUNICORN_GRACEFUL_TIMEOUT=120 \
     GUNICORN_KEEP_ALIVE=75 \
@@ -50,6 +50,17 @@ RUN groupadd --gid 10001 appuser \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY . .
+
+# Optional: pass --build-arg APP_VERSION=v72 to stamp the image tag into the
+# running app (shows up in the X-App-Version header and /health).
+ARG APP_VERSION=unknown
+ENV APP_VERSION=${APP_VERSION}
+
+# Written fresh on every build where source changed: this RUN sits after
+# COPY . ., so Docker only cache-hits it when COPY produced an identical
+# layer (i.e. no code changed). Lets a HAR/curl prove which build is live
+# without relying on --build-arg or trusting the deploy pipeline.
+RUN date -u +"%Y-%m-%dT%H:%M:%SZ" > /app/BUILD_TIME
 
 RUN chown -R appuser:appuser /app
 

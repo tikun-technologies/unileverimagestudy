@@ -33,6 +33,7 @@ class AssistantToolName(str, Enum):
     fatigue_summary = "fatigue_summary"
     explain_mindset = "explain_mindset"
     list_saved_designs = "list_saved_designs"
+    generate_ppt = "generate_ppt"
     clarify = "clarify"
     unsupported = "unsupported"
 
@@ -232,11 +233,22 @@ class AssistantAction(BaseModel):
         "save_design",
         "compare_designs",
         "export_csv",
+        "download_ppt",
         "set_metric",
         "set_segment",
     ]
     label: str
     payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AssistantPptExportRequest(BaseModel):
+    """Request body for downloading a generated analytics PowerPoint."""
+
+    filters: Optional[StudyFilterCriteria] = None
+    use_active_filters: bool = True
+    metric: Optional[AssistantMetric] = AssistantMetric.T
+    segment_section: Optional[str] = None
+    segment_key: Optional[str] = None
 
 
 class AssistantQueryResponse(BaseModel):

@@ -81,7 +81,7 @@ must_include, clarification_prompt, clarification_options, unsupported_reason, c
 Allowed tools:
 greeting, study_overview, classification_distribution, rank_elements, rank_designs,
 compare, compare_segments, executive_summary, use_avoid_elements, response_time_summary, fatigue_summary,
-explain_mindset, explain_design, list_saved_designs, clarify, unsupported.
+explain_mindset, explain_design, list_saved_designs, generate_ppt, clarify, unsupported.
 
 Your job is INTENT understanding. Clients paraphrase freely — slang, typos, and
 informal wording are normal. Map MEANING, never require exact keywords.
@@ -140,6 +140,12 @@ Tool mapping (paraphrases count as the same intent):
 - Do NOT use rank_designs when the user wants a side-by-side / difference — use tool=compare.
 - compare_segments: compare ALL segments in Gender/Age/Mindsets at once.
 - executive_summary: key findings / stakeholder summary / “most important findings”.
+- generate_ppt: create / generate / export / download a PowerPoint, PPT, PPTX, presentation, or slide deck of the study analytics.
+  Examples → tool=generate_ppt:
+  - "generate a PPT for me"
+  - "create a powerpoint"
+  - "export presentation"
+  - "download slides for this study"
 - classification_distribution: how many answered/selected/chose a prelim option.
 - use_avoid_elements: what to use or avoid.
 - greeting: hi/hello/hey/thanks.
@@ -224,6 +230,24 @@ def _is_executive_summary_query(text: str) -> bool:
             "summary of findings",
         )
     )
+
+
+def _is_ppt_generation_query(text: str) -> bool:
+    """Detect requests to generate/export an analytics PowerPoint deck."""
+    normalized = (text or "").casefold()
+    if re.search(r"\b(?:ppt|pptx|powerpoint|power\s*point)\b", normalized):
+        return True
+    if re.search(
+        r"\b(?:generate|create|make|build|export|download|prepare)\b.{0,48}\b(?:presentation|deck|slides?)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        r"\b(?:presentation|deck|slides?)\b.{0,48}\b(?:generate|create|make|build|export|download|prepare)\b",
+        normalized,
+    ):
+        return True
+    return False
 
 
 def _is_cohort_rank_query(text: str) -> bool:
@@ -364,6 +388,9 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
 
     if _is_executive_summary_query(text):
         return AssistantQueryPlan(tool=AssistantToolName.executive_summary, confidence=0.95)
+
+    if _is_ppt_generation_query(text):
+        return AssistantQueryPlan(tool=AssistantToolName.generate_ppt, confidence=0.98)
 
     if is_compare_intent(message):
         plan = AssistantQueryPlan(
@@ -1245,6 +1272,10 @@ def _normalize_plan_for_question(
         plan.tool = AssistantToolName.executive_summary
         return plan
 
+    if _is_ppt_generation_query(text):
+        plan.tool = AssistantToolName.generate_ppt
+        return plan
+
     # Compare / difference / contrast — trust free-text intent. Static rules only
     # correct clear special cases (top N designs, best vs worst).
     if plan.tool == AssistantToolName.compare or is_compare_intent(message):
@@ -1698,7 +1729,7 @@ def run_assistant_query(
     cache_payload = {
         # Bumped for the tool-calling agent: cached template answers from the
         # single-tool planner must not be replayed over the new behaviour.
-        "assistant_semantics_version": 23,
+        "assistant_semantics_version": 24,
         "message": request.message,
         "filters": filters,
         "metric": request.metric.value if request.metric else None,
@@ -1735,7 +1766,11 @@ def run_assistant_query(
     # On the fallback path the planner still runs concurrently with the prefetch
     # (network I/O releases the GIL). Only the main thread touches `db`, and
     # plan_query is pure network/regex, so that overlap stays safe.
-    use_agent = bool(settings.ASSISTANT_AGENT_ENABLED) and not _is_simple_greeting(request.message)
+    use_agent = (
+        bool(settings.ASSISTANT_AGENT_ENABLED)
+        and not _is_simple_greeting(request.message)
+        and not _is_ppt_generation_query(request.message.casefold())
+    )
     plan_future = None if use_agent else _PLANNER_POOL.submit(plan_query, request.message, request)
 
     prefetched_analysis: Optional[Dict[str, Any]] = None

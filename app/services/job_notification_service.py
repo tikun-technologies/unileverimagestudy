@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
@@ -11,6 +13,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.core.cache import RedisCache
+from app.db.session import SessionLocal
 from app.models.job_model import (
     DismissedJobNotification,
     Job,
@@ -24,6 +27,17 @@ from app.models.project_model import Project, ProjectMember
 logger = logging.getLogger(__name__)
 
 NOTIFICATION_CACHE_TTL = 8
+
+# The heavy backfill sync (jobs -> notifications, memberships -> invitations) is a
+# safety net; real-time freshness comes from job-lifecycle upserts + the WebSocket.
+# Gate it so rapid/concurrent notification reads (e.g. 3 firing on one page load)
+# can't each re-run it. Reads still return current rows on every call.
+NOTIFICATION_SYNC_GATE_TTL = 45
+
+# Sentinel so upsert_user_job_notification can tell "look the row up yourself"
+# (default) apart from "here is the prefetched row (possibly None)" used by the
+# batched sync to avoid a per-job SELECT.
+_UNSET = object()
 
 ACTIVE_JOB_STATUSES = (
     JobStatus.PENDING,
@@ -42,6 +56,10 @@ NOTIFICATION_KINDS = {"task_generation", "simulate_ai"}
 
 def _notification_cache_key(user_id: UUID) -> str:
     return f"user_notifications:{user_id}"
+
+
+def _notification_sync_gate_key(user_id: UUID) -> str:
+    return f"user_notifications_synced:{user_id}"
 
 
 def invalidate_user_notification_cache(user_id: UUID) -> None:
@@ -315,7 +333,11 @@ def create_project_invitation_notification(
 
 
 def sync_invitation_notifications_from_members(db: Session, user_id: UUID) -> None:
-    """Backfill invitation notifications from linked study/project memberships."""
+    """Backfill invitation notifications from linked study/project memberships.
+
+    Batched: prefetch existing invitation rows and referenced studies/projects in
+    bulk instead of a SELECT + db.get per membership (was N+1).
+    """
     user_id_str = str(user_id)
 
     study_members = db.scalars(
@@ -323,56 +345,82 @@ def sync_invitation_notifications_from_members(db: Session, user_id: UUID) -> No
             StudyMember.user_id == user_id,
         )
     ).all()
-    for member in study_members:
-        existing = db.scalar(
-            select(UserInvitationNotification.id).where(
-                UserInvitationNotification.member_id == str(member.id)
-            )
-        )
-        if existing:
-            continue
-        study = db.get(Study, member.study_id)
-        if not study or study.creator_id == user_id:
-            continue
-        row = UserInvitationNotification(
-            user_id=user_id_str,
-            notification_kind="study_invite",
-            study_id=str(member.study_id),
-            resource_title=study.title or "Untitled Study",
-            inviter_name=None,
-            role=member.role,
-            member_id=str(member.id),
-            is_read=True,
-        )
-        db.add(row)
-
     project_members = db.scalars(
         select(ProjectMember).where(
             ProjectMember.user_id == user_id,
         )
     ).all()
-    for member in project_members:
-        existing = db.scalar(
-            select(UserInvitationNotification.id).where(
-                UserInvitationNotification.member_id == str(member.id)
+
+    all_member_ids = [str(m.id) for m in study_members] + [str(m.id) for m in project_members]
+    if not all_member_ids:
+        return
+
+    # Which memberships already have an invitation row (regardless of read/dismissed)?
+    existing_member_ids = set(
+        db.scalars(
+            select(UserInvitationNotification.member_id).where(
+                UserInvitationNotification.member_id.in_(all_member_ids)
+            )
+        ).all()
+    )
+
+    # Bulk-load referenced studies/projects (title + creator) in one query each.
+    study_ids = [m.study_id for m in study_members if m.study_id is not None]
+    project_ids = [m.project_id for m in project_members if m.project_id is not None]
+    studies_by_id = (
+        {s.id: s for s in db.scalars(select(Study).where(Study.id.in_(study_ids))).all()}
+        if study_ids
+        else {}
+    )
+    projects_by_id = (
+        {p.id: p for p in db.scalars(select(Project).where(Project.id.in_(project_ids))).all()}
+        if project_ids
+        else {}
+    )
+
+    added = False
+    for member in study_members:
+        if str(member.id) in existing_member_ids:
+            continue
+        study = studies_by_id.get(member.study_id)
+        if not study or study.creator_id == user_id:
+            continue
+        db.add(
+            UserInvitationNotification(
+                user_id=user_id_str,
+                notification_kind="study_invite",
+                study_id=str(member.study_id),
+                resource_title=study.title or "Untitled Study",
+                inviter_name=None,
+                role=member.role,
+                member_id=str(member.id),
+                is_read=True,
             )
         )
-        if existing:
+        added = True
+
+    for member in project_members:
+        if str(member.id) in existing_member_ids:
             continue
-        project = db.get(Project, member.project_id)
+        project = projects_by_id.get(member.project_id)
         if not project or project.creator_id == user_id:
             continue
-        row = UserInvitationNotification(
-            user_id=user_id_str,
-            notification_kind="project_invite",
-            project_id=str(member.project_id),
-            resource_title=project.name or "Untitled Project",
-            inviter_name=None,
-            role=member.role,
-            member_id=str(member.id),
-            is_read=True,
+        db.add(
+            UserInvitationNotification(
+                user_id=user_id_str,
+                notification_kind="project_invite",
+                project_id=str(member.project_id),
+                resource_title=project.name or "Untitled Project",
+                inviter_name=None,
+                role=member.role,
+                member_id=str(member.id),
+                is_read=True,
+            )
         )
-        db.add(row)
+        added = True
+
+    if not added:
+        return
 
     try:
         db.commit()
@@ -414,8 +462,13 @@ def upsert_user_job_notification(
     mark_read: Optional[bool] = None,
     dismissed: bool = False,
     commit: bool = True,
+    existing: Any = _UNSET,
 ) -> Optional[UserJobNotification]:
-    """Create or update a persisted notification row for the job owner."""
+    """Create or update a persisted notification row for the job owner.
+
+    Pass ``existing`` (the prefetched row, or ``None`` when there isn't one) to
+    skip the per-job lookup — the batched sync uses this to avoid an N+1 SELECT.
+    """
     kind = infer_job_kind(job)
     if kind not in NOTIFICATION_KINDS:
         return None
@@ -428,12 +481,15 @@ def upsert_user_job_notification(
     requested, completed = _extract_respondent_counts(job, kind)
     status_val = job.status.value if isinstance(job.status, JobStatus) else str(job.status)
 
-    row = db.scalar(
-        select(UserJobNotification).where(
-            UserJobNotification.user_id == user_id_str,
-            UserJobNotification.job_id == job.job_id,
+    if existing is _UNSET:
+        row = db.scalar(
+            select(UserJobNotification).where(
+                UserJobNotification.user_id == user_id_str,
+                UserJobNotification.job_id == job.job_id,
+            )
         )
-    )
+    else:
+        row = existing
 
     prev_status = row.status if row else None
     became_terminal = status_val in {s.value for s in TERMINAL_JOB_STATUSES} and (
@@ -514,25 +570,34 @@ def sync_user_notifications_from_jobs(db: Session, user_id: UUID) -> None:
         return
 
     titles = _study_title_map(db, {j.study_id for j in jobs if j.study_id})
+
+    # Prefetch existing notification rows for these jobs in one query (was a
+    # per-job SELECT inside the loop — the main N+1 behind the 15s response).
+    existing_by_job = {
+        r.job_id: r
+        for r in db.scalars(
+            select(UserJobNotification).where(
+                UserJobNotification.user_id == user_id_str,
+                UserJobNotification.job_id.in_([j.job_id for j in jobs]),
+            )
+        ).all()
+    }
+
     for job in jobs:
         if job.job_id in dismissed:
             continue
         kind = infer_job_kind(job)
         if kind not in NOTIFICATION_KINDS:
             continue
-        existing = db.scalar(
-            select(UserJobNotification).where(
-                UserJobNotification.user_id == user_id_str,
-                UserJobNotification.job_id == job.job_id,
-            )
-        )
-        if existing and existing.dismissed_at is not None:
+        existing = existing_by_job.get(job.job_id)
+        if existing is not None and existing.dismissed_at is not None:
             continue
         upsert_user_job_notification(
             db,
             job,
             study_title=titles.get(job.study_id),
             commit=False,
+            existing=existing,
         )
 
     try:
@@ -540,6 +605,45 @@ def sync_user_notifications_from_jobs(db: Session, user_id: UUID) -> None:
         invalidate_user_notification_cache(user_id)
     except Exception:
         db.rollback()
+
+
+def _maybe_backfill_notifications_async(user_id: UUID, use_cache: bool) -> None:
+    """Kick off the heavy backfill sync in the background so the notifications read
+    never blocks on it.
+
+    The read path returns persisted rows immediately; those rows are already kept
+    current by job-lifecycle upserts and the WebSocket, so the backfill is only a
+    safety net (cross-device bootstrap). Gated to at most one run per user per
+    window; the background thread uses its own DB session because the request's
+    session is closed once the response is sent.
+    """
+    gate_key = _notification_sync_gate_key(user_id)
+    if use_cache and RedisCache.get(gate_key):
+        return
+    # Claim the window before spawning so concurrent reads don't each spawn a thread.
+    RedisCache.set(gate_key, 1, ttl_seconds=NOTIFICATION_SYNC_GATE_TTL)
+
+    def _run() -> None:
+        bg_db = SessionLocal()
+        try:
+            started = time.time()
+            sync_user_notifications_from_jobs(bg_db, user_id)
+            sync_invitation_notifications_from_members(bg_db, user_id)
+            logger.info(
+                "Notification backfill for user %s completed in %.2fs",
+                user_id,
+                time.time() - started,
+            )
+        except Exception as exc:  # never let a backfill failure surface to the user
+            logger.warning("Notification backfill failed for user %s: %s", user_id, exc)
+            try:
+                bg_db.rollback()
+            except Exception:
+                pass
+        finally:
+            bg_db.close()
+
+    threading.Thread(target=_run, name="notif-backfill", daemon=True).start()
 
 
 def get_user_notifications(
@@ -566,8 +670,9 @@ def get_user_notifications(
                 "unread_count": cached.get("unread_count", 0),
             }
 
-    sync_user_notifications_from_jobs(db, user_id)
-    sync_invitation_notifications_from_members(db, user_id)
+    # Backfill runs in the background (gated) so this read returns immediately.
+    # The persisted rows read below are the source of truth for the response.
+    _maybe_backfill_notifications_async(user_id, use_cache)
 
     job_rows = db.scalars(
         select(UserJobNotification)

@@ -6,6 +6,7 @@ from typing import Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_active_user
@@ -14,8 +15,12 @@ from app.models.user_model import User
 from app.schemas.assistant_schema import (
     AssistantClearHistoryResponse,
     AssistantHistoryPage,
+    AssistantMetric,
+    AssistantPptExportRequest,
+    AssistantQueryPlan,
     AssistantQueryRequest,
     AssistantQueryResponse,
+    AssistantToolName,
 )
 from app.services.assistant_message_service import (
     AssistantMessageServiceError,
@@ -26,7 +31,14 @@ from app.services.assistant_message_service import (
     list_messages_page,
 )
 from app.services.assistant_service import run_assistant_query
-from app.services.assistant_tools import AssistantToolError, authorize_study_for_assistant
+from app.services.assistant_tools import (
+    AssistantToolError,
+    authorize_study_for_assistant,
+    build_applied_context,
+    load_analysis_for_assistant,
+)
+from app.services.analysis_filter import get_active_filter
+from app.services.ppt_export import build_analytics_pptx
 
 router = APIRouter()
 
@@ -55,6 +67,59 @@ def assistant_query(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Assistant query failed: {exc}") from exc
+
+
+@router.post("/{study_id}/assistant/export-ppt")
+def assistant_export_ppt(
+    study_id: UUID,
+    payload: AssistantPptExportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Generate and download a MindSurve-branded analytics PowerPoint for the study."""
+    try:
+        study_obj = authorize_study_for_assistant(db, study_id, current_user)
+        filters = None
+        if payload.filters is not None:
+            data = payload.filters.model_dump(exclude_none=True)
+            filters = data or None
+        elif payload.use_active_filters:
+            filters = get_active_filter(db, study_id, current_user.id) or None
+
+        analysis = load_analysis_for_assistant(db, study_obj, current_user, filters=filters)
+        plan = AssistantQueryPlan(
+            tool=AssistantToolName.generate_ppt,
+            metric=payload.metric or AssistantMetric.T,
+            segment_section=payload.segment_section,
+            segment_key=payload.segment_key,
+        )
+        context = build_applied_context(study_obj, analysis, plan, filters)
+        ppt_bytes, meta = build_analytics_pptx(
+            db=db,
+            study_obj=study_obj,
+            analysis=analysis,
+            plan=plan,
+            context=context,
+        )
+        filename = meta.get("filename") or "MindSurve-analytics.pptx"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Slide-Count": str(meta.get("slide_count") or 0),
+        }
+        return StreamingResponse(
+            iter([ppt_bytes]),
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            headers=headers,
+        )
+    except AssistantToolError as exc:
+        raise HTTPException(
+            status_code=403 if "denied" in (exc.message or "").lower() else 400,
+            detail=exc.message,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate PowerPoint: {exc}") from exc
 
 
 @router.get("/{study_id}/assistant/messages", response_model=AssistantHistoryPage)
