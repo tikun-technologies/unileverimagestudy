@@ -344,6 +344,25 @@ class StudyListItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class StudyStatusCounts(BaseModel):
+    total: int = 0
+    active: int = 0
+    draft: int = 0
+    completed: int = 0
+    paused: int = 0
+
+
+class StudyListResponse(BaseModel):
+    items: List[StudyListItem]
+    total: int
+    page: int
+    per_page: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
+    status_counts: StudyStatusCounts = Field(default_factory=StudyStatusCounts)
+
+
 class StudyPublicMinimal(BaseModel):
     id: UUID
     title: str

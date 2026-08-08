@@ -66,6 +66,48 @@ class TaskService:
         legacy_value = self._get_legacy_tasks(study_id).get(str(respondent_id))
         return legacy_value if isinstance(legacy_value, list) else None
 
+    def get_preview_tasks_as_dict(
+        self, study_id: UUID, *, preview_respondent_id: int = 1
+    ) -> Optional[Dict[str, List[Dict[str, Any]]]]:
+        """
+        Tasks for preview endpoints: one respondent in the same dict shape as
+        get_all_tasks_as_dict, without loading every respondent.
+
+        Prefers ``preview_respondent_id`` (default 1). When that respondent has no
+        tasks, falls back to the lowest respondent id present — matching the prior
+        preview behavior of picking the first numeric dict key.
+        """
+        tasks = self.get_respondent_tasks(study_id, preview_respondent_id)
+        if tasks:
+            return {str(preview_respondent_id): tasks}
+
+        try:
+            first_id = self.db.execute(
+                select(StudyTaskAssignment.respondent_id)
+                .where(StudyTaskAssignment.study_id == study_id)
+                .order_by(StudyTaskAssignment.respondent_id)
+                .limit(1)
+            ).scalar_one_or_none()
+            if first_id is not None and int(first_id) != preview_respondent_id:
+                fallback_tasks = self.get_respondent_tasks(study_id, int(first_id))
+                if fallback_tasks:
+                    return {str(first_id): fallback_tasks}
+        except Exception as e:
+            logger.debug(f"preview first respondent lookup failed: {e}")
+            self.db.rollback()
+
+        legacy_tasks = self._get_legacy_tasks(study_id)
+        if isinstance(legacy_tasks, dict):
+            first_key = next((k for k in legacy_tasks if str(k).isdigit()), None)
+            if first_key is not None:
+                val = legacy_tasks[first_key]
+                if isinstance(val, list) and val:
+                    return {first_key: val}
+                if val and not isinstance(val, list):
+                    return {first_key: [val]}
+
+        return None
+
     def get_all_tasks_as_dict(self, study_id: UUID) -> Dict[str, List[Dict[str, Any]]]:
         """
         Get all tasks for a study in the original dict format:

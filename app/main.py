@@ -102,6 +102,18 @@ async def on_startup():
     init_cloudinary()
     print("Cloudinary initialized")
 
+    # Warm one DB connection so the first user request doesn't pay SSL handshake latency
+    # (DB is cross-region from the API; cold connect is expensive).
+    try:
+        from sqlalchemy import text
+        from app.db.session import engine
+
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("Database connection pool warmed")
+    except Exception as e:
+        print(f"Database pool warmup skipped: {e}")
+
     if settings.RUN_API_BACKGROUND_SERVICES:
         # These in-process loops should run only in a single-purpose process, not once per Gunicorn worker.
         from app.services.background_tasks import background_task_service

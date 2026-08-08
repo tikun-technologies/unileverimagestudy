@@ -1,10 +1,10 @@
 # app/services/project_service.py
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, Dict
 
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func, text, or_, and_, true
+from sqlalchemy import select, func, text, or_, and_, true, desc, cast, Integer
 from fastapi import HTTPException, status
 from uuid import UUID
 from datetime import datetime
@@ -17,6 +17,7 @@ from app.schemas.project_schema import (
     ValidateProductRequest, ValidateProductResponse,
     AssignStudyRequest, AssignStudyResponse,
 )
+from app.schemas.study_schema import StudyStatus, StudyType
 
 
 def create_project(
@@ -122,37 +123,76 @@ def get_project_studies(
     project_id: UUID,
     user_id: UUID,
     page: int = 1,
-    per_page: int = 50
-) -> List[dict]:
+    per_page: int = 10,
+    *,
+    status_filter: Optional[StudyStatus] = None,
+    study_type: Optional[StudyType] = None,
+    search: Optional[str] = None,
+    created_after: Optional[datetime] = None,
+) -> Tuple[List[dict], int, Dict[str, int]]:
     """
-    Fetch all studies for a specific project (optimized for <200ms).
+    Paginated project studies with optional search/type/status/time filters.
     Allows access for both project owner and project members.
-    Uses live counts from study_responses so total_responses and completed_responses
-    are always accurate (not the Study model's cached counters).
+    Uses page-then-aggregate counts (same pattern as list_studies) for speed.
+    Returns (items, total, status_counts).
     """
     # Verify the project exists and user has access (owner or member)
     get_project(db, project_id, user_id)
 
+    page = max(1, int(page or 1))
+    per_page = min(max(1, int(per_page or 10)), 200)
     offset = (page - 1) * per_page
 
-    # Correlated subqueries for live response counts (same approach as list_studies)
-    total_subq = (
-        select(func.count(StudyResponse.id))
-        .where(StudyResponse.study_id == Study.id)
-        .correlate(Study)
-        .scalar_subquery()
-    )
-    completed_subq = (
-        select(func.count(StudyResponse.id))
-        .where(and_(
-            StudyResponse.study_id == Study.id,
-            StudyResponse.is_completed == True,
-        ))
-        .correlate(Study)
-        .scalar_subquery()
-    )
+    base_filters = [Study.project_id == project_id]
+    if study_type:
+        base_filters.append(Study.study_type == study_type)
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        base_filters.append(or_(Study.title.ilike(term), Study.product_id.ilike(term)))
+    if created_after is not None:
+        base_filters.append(Study.created_at >= created_after)
 
-    query = (
+    status_count_stmt = (
+        select(Study.status, func.count(Study.id))
+        .where(*base_filters)
+        .group_by(Study.status)
+    )
+    status_rows = db.execute(status_count_stmt).all()
+    status_counts: Dict[str, int] = {
+        "total": 0,
+        "active": 0,
+        "draft": 0,
+        "completed": 0,
+        "paused": 0,
+    }
+    for status_value, cnt in status_rows:
+        key = status_value if isinstance(status_value, str) else getattr(status_value, "value", str(status_value))
+        count_int = int(cnt or 0)
+        if key in status_counts:
+            status_counts[key] = count_int
+        status_counts["total"] += count_int
+
+    # Derive total from status_counts — avoids a separate COUNT round-trip
+    if status_filter:
+        status_key = (
+            status_filter
+            if isinstance(status_filter, str)
+            else getattr(status_filter, "value", str(status_filter))
+        )
+        total = int(status_counts.get(status_key, 0))
+    else:
+        total = int(status_counts["total"])
+
+    filtered = list(base_filters)
+    if status_filter:
+        filtered.append(Study.status == status_filter)
+
+    respondents_target_expr = func.coalesce(
+        cast(Study.audience_segmentation["number_of_respondents"].astext, Integer),
+        0,
+    ).label("respondents_target")
+
+    rows = db.execute(
         select(
             Study.id,
             Study.title,
@@ -160,30 +200,72 @@ def get_project_studies(
             Study.status,
             Study.created_at,
             Study.updated_at,
-            total_subq.label("total_responses_calc"),
-            completed_subq.label("completed_responses_calc"),
+            Study.last_step,
+            Study.project_id,
+            Study.product_id,
+            Study.product_keys,
+            respondents_target_expr,
         )
-        .where(Study.project_id == project_id)
-        .order_by(Study.created_at.desc())
+        .where(*filtered)
+        .order_by(desc(Study.created_at), desc(Study.id))
         .offset(offset)
         .limit(per_page)
-    )
+    ).all()
 
-    result = db.execute(query).all()
+    if not rows:
+        return [], int(total), status_counts
+
+    study_ids = [row.id for row in rows]
+    count_rows = db.execute(
+        select(
+            StudyResponse.study_id.label("study_id"),
+            func.count(StudyResponse.id).label("total_responses_calc"),
+            func.count(StudyResponse.id).filter(StudyResponse.is_completed == True).label("completed_responses_calc"),
+            func.count(StudyResponse.id).filter(StudyResponse.is_abandoned == True).label("abandoned_responses_calc"),
+        )
+        .where(StudyResponse.study_id.in_(study_ids))
+        .group_by(StudyResponse.study_id)
+    ).all()
+    counts_by_study = {
+        c.study_id: {
+            "total_responses": int(c.total_responses_calc or 0),
+            "completed_responses": int(c.completed_responses_calc or 0),
+            "abandoned_responses": int(c.abandoned_responses_calc or 0),
+        }
+        for c in count_rows
+    }
 
     studies = []
-    for row in result:
+    for row in rows:
+        counts = counts_by_study.get(
+            row.id,
+            {"total_responses": 0, "completed_responses": 0, "abandoned_responses": 0},
+        )
+        total_calc = counts["total_responses"]
+        completed_calc = counts["completed_responses"]
+        abandoned_calc = counts["abandoned_responses"]
+        respondents_target = int(getattr(row, "respondents_target", 0) or 0)
         studies.append({
             "id": str(row.id),
             "title": row.title,
             "study_type": row.study_type,
             "status": row.status,
-            "created_at": row.created_at.isoformat(),
-            "updated_at": row.updated_at.isoformat(),
-            "total_responses": int(row.total_responses_calc or 0),
-            "completed_responses": int(row.completed_responses_calc or 0),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "last_step": row.last_step,
+            "project_id": str(row.project_id) if row.project_id else None,
+            "product_id": row.product_id,
+            "product_keys": row.product_keys,
+            "total_responses": total_calc,
+            "completed_responses": completed_calc,
+            "abandoned_responses": abandoned_calc,
+            "respondents_target": respondents_target,
+            "respondents_completed": completed_calc,
+            "completion_rate": (completed_calc / total_calc * 100) if total_calc else 0,
+            "abandonment_rate": (abandoned_calc / total_calc * 100) if total_calc else 0,
+            "average_duration": 0,
         })
-    return studies
+    return studies, int(total), status_counts
 
 
 def get_project_studies_for_export(

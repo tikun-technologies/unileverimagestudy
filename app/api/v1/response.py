@@ -993,7 +993,7 @@ def list_responses(
     else:
         # Get all studies owned by user and their responses
         from app.services import study as study_service
-        user_studies, _ = study_service.list_studies(db, current_user.id)
+        user_studies, _, _ = study_service.list_studies(db, current_user.id, page=1, per_page=200)
         study_ids = [study.id for study in user_studies]
         
         if not study_ids:

@@ -8,7 +8,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func, desc, and_, or_
+from sqlalchemy import select, func, desc, and_, or_, cast, Integer
 from fastapi import HTTPException, status
 import logging
 
@@ -1272,14 +1272,50 @@ def get_study_share_details(db: Session, study_id: UUID) -> Optional[Dict[str, A
         "share_url": row.share_url,
     }
 
+def _study_access_where(owner_id: UUID):
+    return or_(
+        Study.creator_id == owner_id,
+        StudyMember.user_id == owner_id,
+    )
+
+
+def _apply_study_list_filters(
+    stmt,
+    *,
+    status_filter: Optional[StudyStatus] = None,
+    study_type: Optional[StudyType] = None,
+    search: Optional[str] = None,
+    created_after: Optional[datetime] = None,
+    apply_status: bool = True,
+):
+    if apply_status and status_filter:
+        stmt = stmt.where(Study.status == status_filter)
+    if study_type:
+        stmt = stmt.where(Study.study_type == study_type)
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        stmt = stmt.where(
+            or_(
+                Study.title.ilike(term),
+                Study.product_id.ilike(term),
+            )
+        )
+    if created_after is not None:
+        stmt = stmt.where(Study.created_at >= created_after)
+    return stmt
+
+
 def list_studies(
     db: Session,
     owner_id: UUID,
     *,
     status_filter: Optional[StudyStatus] = None,
+    study_type: Optional[StudyType] = None,
+    search: Optional[str] = None,
+    created_after: Optional[datetime] = None,
     page: int = 1,
-    per_page: int = 10
-) -> Tuple[List, int]:
+    per_page: int = 10,
+) -> Tuple[List, int, Dict[str, int]]:
     """
     Study listing optimized for dashboard cards.
     Uses live response counts from study_responses with a paged aggregate:
@@ -1287,7 +1323,20 @@ def list_studies(
     2) fetch grouped counts for only those study IDs
 
     This keeps counts accurate while avoiding heavy per-row correlated subqueries.
+    Returns (rows, total_matching_status_filter, status_counts_ignoring_status_filter).
     """
+    page = max(1, int(page or 1))
+    per_page = min(max(1, int(per_page or 10)), 200)
+
+    access_join = and_(StudyMember.study_id == Study.id, StudyMember.user_id == owner_id)
+    access_where = _study_access_where(owner_id)
+
+    # Extract only the respondents target key — avoid shipping full iped_parameters JSONB
+    respondents_target_expr = func.coalesce(
+        cast(Study.audience_segmentation["number_of_respondents"].astext, Integer),
+        0,
+    ).label("respondents_target")
+
     # Select only fields needed by StudyListItem; counters are added via grouped aggregate query
     base_stmt = (
         select(
@@ -1302,43 +1351,72 @@ def list_studies(
             Study.creator_id,
             Study.product_keys,
             Study.product_id,
-            Study.audience_segmentation,  # Needed for respondents_target extraction
+            respondents_target_expr,
         )
-        .outerjoin(StudyMember, and_(StudyMember.study_id == Study.id, StudyMember.user_id == owner_id))
-        .where(
-            or_(
-                Study.creator_id == owner_id,
-                StudyMember.user_id == owner_id
-            )
-        )
+        .outerjoin(StudyMember, access_join)
+        .where(access_where)
+        .distinct()
     )
-    
-    count_stmt = (
-        select(func.count(Study.id.distinct()))
-        .select_from(Study)
-        .outerjoin(StudyMember, and_(StudyMember.study_id == Study.id, StudyMember.user_id == owner_id))
-        .where(
-            or_(
-                Study.creator_id == owner_id,
-                StudyMember.user_id == owner_id
-            )
-        )
-    )
-    
-    if status_filter:
-        base_stmt = base_stmt.where(Study.status == status_filter)
-        count_stmt = count_stmt.where(Study.status == status_filter)
 
-    total = db.scalar(count_stmt) or 0
+    base_stmt = _apply_study_list_filters(
+        base_stmt,
+        status_filter=status_filter,
+        study_type=study_type,
+        search=search,
+        created_after=created_after,
+    )
+
+    # Status tab counts: same search/type/time filters, ignore status filter.
+    # total for the current status filter is derived from these counts (saves a COUNT round-trip).
+    status_count_stmt = (
+        select(Study.status, func.count(Study.id.distinct()))
+        .select_from(Study)
+        .outerjoin(StudyMember, access_join)
+        .where(access_where)
+        .group_by(Study.status)
+    )
+    status_count_stmt = _apply_study_list_filters(
+        status_count_stmt,
+        status_filter=None,
+        study_type=study_type,
+        search=search,
+        created_after=created_after,
+        apply_status=False,
+    )
+    status_rows = db.execute(status_count_stmt).all()
+    status_counts: Dict[str, int] = {
+        "total": 0,
+        "active": 0,
+        "draft": 0,
+        "completed": 0,
+        "paused": 0,
+    }
+    for status_value, cnt in status_rows:
+        key = status_value if isinstance(status_value, str) else getattr(status_value, "value", str(status_value))
+        count_int = int(cnt or 0)
+        if key in status_counts:
+            status_counts[key] = count_int
+        status_counts["total"] += count_int
+
+    if status_filter:
+        status_key = (
+            status_filter
+            if isinstance(status_filter, str)
+            else getattr(status_filter, "value", str(status_filter))
+        )
+        total = int(status_counts.get(status_key, 0))
+    else:
+        total = int(status_counts["total"])
+
     rows = db.execute(
         base_stmt
-        .order_by(desc(Study.created_at))
+        .order_by(desc(Study.created_at), desc(Study.id))
         .offset((page - 1) * per_page)
         .limit(per_page)
     ).all()
 
     if not rows:
-        return [], int(total)
+        return [], int(total), status_counts
 
     study_ids = [row.id for row in rows]
     count_rows = db.execute(
@@ -1375,7 +1453,7 @@ def list_studies(
         row_dict.update(counts)
         enriched_rows.append(SimpleNamespace(**row_dict))
 
-    return enriched_rows, int(total)
+    return enriched_rows, int(total), status_counts
 
 def update_study(
     db: Session,
@@ -1839,40 +1917,50 @@ def launch_study_ultra_fast(
     study_id: UUID,
     owner_id: UUID
 ) -> Study:
-    """Ultra-fast launch-only function - no updates, just launch."""
-    # Use direct SQL UPDATE for maximum speed
+    """Ultra-fast launch-only function - no updates, just launch.
+    Allows study/project admins and editors (not viewers).
+    """
     from sqlalchemy import update
     from datetime import datetime
-    
+
+    study = _load_owned_study_minimal(db, study_id, owner_id, for_update=True)
+    if not _get_effective_edit_permission(db, study, owner_id):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to launch this study.",
+        )
+
     now = datetime.utcnow()
+    launched_at = study.launched_at or now
+    share_url = _build_share_url(None, str(study_id))
     stmt = (
         update(Study)
-        .where(Study.id == study_id, Study.creator_id == owner_id)
+        .where(Study.id == study_id)
         .values(
             status='active',
-            launched_at=now,
-            share_url=_build_share_url(None, str(study_id)),
-            updated_at=now
+            launched_at=launched_at,
+            share_url=share_url,
+            updated_at=now,
         )
         .returning(Study.id, Study.title, Study.status, Study.launched_at, Study.share_url, Study.updated_at)
     )
-    
+
     result = db.execute(stmt).first()
     if not result:
         raise HTTPException(status_code=404, detail="Study not found or access denied.")
-    
+
     # Create minimal study object for response
-    study = Study()
-    study.id = result.id
-    study.title = result.title
-    study.status = result.status
-    study.launched_at = result.launched_at
-    study.share_url = result.share_url
-    study.updated_at = result.updated_at
-    
+    out = Study()
+    out.id = result.id
+    out.title = result.title
+    out.status = result.status
+    out.launched_at = result.launched_at
+    out.share_url = result.share_url
+    out.updated_at = result.updated_at
+
     db.commit()
     invalidate_study_cache(study_id)
-    return study
+    return out
 
 def delete_study(db: Session, study_id: UUID, owner_id: UUID) -> None:
     """Delete a study (non-active only). Uses minimal load for speed; CASCADE removes related rows."""
@@ -1931,6 +2019,11 @@ def change_status_fast(
 ) -> Study:
     """Optimized version of change_status that avoids loading related data."""
     study = _load_owned_study_minimal(db, study_id, owner_id, for_update=True)
+    if not _get_effective_edit_permission(db, study, owner_id):
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have permission to change this study's status.",
+        )
 
     if new_status not in ['draft', 'active', 'paused', 'completed']:
         raise HTTPException(status_code=400, detail="Invalid status.")

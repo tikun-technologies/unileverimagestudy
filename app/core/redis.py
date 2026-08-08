@@ -69,9 +69,16 @@ def get_sync_redis() -> sync_redis.Redis | None:
             _sync_redis_client = sync_redis.Redis.from_url(
                 redis_url,
                 decode_responses=True,
-                socket_timeout=5.0,
-                socket_connect_timeout=5.0,
+                socket_timeout=2.0,
+                socket_connect_timeout=2.0,
                 retry_on_timeout=True,
+                # Proactively PING connections that have been idle longer than this
+                # (seconds) and reconnect if dead. Without it, a stale pooled
+                # connection (managed Redis / firewalls drop idle sockets) blocks
+                # for the full socket_timeout on the next command, causing the
+                # intermittent multi-second stalls seen on cache reads.
+                health_check_interval=30,
+                socket_keepalive=True,
             )
             _sync_redis_client.ping()
             logger.info("Sync Redis client initialized")

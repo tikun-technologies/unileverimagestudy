@@ -82,6 +82,78 @@ def test_task_service_supports_any_number_of_respondent_rows():
     assert tasks["100"][2]["task_id"] == "100_2"
 
 
+def test_preview_tasks_prefers_respondent_one_without_loading_all():
+    db = MagicMock()
+    study_id = uuid4()
+    db.execute.return_value.scalars.return_value.all.return_value = [
+        _assignment(1, 0),
+        _assignment(1, 1),
+    ]
+
+    preview = TaskService(db).get_preview_tasks_as_dict(study_id)
+
+    assert preview == {
+        "1": [
+            {
+                "task_id": "1_0",
+                "task_index": 0,
+                "elements_shown": {"A_1": 1},
+                "elements_shown_content": {"A_1": {"name": "A", "content": "url"}},
+            },
+            {
+                "task_id": "1_1",
+                "task_index": 1,
+                "elements_shown": {"A_1": 1},
+                "elements_shown_content": {"A_1": {"name": "A", "content": "url"}},
+            },
+        ]
+    }
+    # Preview must not pull every respondent row.
+    assert db.execute.call_count == 1
+
+
+def test_preview_tasks_falls_back_to_first_numeric_respondent():
+    db = MagicMock()
+    study_id = uuid4()
+    service = TaskService(db)
+
+    first_id_result = MagicMock()
+    first_id_result.scalar_one_or_none.return_value = 2
+    db.execute.return_value = first_id_result
+
+    fallback_tasks = [
+        {
+            "task_id": "2_0",
+            "task_index": 0,
+            "elements_shown": {"A_1": 1},
+            "elements_shown_content": {"A_1": {"name": "A", "content": "url"}},
+        }
+    ]
+
+    with patch.object(
+        service,
+        "get_respondent_tasks",
+        side_effect=[[], fallback_tasks],
+    ) as get_respondent_tasks:
+        preview = service.get_preview_tasks_as_dict(study_id)
+
+    assert preview == {"2": fallback_tasks}
+    assert get_respondent_tasks.call_args_list[0].args == (study_id, 1)
+    assert get_respondent_tasks.call_args_list[1].args == (study_id, 2)
+
+
+def test_preview_tasks_returns_none_when_no_tasks_exist():
+    db = MagicMock()
+    study_id = uuid4()
+    db.execute.return_value.scalars.return_value.all.return_value = []
+    db.execute.return_value.scalar_one_or_none.return_value = None
+    db.get.return_value = SimpleNamespace(tasks={})
+
+    preview = TaskService(db).get_preview_tasks_as_dict(study_id)
+
+    assert preview is None
+
+
 def test_task_service_save_failure_rolls_back_and_raises():
     db = MagicMock()
     study_id = uuid4()

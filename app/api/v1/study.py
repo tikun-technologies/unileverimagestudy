@@ -3,12 +3,14 @@ from __future__ import annotations
 
 from typing import List, Optional, Dict, Any
 from uuid import UUID
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import hashlib
+import math
 
 from fastapi import APIRouter, Depends, Query, HTTPException, status, Body, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import select, desc, delete
+from sqlalchemy import select, desc, delete, and_
 from sqlalchemy.exc import IntegrityError
 
 from app.core.dependencies import get_current_active_user
@@ -16,8 +18,9 @@ from app.db.session import get_db
 from app.models.user_model import User
 from app.models.study_model import Study, StudyMember, StudySavedDesign
 from app.schemas.study_schema import (
-    StudyCreate, StudyUpdate, StudyOut, StudyListItem, StudyLaunchOut,
-    ChangeStatusPayload, RegenerateTasksResponse, ValidateTasksResponse, StudyStatus,
+    StudyCreate, StudyUpdate, StudyOut, StudyListItem, StudyListResponse, StudyStatusCounts,
+    StudyLaunchOut,
+    ChangeStatusPayload, RegenerateTasksResponse, ValidateTasksResponse, StudyStatus, StudyType,
     GenerateTasksRequest, GenerateTasksResult, StudyPublicMinimal, StudyBasicDetails, StudyBasicDetailsV2, SimulateAIRespondentsRequest,
     ValidateDesignConstraintsResponse,
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
@@ -399,9 +402,65 @@ def _user_role_for_study(
     return study_role_map.get(study_id) or "viewer"
 
 
-@router.get("", response_model=List[StudyListItem])
+def _created_after_from_time_range(time_range: Optional[str]) -> Optional[datetime]:
+    if not time_range or time_range in ("all", "all_time"):
+        return None
+    now = datetime.now(timezone.utc)
+    mapping = {
+        "7d": 7,
+        "last_7_days": 7,
+        "30d": 30,
+        "last_30_days": 30,
+        "90d": 90,
+        "last_3_months": 90,
+        "365d": 365,
+        "last_year": 365,
+    }
+    days = mapping.get(time_range)
+    if days is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid time_range. Use one of: all, 7d, 30d, 90d, 365d",
+        )
+    return now - timedelta(days=days)
+
+
+def _build_study_list_response(
+    items: List[StudyListItem],
+    *,
+    total: int,
+    page: int,
+    per_page: int,
+    status_counts: Dict[str, int],
+) -> StudyListResponse:
+    total_pages = math.ceil(total / per_page) if per_page > 0 and total > 0 else 0
+    return StudyListResponse(
+        items=items,
+        total=total,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        has_next=page < total_pages,
+        has_previous=page > 1 and total > 0,
+        status_counts=StudyStatusCounts(
+            total=int(status_counts.get("total", 0)),
+            active=int(status_counts.get("active", 0)),
+            draft=int(status_counts.get("draft", 0)),
+            completed=int(status_counts.get("completed", 0)),
+            paused=int(status_counts.get("paused", 0)),
+        ),
+    )
+
+
+@router.get("", response_model=StudyListResponse)
 def list_studies_endpoint(
-    status_filter: Optional[StudyStatus] = Query(None),
+    status_filter: Optional[StudyStatus] = Query(None, alias="status"),
+    study_type: Optional[StudyType] = Query(None),
+    search: Optional[str] = Query(None, max_length=200),
+    time_range: Optional[str] = Query(
+        None,
+        description="Relative created_at filter: all, 7d, 30d, 90d, 365d",
+    ),
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=200),
     db: Session = Depends(get_db),
@@ -409,39 +468,53 @@ def list_studies_endpoint(
     response: Response = None,
 ):
     """
-    List studies for the current user with live response counts.
-    Response includes total_responses, completed_responses, completion_rate, etc.
-    Clients should replace any cached studies list (e.g. in local storage) with this response
-    so cached data does not show stale zeros.
+    Paginated study list for the current user with search, type, status, and time filters.
+    Response includes items, pagination metadata, and status_counts for tab badges.
     """
     # Prevent caching so clients always get fresh counts (avoids stale zeros in cached/local storage)
     if response is not None:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
-        
-    # Short 15-second Redis cache to "debounce" heavy dashboard loads
-    # while still feeling "live" to the user.
-    status_str = status_filter.value if status_filter else "all"
-    cache_key = f"user_studies_list:{current_user.id}:{status_str}:{page}:{per_page}"
+
+    created_after = _created_after_from_time_range(time_range)
+    search_term = (search or "").strip() or None
+    status_str = status_filter or "all"
+    type_str = study_type or "all"
+    time_str = time_range or "all"
+    search_hash = hashlib.sha1((search_term or "").encode("utf-8")).hexdigest()[:12]
+    cache_key = (
+        f"user_studies_list:{current_user.id}:{status_str}:{type_str}:{time_str}:"
+        f"{search_hash}:{page}:{per_page}"
+    )
     cached_data = RedisCache.get(cache_key)
     if cached_data:
-        return [StudyListItem.model_validate(d) for d in cached_data]
+        return StudyListResponse.model_validate(cached_data)
 
-    rows, _total = study_service.list_studies(
+    rows, total, status_counts = study_service.list_studies(
         db=db,
         owner_id=current_user.id,
         status_filter=status_filter,
+        study_type=study_type,
+        search=search_term,
+        created_after=created_after,
         page=page,
         per_page=per_page,
     )
-    # Lightweight enrichment: only the counters needed for the list card
     if not rows:
-        return []
-    
+        empty = _build_study_list_response(
+            [],
+            total=total,
+            page=page,
+            per_page=per_page,
+            status_counts=status_counts,
+        )
+        RedisCache.set(cache_key, empty.model_dump(mode="json"), ttl_seconds=7)
+        return empty
+
     # Row structure from optimized query:
-    # (id, title, study_type, status, created_at, last_step, jobid, project_id, 
-    #  creator_id, product_keys, product_id, audience_segmentation,
-    #  total_responses_calc, completed_responses_calc, abandoned_responses_calc, avg_duration_calc)
+    # (id, title, study_type, status, created_at, last_step, jobid, project_id,
+    #  creator_id, product_keys, product_id, respondents_target,
+    #  total_responses_calc, completed_responses_calc, abandoned_responses_calc)
     study_ids = [row.id for row in rows]
     project_ids = list({row.project_id for row in rows if row.project_id is not None})
     project_creator_map: Dict[UUID, UUID] = {}
@@ -449,20 +522,24 @@ def list_studies_endpoint(
     study_role_map: Dict[UUID, str] = {}
     if project_ids:
         from app.models.project_model import Project, ProjectMember
-        projects = db.execute(
-            select(Project.id, Project.creator_id).where(Project.id.in_(project_ids))
-        ).all()
-        project_creator_map = {p.id: p.creator_id for p in projects}
-        project_members = db.execute(
-            select(ProjectMember.project_id, ProjectMember.role).where(
-                ProjectMember.project_id.in_(project_ids),
-                ProjectMember.user_id == current_user.id,
+        # One round-trip: project creator + current user's project role
+        project_rows = db.execute(
+            select(Project.id, Project.creator_id, ProjectMember.role)
+            .outerjoin(
+                ProjectMember,
+                and_(
+                    ProjectMember.project_id == Project.id,
+                    ProjectMember.user_id == current_user.id,
+                ),
             )
+            .where(Project.id.in_(project_ids))
         ).all()
-        project_role_map = {
-            r.project_id: (r.role if isinstance(r.role, str) else getattr(r.role, "value", str(r.role)))
-            for r in project_members
-        }
+        for p in project_rows:
+            project_creator_map[p.id] = p.creator_id
+            if p.role is not None:
+                project_role_map[p.id] = (
+                    p.role if isinstance(p.role, str) else getattr(p.role, "value", str(p.role))
+                )
     study_members = db.execute(
         select(StudyMember.study_id, StudyMember.role).where(
             StudyMember.study_id.in_(study_ids),
@@ -475,12 +552,11 @@ def list_studies_endpoint(
     }
     enriched: List[StudyListItem] = []
     for row in rows:
-        # Extract values from denormalized counters (no JOINs needed!)
         total_calc = int(row.total_responses_calc or 0)
         completed_calc = int(row.completed_responses_calc or 0)
         abandoned_calc = int(row.abandoned_responses_calc or 0)
-        respondents_target = int((row.audience_segmentation or {}).get("number_of_respondents") or 0)
-        
+        respondents_target = int(getattr(row, "respondents_target", 0) or 0)
+
         user_role = _user_role_for_study(
             row.id,
             row.creator_id,
@@ -490,7 +566,7 @@ def list_studies_endpoint(
             study_role_map,
             current_user.id,
         )
-        
+
         enriched.append(StudyListItem(
             id=row.id,
             title=row.title,
@@ -507,19 +583,21 @@ def list_studies_endpoint(
             abandoned_responses=abandoned_calc,
             respondents_target=respondents_target,
             respondents_completed=completed_calc,
-            average_duration=0,  # Not needed for list view, calculated on detail view
+            average_duration=0,
             completion_rate=(completed_calc / total_calc * 100) if total_calc else 0,
             abandonment_rate=(abandoned_calc / total_calc * 100) if total_calc else 0,
             user_role=user_role,
         ))
 
-    # Cache for 15 seconds to debounce dashboard loads (store JSON-serializable dicts)
-    RedisCache.set(
-        cache_key,
-        [x.model_dump(mode="json") for x in enriched],
-        ttl_seconds=7,
+    payload = _build_study_list_response(
+        enriched,
+        total=total,
+        page=page,
+        per_page=per_page,
+        status_counts=status_counts,
     )
-    return enriched
+    RedisCache.set(cache_key, payload.model_dump(mode="json"), ttl_seconds=7)
+    return payload
 
 
 @router.post("/{study_id}/simulate-ai-respondents")
@@ -777,13 +855,10 @@ def get_study_preview_endpoint(
     # Ensure aspect_ratio is present
     out['aspect_ratio'] = ar
 
-    # Load tasks through TaskService so preview uses the same source as runtime.
+    # Load only respondent 1's tasks (preview mode) — avoid fetching all respondents.
     from app.services.task_service import TaskService
     task_service = TaskService(db)
-    all_tasks = task_service.get_all_tasks_as_dict(study_id)
-    first_respondent = next((k for k in all_tasks if str(k).isdigit()), None) if isinstance(all_tasks, dict) else None
-    tasks_data = {first_respondent: all_tasks[first_respondent]} if first_respondent else None
-    out['tasks'] = tasks_data
+    out['tasks'] = task_service.get_preview_tasks_as_dict(study_id)
 
     # If classification_questions missing or empty in the serialized output, populate from ORM
     try:

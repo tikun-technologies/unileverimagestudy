@@ -6,6 +6,7 @@ import io
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
+import math
 
 from uuid import UUID
 
@@ -27,11 +28,20 @@ from app.schemas.project_schema import (
     ExportCompletedPanelistsRequest,
     ExportAbandonedResponsesRequest,
 )
+from app.schemas.study_schema import (
+    StudyListItem,
+    StudyListResponse,
+    StudyStatusCounts,
+    StudyStatus,
+    StudyType,
+)
 from app.services import project_service
 from app.services.project_member_service import project_member_service
 from app.services.study import build_study_data_for_analysis
 from app.services.response import StudyResponseService
 from app.services.analysis import StudyAnalysisService
+from datetime import datetime, timedelta, timezone
+from fastapi import HTTPException
 
 router = APIRouter()
 
@@ -250,26 +260,78 @@ def get_project_endpoint(
     )
 
 
-@router.get("/{project_id}/studies")
+def _project_created_after_from_time_range(time_range: Optional[str]) -> Optional[datetime]:
+    if not time_range or time_range in ("all", "all_time"):
+        return None
+    now = datetime.now(timezone.utc)
+    mapping = {
+        "7d": 7,
+        "last_7_days": 7,
+        "30d": 30,
+        "last_30_days": 30,
+        "90d": 90,
+        "last_3_months": 90,
+        "365d": 365,
+        "last_year": 365,
+    }
+    days = mapping.get(time_range)
+    if days is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid time_range. Use one of: all, 7d, 30d, 90d, 365d",
+        )
+    return now - timedelta(days=days)
+
+
+@router.get("/{project_id}/studies", response_model=StudyListResponse)
 def get_project_studies_endpoint(
     project_id: UUID,
+    status_filter: Optional[StudyStatus] = Query(None, alias="status"),
+    study_type: Optional[StudyType] = Query(None),
+    search: Optional[str] = Query(None, max_length=200),
+    time_range: Optional[str] = Query(
+        None,
+        description="Relative created_at filter: all, 7d, 30d, 90d, 365d",
+    ),
     page: int = Query(1, ge=1),
-    per_page: int = Query(50, ge=1, le=200),
+    per_page: int = Query(10, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
     """
-    Fetch all studies for a specific project.
-    Optimized for <200ms response time.
+    Paginated studies for a project with search, type, status, and time filters.
     """
-    studies = project_service.get_project_studies(
+    created_after = _project_created_after_from_time_range(time_range)
+    search_term = (search or "").strip() or None
+    studies, total, status_counts = project_service.get_project_studies(
         db=db,
         project_id=project_id,
         user_id=current_user.id,
         page=page,
-        per_page=per_page
+        per_page=per_page,
+        status_filter=status_filter,
+        study_type=study_type,
+        search=search_term,
+        created_after=created_after,
     )
-    return studies
+    items = [StudyListItem.model_validate(s) for s in studies]
+    total_pages = math.ceil(total / per_page) if per_page > 0 and total > 0 else 0
+    return StudyListResponse(
+        items=items,
+        total=total,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        has_next=page < total_pages,
+        has_previous=page > 1 and total > 0,
+        status_counts=StudyStatusCounts(
+            total=int(status_counts.get("total", 0)),
+            active=int(status_counts.get("active", 0)),
+            draft=int(status_counts.get("draft", 0)),
+            completed=int(status_counts.get("completed", 0)),
+            paused=int(status_counts.get("paused", 0)),
+        ),
+    )
 
 
 @router.post("/validate-product", response_model=ValidateProductResponse)
