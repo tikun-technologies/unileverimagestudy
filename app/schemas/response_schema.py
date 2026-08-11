@@ -262,7 +262,16 @@ class StudyResponseListItem(BaseModel):
 
 class UserDetails(BaseModel):
     """Structured user details for study participation"""
-    date_of_birth: Optional[str] = Field(None, description="Date of birth in YYYY-MM-DD format")
+    age: Optional[int] = Field(
+        None,
+        ge=18,
+        le=120,
+        description="Participant age in years (18-120). Preferred over date_of_birth for new responses.",
+    )
+    date_of_birth: Optional[str] = Field(
+        None,
+        description="Date of birth in YYYY-MM-DD format (legacy; kept for older clients/responses)",
+    )
     gender: Optional[str] = Field(None, description="Gender (male, female, other, prefer_not_to_say)")
     age_range: Optional[str] = Field(None, description="Age range (18-24, 25-34, 35-44, 45-54, 55-64, 65+)")
     education_level: Optional[str] = Field(None, description="Education level")

@@ -1323,7 +1323,7 @@ class StudyResponseService:
         - ResponseTime (seconds)
 
         Notes:
-        - Age is derived from personal_info.dob or personal_info.date_of_birth (YYYY-MM-DD).
+        - Age prefers personal_info.age; falls back to dob/date_of_birth (YYYY-MM-DD).
         - Gender comes from personal_info.gender if available.
         - Layer visibility is inferred from CompletedTask.elements_shown_content or layers_shown_in_task.
         """
@@ -1503,13 +1503,19 @@ class StudyResponseService:
         # Yield header
         yield header
 
-        # Helper to compute age
+        # Helper to compute age (prefer stored age; fall back to DOB for legacy responses)
         def compute_age(personal_info: Optional[Dict[str, Any]]) -> Optional[int]:
             if not personal_info:
                 return None
+            raw_age = personal_info.get("age")
+            if raw_age is not None:
+                try:
+                    return int(raw_age)
+                except (TypeError, ValueError):
+                    pass
             dob_str = personal_info.get("dob") or personal_info.get("date_of_birth")
             if not dob_str:
-                return personal_info.get("age")
+                return None
             try:
                 from datetime import date
                 year, month, day = [int(x) for x in str(dob_str).split("-")[:3]]
@@ -1972,13 +1978,19 @@ class StudyResponseService:
         header.extend(["Rating", "ResponseTime"])
         yield header
 
-        # Helper: age
+        # Helper: age (prefer stored age; fall back to DOB for legacy responses)
         def compute_age(personal_info: Optional[Dict[str, Any]]) -> Optional[int]:
             if not personal_info:
                 return None
+            raw_age = personal_info.get("age")
+            if raw_age is not None:
+                try:
+                    return int(raw_age)
+                except (TypeError, ValueError):
+                    pass
             dob_str = personal_info.get("dob") or personal_info.get("date_of_birth")
             if not dob_str:
-                return personal_info.get("age")
+                return None
             try:
                 from datetime import date
                 year, month, day = [int(x) for x in str(dob_str).split("-")[:3]]
@@ -2303,10 +2315,21 @@ class StudyResponseService:
         
         if response.is_completed:
             raise HTTPException(status_code=400, detail="Cannot update details for completed study")
+
+        details = dict(user_details or {})
+        # Normalize age when present (new flow). Keep date_of_birth for legacy clients.
+        if "age" in details and details["age"] is not None:
+            try:
+                age_int = int(details["age"])
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Age must be an integer between 18 and 120")
+            if age_int < 18 or age_int > 120:
+                raise HTTPException(status_code=400, detail="Age must be between 18 and 120")
+            details["age"] = age_int
         
         # Merge with existing personal_info
         existing_info = response.personal_info or {}
-        existing_info.update(user_details)
+        existing_info.update(details)
         
         response.personal_info = existing_info
         response.last_activity = datetime.utcnow()
@@ -2867,13 +2890,21 @@ class StudyResponseService:
             return None
 
         def extract_age(pi):
-            if not isinstance(pi, dict): return None
+            if not isinstance(pi, dict):
+                return None
+            raw_age = pi.get("age")
+            if raw_age is not None:
+                try:
+                    return int(raw_age)
+                except (TypeError, ValueError):
+                    pass
             dob = pi.get("dob") or pi.get("date_of_birth")
-            if not dob: return pi.get("age")
+            if not dob:
+                return None
             try:
-                # Simple age calc
+                # Simple age calc from legacy DOB
                 return int((datetime.now() - pd.to_datetime(dob)).days / 365.25)
-            except:
+            except Exception:
                 return None
 
         responses_df['Gender'] = responses_df['personal_info'].apply(extract_gender)

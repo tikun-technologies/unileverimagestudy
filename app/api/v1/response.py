@@ -360,6 +360,11 @@ def _extract_demographics(personal_info: Any, analysis_service: StudyAnalysisSer
         gender_norm = _clean_demo_label(analysis_service._normalize_gender(gender_raw))
 
     age_val = personal_info.get("age")
+    if age_val is not None:
+        try:
+            age_val = int(age_val)
+        except (TypeError, ValueError):
+            age_val = None
     if age_val is None:
         dob = (
             personal_info.get("dob")
