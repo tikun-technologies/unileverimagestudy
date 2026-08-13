@@ -17,6 +17,7 @@ import app.models.project_model  # noqa: F401
 import app.models.study_model  # noqa: F401
 import app.models.response_model  # noqa: F401
 import app.models.job_model  # noqa: F401
+import app.models.assistant_message_model  # noqa: F401  # User/Study relationships resolve AssistantConversation
 
 logger = logging.getLogger(__name__)
 
