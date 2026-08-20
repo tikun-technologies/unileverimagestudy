@@ -383,6 +383,16 @@ class BackgroundTaskService:
                         "respondents_completed": max_respondents,
                         "respondents_requested": max_respondents
                     })
+
+                    from app.services.job_notification_service import send_synthetic_simulation_complete_email_for_job
+
+                    send_synthetic_simulation_complete_email_for_job(
+                        db_fresh,
+                        user_id=job.user_id,
+                        study_id=job.study_id,
+                        payload=payload,
+                        respondents_simulated=result.get("respondents_simulated"),
+                    )
                 else:
                     job.status = JobStatus.FAILED
                     job.message = result.get("message", "Simulation failed.")

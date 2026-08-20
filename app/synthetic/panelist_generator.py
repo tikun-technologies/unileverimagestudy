@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import itertools
@@ -166,6 +167,38 @@ def generate_all_panelist_combinations(
         panelists.append(panelist)
     
     return panelists
+
+
+def expand_panelists_to_count(
+    unique_panelists: List[Dict[str, Any]],
+    count: int,
+    task_numbers: Optional[List[int]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Repeat unique classification personas in order until ``count`` respondents exist.
+
+    The first pass uses each unique persona once. Extra respondents loop back to
+    the first persona (1, 2, 3, 4, 1, 2, ...). Each copy gets a unique
+    panelist_id / panelist_number. ``task_lookup_number`` points at an existing
+    task slot and is cycled if ``count`` is larger than the number of slots.
+    """
+    if not unique_panelists or count < 1:
+        return []
+
+    slots = list(task_numbers) if task_numbers else [
+        p.get("panelist_number", i + 1) for i, p in enumerate(unique_panelists)
+    ]
+    if not slots:
+        slots = list(range(1, len(unique_panelists) + 1))
+
+    expanded: List[Dict[str, Any]] = []
+    for i in range(count):
+        clone = copy.deepcopy(unique_panelists[i % len(unique_panelists)])
+        clone["panelist_number"] = i + 1
+        clone["panelist_id"] = f"panelist_{i + 1:06d}"
+        clone["task_lookup_number"] = slots[i % len(slots)]
+        expanded.append(clone)
+    return expanded
 
 
 def create_panelists_json(study_data: Dict[str, Any], panelists: List[Dict[str, Any]]) -> Dict[str, Any]:

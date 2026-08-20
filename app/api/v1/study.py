@@ -639,14 +639,6 @@ def simulate_ai_respondents_endpoint(
     if N <= 0:
         raise HTTPException(status_code=400, detail="Could not determine number of respondents (set audience_segmentation.number_of_respondents or ensure tasks have numeric keys).")
 
-    from app.services.synthetic_simulation_service import get_max_panelist_combinations
-    max_combinations = get_max_panelist_combinations(db, study_id)
-    if max_combinations is not None and N > max_combinations:
-        raise HTTPException(
-            status_code=400,
-            detail=f"AI cannot process more than {max_combinations} respondents. Classification combinations allow at most {max_combinations}.",
-        )
-
     if run_async and N > settings.MAX_RESPONDENTS_FOR_SYNC:
         import logging
         from app.services.background_task_service import background_task_service
@@ -722,6 +714,16 @@ def simulate_ai_respondents_endpoint(
         is_special_creator=is_special_creator,
         randomize=randomize,
     )
+    if result.get("success"):
+        from app.services.job_notification_service import send_synthetic_simulation_complete_email_for_job
+
+        send_synthetic_simulation_complete_email_for_job(
+            db,
+            user_id=str(current_user.id),
+            study_id=str(study_id),
+            payload={"max_respondents": N},
+            respondents_simulated=result.get("respondents_simulated"),
+        )
     return result
 
 

@@ -14,7 +14,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.services.synthetic_study_adapter import build_study_data_for_synthetic
-from app.synthetic import process_panelist_response, generate_all_panelist_combinations
+from app.synthetic import process_panelist_response, generate_all_panelist_combinations, expand_panelists_to_count
 from app.services.response import StudyResponseService
 from app.schemas.response_schema import (
     SyntheticRespondentPayload,
@@ -35,8 +35,9 @@ DB_RETRY_DELAY_SECONDS = 1.0
 
 def get_max_panelist_combinations(db: Session, study_id: UUID) -> Optional[int]:
     """
-    Return max number of respondents allowed (based on classification combinations with tasks).
-    Returns None if study has no tasks or panelists.
+    Return the number of unique classification personas (option combinations)
+    that have a matching task slot. This is not a run cap — extra respondents
+    cycle those personas. Returns None if study has no tasks or panelists.
     """
     from app.models.study_model import Study
 
@@ -194,7 +195,7 @@ def run_simulation(
     api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
     model_name = model or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
     
-    # Standalone logic: only run panelists that have tasks (task keys = available panelist numbers)
+    # Task keys are available respondent slots. Personas come from classification combos.
     available_panelist_numbers = set()
     for key in tasks:
         try:
@@ -202,34 +203,18 @@ def run_simulation(
                 available_panelist_numbers.add(int(key))
         except (ValueError, TypeError):
             continue
-    
-    # Limit panelist generation to the highest panelist number we need (avoids full cartesian product)
-    max_to_generate = max(available_panelist_numbers) if available_panelist_numbers else None
-    
-    panelists = generate_all_panelist_combinations(study_data, max_panelists=max_to_generate)
-    if not panelists:
+
+    unique_panelists = generate_all_panelist_combinations(study_data)
+    if not unique_panelists:
         return {"success": False, "respondents_simulated": 0, "message": "No panelists generated (check classification_questions and answer_options)", "error": "No panelists"}
-    
-    if available_panelist_numbers:
-        panelists_with_tasks = [p for p in panelists if p.get("panelist_number") in available_panelist_numbers]
-        panelists_with_tasks.sort(key=lambda p: p.get("panelist_number", 0))
-    else:
-        panelists_with_tasks = panelists
-    
-    if not panelists_with_tasks:
+
+    if not available_panelist_numbers:
         return {"success": False, "respondents_simulated": 0, "message": "No panelists with tasks", "error": "No panelists with tasks"}
 
-    max_combinations = len(panelists_with_tasks)
-    if N > max_combinations:
-        return {
-            "success": False,
-            "respondents_simulated": 0,
-            "message": f"AI cannot process more than {max_combinations} respondents. Classification combinations allow at most {max_combinations}.",
-            "error": f"max_respondents ({N}) exceeds max combinations ({max_combinations})",
-        }
-
-    # Standalone logic: run only panelists that have tasks, up to N (no cycling)
-    panelists_to_run = panelists_with_tasks[:N]
+    # Unique personas first; if N is larger, loop from the first persona again.
+    # Same expansion is used for AI and randomize — rating method is chosen later per vignette.
+    task_numbers = sorted(available_panelist_numbers)
+    panelists_to_run = expand_panelists_to_count(unique_panelists, N, task_numbers)
     total = len(panelists_to_run)
     response_service = StudyResponseService(db)
     simulated = 0
@@ -300,9 +285,12 @@ def run_simulation(
     def _run_one_panelist(args: Tuple[int, Dict[str, Any]]) -> Tuple[int, Optional[Dict[str, Any]], Optional[str]]:
         idx, panelist = args
         try:
+            lookup = panelist.get("task_lookup_number", panelist.get("panelist_number"))
+            panelist_number = panelist.get("panelist_number")
+            tasks_for_panelist = {str(panelist_number): tasks.get(str(lookup), [])}
             resp = process_panelist_response(
                 panelist_json=panelist,
-                tasks_json=tasks,
+                tasks_json=tasks_for_panelist,
                 study_data=study_data,
                 openai_api_key=api_key,
                 model=model_name,

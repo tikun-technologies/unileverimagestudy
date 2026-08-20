@@ -952,3 +952,47 @@ def send_task_generation_complete_email_for_job(
             logger.warning("Failed to send task generation complete email to %s", user.email)
     except Exception as e:
         logger.warning("Task generation complete email failed for study %s: %s", study_id, e)
+
+
+def send_synthetic_simulation_complete_email_for_job(
+    db: Session,
+    *,
+    user_id: str,
+    study_id: str,
+    payload: dict[str, Any] | None = None,
+    respondents_simulated: int | None = None,
+) -> None:
+    """Email the job owner when synthetic simulation completes. Failures are logged, not raised."""
+    from app.core.config import settings
+    from app.models.user_model import User
+    from app.services.email_service import email_service
+
+    try:
+        user = db.query(User).filter(User.id == UUID(user_id)).first()
+        if not user or not user.email:
+            logger.warning("Synthetic simulation email skipped: user %s not found or has no email", user_id)
+            return
+
+        study = db.query(Study).filter(Study.id == UUID(study_id)).first()
+        study_title = (study.title if study else None) or "Your study"
+
+        respondents_count = respondents_simulated
+        if not respondents_count and payload:
+            respondents_count = payload.get("max_respondents")
+
+        study_url = f"{settings.FRONTEND_URL.rstrip('/')}/home/study/{study_id}"
+        user_name = user.name or user.email.split("@")[0]
+
+        sent = email_service.send_synthetic_simulation_complete_email(
+            to_email=user.email,
+            user_name=user_name,
+            study_title=study_title,
+            study_url=study_url,
+            respondents_count=int(respondents_count) if respondents_count else None,
+        )
+        if sent:
+            logger.info("Synthetic simulation complete email sent to %s for study %s", user.email, study_id)
+        else:
+            logger.warning("Failed to send synthetic simulation complete email to %s", user.email)
+    except Exception as e:
+        logger.warning("Synthetic simulation complete email failed for study %s: %s", study_id, e)

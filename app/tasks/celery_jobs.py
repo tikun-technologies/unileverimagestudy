@@ -597,6 +597,16 @@ def simulate_synthetic_respondents_celery(
                             "respondents_requested": max_respondents,
                         },
                     )
+
+                    from app.services.job_notification_service import send_synthetic_simulation_complete_email_for_job
+
+                    send_synthetic_simulation_complete_email_for_job(
+                        db,
+                        user_id=user_id,
+                        study_id=study_id,
+                        payload=payload,
+                        respondents_simulated=result.get("respondents_simulated"),
+                    )
                 else:
                     job_progress_notifier.notify(
                         job_id,
