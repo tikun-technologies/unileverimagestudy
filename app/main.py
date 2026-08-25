@@ -15,6 +15,7 @@ from app.api.v1.project import router as project_router
 from app.api.v1.websocket import router as websocket_router
 from app.api.v1.template import router as template_router
 from app.api.v1.assistant import router as assistant_router
+from app.api.v1.contact import router as contact_router
 from app.core.config import settings
 from app.core.cloudinary_config import init_cloudinary
 from app.core.build_info import APP_VERSION, BUILD_TIME
@@ -64,6 +65,7 @@ app.include_router(project_router, prefix="/api/v1/projects", tags=["projects"])
 app.include_router(template_router, prefix="/api/v1/templates", tags=["templates"])
 app.include_router(websocket_router, prefix="/api/v1/ws", tags=["websocket"])
 app.include_router(assistant_router, prefix="/api/v1/studies", tags=["assistant"])
+app.include_router(contact_router, prefix="/api/v1/contact", tags=["contact"])
 
 
 @app.exception_handler(RequestValidationError)

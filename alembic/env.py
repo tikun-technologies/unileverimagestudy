@@ -15,6 +15,7 @@ from app.models import (
     project_model,
     template_model,
     assistant_message_model,
+    contact_inquiry_model,
 )
 
 

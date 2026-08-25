@@ -1,7 +1,8 @@
 """
 Golden Matrix–based task generation matching legacy v2 payload shape (tasks + metadata).
 
-Uses 2× respondent count (cap 1500) like task_generation_core.generate_*_tasks_v2.
+Uses 2× respondent count (cap 1500) for collection studies. A one-person
+request remains one person so draft previews do not build unused assignments.
 """
 from __future__ import annotations
 
@@ -24,6 +25,8 @@ MAX_RESPONDENTS_CAP = 1500
 def _requested_to_generated_n(number_of_respondents: int) -> int:
     if number_of_respondents < 1:
         return 0
+    if number_of_respondents == 1:
+        return 1
     return min(number_of_respondents * 2, MAX_RESPONDENTS_CAP)
 
 
