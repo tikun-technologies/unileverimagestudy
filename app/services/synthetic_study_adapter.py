@@ -7,6 +7,8 @@ from __future__ import annotations
 from typing import Dict, Any, List, Optional
 from uuid import UUID
 
+from app.synthetic.layer_stimulus import DEFAULT_TRANSFORM, normalize_transform, normalize_z_index
+
 # Study is typed generically to avoid circular imports; caller passes loaded Study with relationships
 def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] = None, db: Any = None) -> Dict[str, Any]:
     """
@@ -17,9 +19,10 @@ def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] =
     loaded (e.g. via selectinload or access that triggers load).
     
     Returns:
-        Dict with keys: id, title, background, main_question, language,
-        orientation_text, objectives_text, rating_scale, audience_segmentation,
-        classification_questions, categories, elements, tasks.
+        Dict with keys: id, title, background, background_image_url, aspect_ratio,
+        study_type, main_question, language, orientation_text, objectives_text,
+        rating_scale, audience_segmentation, classification_questions, categories,
+        elements, layer_layout, tasks.
     """
     study_id = study.id
     id_str = str(study_id) if isinstance(study_id, UUID) else study_id
@@ -67,17 +70,42 @@ def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] =
     # Categories and elements: grid/text use StudyCategory and StudyElement; layer uses StudyLayer and LayerImage
     categories: List[Dict[str, Any]] = []
     elements: List[Dict[str, Any]] = []
+    layer_layout: Dict[str, Any] = {}
     
     study_type_str = str(study.study_type) if study.study_type else "grid"
+    if "." in study_type_str:
+        study_type_str = study_type_str.rsplit(".", 1)[-1]
+    study_type_str = study_type_str.strip().lower() or "grid"
+    
+    audience_aspect = audience_seg.get("aspect_ratio") if isinstance(audience_seg, dict) else None
+    aspect_ratio = getattr(study, "aspect_ratio", None) or audience_aspect
+    background_image_url = getattr(study, "background_image_url", None)
     
     if study_type_str == "layer":
         for layer in sorted(study.layers or [], key=lambda x: x.order):
             cat_id = str(layer.layer_id)
+            layer_name = (layer.name or "").strip()
+            layer_transform = normalize_transform(layer.transform) if getattr(layer, "transform", None) else dict(DEFAULT_TRANSFORM)
+            layer_z = normalize_z_index(getattr(layer, "z_index", 0))
+            layer_type = str(layer.layer_type) if layer.layer_type else "image"
+            layout_entry = {
+                "name": layer_name,
+                "z_index": layer_z,
+                "transform": layer_transform,
+                "layer_type": layer_type,
+            }
+            if layer_name:
+                layer_layout[layer_name] = layout_entry
+            layer_id_key = str(getattr(layer, "layer_id", "") or "").strip()
+            if layer_id_key and layer_id_key not in layer_layout:
+                layer_layout[layer_id_key] = layout_entry
             categories.append({
                 "id": cat_id,
                 "category_id": cat_id,
                 "name": layer.name,
                 "order": layer.order,
+                "z_index": layer_z,
+                "transform": layer_transform,
             })
             for img in sorted(layer.images or [], key=lambda x: x.order):
                 elements.append({
@@ -85,10 +113,14 @@ def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] =
                     "id": str(img.id),
                     "name": img.name,
                     "content": img.url,
+                    "url": img.url,
                     "category_id": cat_id,
-                    "element_type": str(layer.layer_type) if layer.layer_type else "image",
-                    "category": {"name": layer.name, "order": layer.order},
+                    "element_type": layer_type,
+                    "category": {"name": layer.name, "order": layer.order, "z_index": layer_z, "transform": layer_transform},
                     "category_name": layer.name,
+                    "layer_name": layer.name,
+                    "z_index": layer_z,
+                    "transform": layer_transform,
                 })
     else:
         # grid, text, hybrid: use study_categories and study_elements
@@ -133,6 +165,9 @@ def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] =
         "id": id_str,
         "title": study.title or "",
         "background": study.background or "",
+        "background_image_url": background_image_url,
+        "aspect_ratio": aspect_ratio,
+        "study_type": study_type_str,
         "main_question": study.main_question or "",
         "language": getattr(study, "language", "en") or "en",
         "orientation_text": study.orientation_text or "",
@@ -142,5 +177,6 @@ def build_study_data_for_synthetic(study: Any, tasks: Optional[Dict[str, Any]] =
         "classification_questions": classification_questions,
         "categories": categories,
         "elements": elements,
+        "layer_layout": layer_layout,
         "tasks": tasks or {},
     }

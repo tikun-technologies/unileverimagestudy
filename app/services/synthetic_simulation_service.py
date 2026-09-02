@@ -172,6 +172,10 @@ def run_simulation(
         study_data = build_study_data_for_synthetic(study, db=db)
     study_data["is_special_creator"] = is_special_creator
     study_data["randomize"] = randomize
+    if not study_data.get("randomize"):
+        from app.synthetic.layer_stimulus import StimulusComposer, is_layer_study
+        if is_layer_study(study_data) and not isinstance(study_data.get("_layer_composer"), StimulusComposer):
+            study_data["_layer_composer"] = StimulusComposer()
     
     tasks = study_data.get("tasks") or {}
     if not isinstance(tasks, dict) or len(tasks) == 0:

@@ -13,6 +13,15 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from app.synthetic.layer_stimulus import (
+    StimulusComposer,
+    describe_layer_stack,
+    enrich_shown_element,
+    is_layer_study,
+    is_probably_image_url,
+    iter_shown_elements,
+)
+
 # Try to load environment variables from .env file
 try:
     from dotenv import load_dotenv
@@ -142,17 +151,8 @@ Rate the entire SET as a WHOLE in response to the question on a scale of 1-5 whe
         if study_context.get("randomize") or not self.client:
             return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
         
-        # Extrac elements shown in this vignette
-        elements_shown_content = task.get('elements_shown_content', {})
-        elements_shown = task.get('elements_shown', {})
-        
-        # Get only the elements that are actually shown (value = 1)
-        shown_elements = []
-        for key, value in elements_shown.items():
-            if value == 1 and key in elements_shown_content:
-                element_data = elements_shown_content[key]
-                if element_data and isinstance(element_data, dict):
-                    shown_elements.append(element_data)
+        shown_pairs = iter_shown_elements(task)
+        shown_elements = [data for _, data in shown_pairs]
         
         if not shown_elements:
             # No elements shown, return neutral rating (or 5 when special creator = polar only)
@@ -162,49 +162,63 @@ Rate the entire SET as a WHOLE in response to the question on a scale of 1-5 whe
                 'reasoning': 'No elements shown in this vignette',
                 'method': 'fallback'
             }
-        
-        # Build vignette description - separate text and images
+
+        layer_mode = is_layer_study(study_context)
         vignette_text_parts = []
         image_urls = []
-        
-        for element in shown_elements:
-            category = element.get('category_name', 'Unknown')
-            # Layer tasks use 'url'; grid/text use 'content'
-            content = element.get('content') or element.get('url') or element.get('name', 'Unknown')
-            element_type = element.get('element_type', 'text')
-            
-            # Check if content is an image URL
-            is_image_url = False
-            if element_type == 'image':
-                is_image_url = True
-            elif isinstance(content, str) and (
-                content.startswith('http://') or 
-                content.startswith('https://')
-            ):
-                # Check if URL looks like an image (common image extensions)
-                image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp']
-                is_image_url = any(content.lower().endswith(ext) for ext in image_extensions)
-            
-            if is_image_url:
-                # Store image URL for vision API
+        composed = False
+
+        if layer_mode:
+            composer = study_context.get("_layer_composer")
+            if composer is None or not callable(getattr(composer, "compose_data_url", None)):
+                composer = StimulusComposer()
+                if isinstance(study_context, dict):
+                    study_context["_layer_composer"] = composer
+            composed_url = composer.compose_data_url(task, study_context)
+            vignette_text_parts.append(describe_layer_stack(task, study_context))
+            if composed_url:
                 image_urls.append({
-                    'type': 'image_url',
-                    'image_url': {'url': content}
+                    "type": "image_url",
+                    "image_url": {"url": composed_url},
                 })
-                vignette_text_parts.append(f"{category}: [Image]")
+                composed = True
             else:
-                # Regular text content
-                vignette_text_parts.append(f"{category}: {content}")
-        
+                image_urls.extend(self._layer_fallback_image_parts(shown_pairs, study_context))
+        else:
+            for key, element in shown_pairs:
+                category = element.get("category_name") or element.get("layer_name") or "Unknown"
+                content = element.get("content") or element.get("url") or element.get("name", "Unknown")
+                element_type = element.get("element_type", "text")
+                url = content if isinstance(content, str) else None
+                if is_probably_image_url(url, element_type, layer_mode=False):
+                    image_urls.append({
+                        "type": "image_url",
+                        "image_url": {"url": url},
+                    })
+                    vignette_text_parts.append(f"{category}: [Image]")
+                else:
+                    vignette_text_parts.append(f"{category}: {content}")
+
         vignette_text = "\n".join(vignette_text_parts)
         
         # Build the user message content
         user_content = []
         
-        # Build prompt based on whether there are images
         has_images = len(image_urls) > 0
-        image_instruction = ""
-        if has_images:
+        if composed:
+            image_instruction = """
+IMPORTANT: The attached image is the EXACT composed stimulus shown to human participants:
+background image plus every visible layer stacked by z-index, each placed/sized by its transform.
+Rate this one assembled design as a whole. Do not treat layers as separate products.
+"""
+        elif layer_mode and has_images:
+            image_instruction = """
+IMPORTANT: Composition of the stacked design failed, so you are seeing separate layer assets.
+Mentally assemble them using the listed z-index (higher = in front) and transform percents
+(x/y/width/height of the background box). Include the background if one is listed.
+Rate the assembled design, not the loose assets.
+"""
+        elif has_images:
             image_instruction = """
 IMPORTANT: This stimulus set contains IMAGES. Please carefully analyze each image visually:
 - Look at the visual design, colors, composition, and overall aesthetic
@@ -235,32 +249,87 @@ Respond ONLY with a JSON object in this exact format:
         user_content.extend(image_urls)
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a role-based evaluator providing ratings from within a defined human context. Your judgment reflects perceived sense-making, not expertise or factual knowledge. Always respond with valid JSON only."},
-                    {"role": "user", "content": user_content}
-                ],
-                temperature=0.7,  # Some variability but still consistent
-                response_format={"type": "json_object"}
-            )
-            
-            result = json.loads(response.choices[0].message.content)
-            rating = int(result.get('rating', 3))
-            # Ensure rating is in valid range
-            rating = max(1, min(5, rating))
-            # Special creator: only 1 or 5 (polar) — map <3 → 1, >=3 → 5
-            if study_context.get("is_special_creator"):
-                rating = 1 if rating < 3 else 5
-
-            return {
-                'rating': rating,
-                'reasoning': result.get('reasoning', ''),
-                'method': 'ai'
-            }
+            return self._complete_vignette_rating(user_content, study_context)
         except Exception as e:
+            if composed:
+                # Composed data-URL can fail (size/provider). Retry with source layer URLs.
+                print(f"Error calling AI API with composed layer image: {e}. Retrying with individual layer URLs.")
+                fallback_images = self._layer_fallback_image_parts(shown_pairs, study_context)
+                retry_instruction = """
+IMPORTANT: Composition upload failed, so you are seeing separate layer assets.
+Mentally assemble them using the listed z-index (higher = in front) and transform percents
+(x/y/width/height of the background box). Include the background if one is listed.
+Rate the assembled design, not the loose assets.
+"""
+                retry_prompt = f"""{persona_prompt}
+
+STIMULUS SET (evaluate as ONE combined proposition):
+{vignette_text}
+{retry_instruction}
+
+Respond ONLY with a JSON object in this exact format:
+{{
+    "rating": <number between 1 and 5>,
+    "reasoning": "<brief explanation of why you gave this rating based on your role, the factors shaping your perspective, and how the stimulus set resonates with you>"
+}}
+"""
+                retry_content = [{"type": "text", "text": retry_prompt}]
+                retry_content.extend(fallback_images)
+                try:
+                    return self._complete_vignette_rating(retry_content, study_context)
+                except Exception as retry_error:
+                    print(f"Error calling AI API on layer fallback: {retry_error}. Using fallback method.")
+                    return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
             print(f"Error calling AI API: {e}. Using fallback method.")
             return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
+
+    def _layer_fallback_image_parts(
+        self,
+        shown_pairs: List[Any],
+        study_context: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        parts: List[Dict[str, Any]] = []
+        seen = set()
+        bg = ""
+        if isinstance(study_context, dict):
+            bg = str(study_context.get("background_image_url") or "").strip()
+        if bg and is_probably_image_url(bg, "image", layer_mode=True) and bg not in seen:
+            seen.add(bg)
+            parts.append({"type": "image_url", "image_url": {"url": bg}})
+        for key, element in shown_pairs:
+            enriched = enrich_shown_element(key, element, study_context)
+            url = enriched.get("url")
+            if url and url not in seen and is_probably_image_url(url, enriched.get("element_type"), layer_mode=True):
+                seen.add(url)
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+        return parts
+
+    def _complete_vignette_rating(self, user_content: List[Any], study_context: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.client:
+            raise RuntimeError("OpenAI client is not available")
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": "You are a role-based evaluator providing ratings from within a defined human context. Your judgment reflects perceived sense-making, not expertise or factual knowledge. Always respond with valid JSON only."},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.7,
+            response_format={"type": "json_object"}
+        )
+        raw_content = response.choices[0].message.content if response.choices else None
+        result = json.loads(raw_content or "{}")
+        try:
+            rating = int(round(float(result.get("rating", 3))))
+        except (TypeError, ValueError):
+            rating = 3
+        rating = max(1, min(5, rating))
+        if study_context.get("is_special_creator"):
+            rating = 1 if rating < 3 else 5
+        return {
+            "rating": rating,
+            "reasoning": result.get("reasoning", ""),
+            "method": "ai",
+        }
     
     def _generate_fallback_vignette_rating(
         self, task: Dict[str, Any], persona_prompt: str, study_context: Optional[Dict[str, Any]] = None
@@ -332,39 +401,22 @@ def generate_panelist_response_from_json(
         # Rate the entire vignette (all elements combined together as one unit)
         rating_result = ai_respondent.rate_vignette_with_ai(task, persona_prompt, study_data)
         
-        # Build vignette content string for output
-        elements_shown_content = task.get('elements_shown_content', {})
-        elements_shown = task.get('elements_shown', {})
-        vignette_parts = []
-        for key, value in elements_shown.items():
-            if value == 1 and key in elements_shown_content:
-                element_data = elements_shown_content[key]
-                if element_data and isinstance(element_data, dict):
-                    category = element_data.get('category_name', 'Unknown')
-                    # Layer tasks use 'url'; grid/text use 'content'
-                    content = element_data.get('content') or element_data.get('url') or element_data.get('name', 'Unknown')
-                    vignette_parts.append(f"{category}: {content}")
-        vignette_content = "\n".join(vignette_parts)
-        
-        # Get elements shown in this vignette (for reference/debugging)
-        elements_shown_content = task.get('elements_shown_content', {})
-        elements_shown = task.get('elements_shown', {})
-        
         # Extract shown elements (layer tasks use 'url', grid/text use 'content')
         shown_elements = []
-        for key, value in elements_shown.items():
-            if value == 1 and key in elements_shown_content:
-                element_data = elements_shown_content[key]
-                if element_data and isinstance(element_data, dict):
-                    url_or_content = element_data.get('content') or element_data.get('url')
-                    shown_elements.append({
-                        'key': key,
-                        'element_id': element_data.get('element_id'),
-                        'name': element_data.get('name'),
-                        'content': url_or_content,
-                        'category_name': element_data.get('category_name'),
-                        'element_type': element_data.get('element_type', 'text')
-                    })
+        vignette_parts = []
+        for key, element_data in iter_shown_elements(task):
+            enriched = enrich_shown_element(key, element_data, study_data)
+            url_or_content = enriched.get("content") or enriched.get("url") or enriched.get("name")
+            shown_elements.append({
+                "key": key,
+                "element_id": enriched.get("element_id") or element_data.get("element_id"),
+                "name": enriched.get("name"),
+                "content": url_or_content,
+                "category_name": enriched.get("category_name") or enriched.get("layer_name"),
+                "element_type": enriched.get("element_type") or "text",
+            })
+            vignette_parts.append(f"{enriched.get('category_name') or 'Unknown'}: {url_or_content}")
+        vignette_content = "\n".join(vignette_parts)
         
         return {
             'task_id': task_id,

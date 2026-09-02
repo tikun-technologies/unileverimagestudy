@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -23,21 +24,31 @@ _MAX_BYTES = 8 * 1024 * 1024
 
 
 class ImageCache:
-    """Per-export URL → PIL image cache."""
+    """URL → PIL image cache. Safe for parallel synthetic rating workers."""
 
     def __init__(self) -> None:
         self._cache: Dict[str, Optional[Image.Image]] = {}
+        self._lock = threading.Lock()
+        self._url_locks: Dict[str, threading.Lock] = {}
 
     def get(self, url: Optional[str]) -> Optional[Image.Image]:
         if not url or not str(url).startswith(("http://", "https://")):
             return None
         key = str(url).strip()
-        if key in self._cache:
-            cached = self._cache[key]
-            return cached.copy() if cached is not None else None
-        image = _download_image(key)
-        self._cache[key] = image
-        return image.copy() if image is not None else None
+        with self._lock:
+            if key in self._cache:
+                cached = self._cache[key]
+                return cached.copy() if cached is not None else None
+            url_lock = self._url_locks.setdefault(key, threading.Lock())
+        with url_lock:
+            with self._lock:
+                if key in self._cache:
+                    cached = self._cache[key]
+                    return cached.copy() if cached is not None else None
+            image = _download_image(key)
+            with self._lock:
+                self._cache[key] = image
+            return image.copy() if image is not None else None
 
 
 def _download_image(url: str) -> Optional[Image.Image]:
@@ -58,10 +69,25 @@ def _download_image(url: str) -> Optional[Image.Image]:
 
 def _parse_aspect(aspect_ratio: Optional[str]) -> Tuple[int, int]:
     raw = (aspect_ratio or "9 / 16").replace(" ", "").replace(":", "/")
-    if raw in {"16/9"}:
-        return 1920, 1080
-    if raw in {"1/1"}:
-        return 1080, 1080
+    known = {
+        "16/9": (1920, 1080),
+        "9/16": (1080, 1920),
+        "1/1": (1080, 1080),
+        "4/3": (1440, 1080),
+        "3/4": (1080, 1440),
+    }
+    if raw in known:
+        return known[raw]
+    if "/" in raw:
+        left, right = raw.split("/", 1)
+        try:
+            width_n, height_n = float(left), float(right)
+            if width_n > 0 and height_n > 0:
+                if width_n >= height_n:
+                    return 1920, max(1, int(round(1920 * height_n / width_n)))
+                return max(1, int(round(1920 * width_n / height_n))), 1920
+        except (TypeError, ValueError):
+            pass
     return 1080, 1920
 
 
