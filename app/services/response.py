@@ -811,6 +811,15 @@ class StudyResponseService:
                 self.db.add(answer)
         
         response.last_activity = datetime.utcnow()
+
+        # Flush the answers we just added/updated above so the completion check below
+        # (which runs its own SELECT against classification_answers) can see them in the
+        # same transaction. Without this, autoflush=False means the just-submitted answers
+        # are invisible to that query, so a "finalize" request submitted together with the
+        # final answer(s) would incorrectly think post-classification is still unanswered
+        # and skip marking the response completed - even though everything was saved.
+        self.db.flush()
+
         tasks_complete = (response.completed_tasks_count or 0) >= (response.total_tasks_assigned or 0)
         if (
             request.finalize_response

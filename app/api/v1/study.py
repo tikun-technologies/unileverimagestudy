@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, delete, and_
 from sqlalchemy.exc import IntegrityError
 
+from app.core.analytics_access import AnalyticsAccess, get_analytics_access, require_analytics_owner
 from app.core.dependencies import get_current_active_user
 from app.db.session import get_db
 from app.models.user_model import User
@@ -1282,12 +1283,14 @@ def _saved_design_to_out(design: StudySavedDesign) -> Dict[str, Any]:
 
 @router.post("/{study_id}/saved-designs", response_model=StudySavedDesignOut, status_code=status.HTTP_201_CREATED)
 def create_saved_design_endpoint(
-    study_id: UUID,
     payload: StudySavedDesignCreate,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
 ):
-    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    study_id = access.study.id
+    current_user = access.user
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
     normalized_name = _normalize_saved_design_name(payload.name)
     design_type = payload.design_type or "configurator"
@@ -1337,12 +1340,11 @@ def create_saved_design_endpoint(
 
 @router.get("/{study_id}/saved-designs", response_model=List[StudySavedDesignOut])
 def list_saved_designs_endpoint(
-    study_id: UUID,
+    access: AnalyticsAccess = Depends(get_analytics_access),
     design_type: str = Query("configurator", pattern="^(configurator|input)$"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
 ):
-    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    study_id = access.study.id
     designs = db.scalars(
         select(StudySavedDesign)
         .where(
@@ -1356,12 +1358,11 @@ def list_saved_designs_endpoint(
 
 @router.post("/{study_id}/saved-designs/compare", response_model=List[StudySavedDesignOut])
 def compare_saved_designs_endpoint(
-    study_id: UUID,
     payload: StudySavedDesignCompareRequest,
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
 ):
-    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    study_id = access.study.id
     unique_ids = list(dict.fromkeys(payload.design_ids))
     if len(unique_ids) < 2 or len(unique_ids) > 4:
         raise HTTPException(status_code=400, detail="Select between 2 and 4 designs to compare.")
@@ -1382,12 +1383,11 @@ def compare_saved_designs_endpoint(
 
 @router.delete("/{study_id}/saved-designs/{design_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_saved_design_endpoint(
-    study_id: UUID,
     design_id: UUID,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_active_user),
 ):
-    study_service.check_study_access(db=db, study_id=study_id, user_id=current_user.id)
+    study_id = access.study.id
     result = db.execute(
         delete(StudySavedDesign).where(
             StudySavedDesign.study_id == study_id,

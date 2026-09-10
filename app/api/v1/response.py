@@ -14,8 +14,15 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, text
 
 from app.core.cache import RedisCache, invalidate_study_cache
+from app.core.analytics_access import (
+    AnalyticsAccess,
+    analysis_viewer_email,
+    get_analytics_access,
+    require_analytics_owner,
+)
 from app.core.dependencies import get_current_active_user
 from app.core.domain import is_unilever_domain, FRAGRANCE_QUESTION_ID
+from app.services import analytics_share as share_service
 from app.db.session import get_db
 from app.models.user_model import User
 from app.models.study_model import Study, StudyMember, StudyActiveFilter
@@ -238,9 +245,12 @@ def _generate_study_analysis_json(
 def _load_study_dataframe_for_analysis(
     db: Session,
     study_id: UUID,
-    current_user: User,
+    current_user: Optional[User] = None,
+    *,
+    viewer_email: Optional[str] = None,
 ):
-    unilever_format = is_unilever_domain(current_user.email or "")
+    email = viewer_email if viewer_email is not None else (current_user.email if current_user else "")
+    unilever_format = is_unilever_domain(email or "")
     response_service = StudyResponseService(db)
     df = response_service.get_study_dataframe(
         study_id,
@@ -250,14 +260,46 @@ def _load_study_dataframe_for_analysis(
     return df, unilever_format
 
 
+def _session_filters_for_access(db: Session, access: AnalyticsAccess) -> Optional[Dict[str, Any]]:
+    if access.share:
+        filters = access.share.current_filters
+        return filters if filters_are_active(filters) else None
+    if not access.user:
+        return None
+    return get_active_filter(db, access.study.id, access.user.id)
+
+
+def _save_session_filters_for_access(
+    db: Session,
+    access: AnalyticsAccess,
+    filters_dict: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if access.share:
+        if filters_are_active(filters_dict):
+            return share_service.save_share_filters(db, access.share, filters_dict)
+        share_service.clear_share_filters(db, access.share)
+        return None
+    if not access.user:
+        return None
+    if filters_are_active(filters_dict):
+        return save_active_filter(db, access.study.id, access.user.id, filters_dict)
+    clear_active_filter(db, access.study.id, access.user.id)
+    return None
+
+
 def _build_analytics_session(
     db: Session,
-    study_obj: Study,
-    current_user: User,
+    access: AnalyticsAccess,
 ) -> Dict[str, Any]:
+    study_obj = access.study
     study_id = study_obj.id
-    active = get_active_filter(db, study_id, current_user.id)
-    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
+    active = _session_filters_for_access(db, access)
+    df, unilever_format = _load_study_dataframe_for_analysis(
+        db,
+        study_id,
+        access.user,
+        viewer_email=analysis_viewer_email(db, access),
+    )
     analysis = _generate_study_analysis_json(
         db,
         study_obj,
@@ -1503,12 +1545,15 @@ def export_study_flattened_csv(
 def _generate_study_excel_export_response(
     db: Session,
     study_obj: Study,
-    current_user: User,
+    current_user: Optional[User] = None,
     filters_dict: Optional[Dict[str, Any]] = None,
+    *,
+    viewer_email: Optional[str] = None,
 ) -> StreamingResponse:
     """Build the full Excel analysis report, optionally filtered to a respondent cohort."""
     study_id = study_obj.id
-    unilever_format = is_unilever_domain(current_user.email or "")
+    email = viewer_email if viewer_email is not None else (current_user.email if current_user else "")
+    unilever_format = is_unilever_domain(email or "")
     response_service = StudyResponseService(db)
     df = response_service.get_study_dataframe(
         study_id,
@@ -1552,37 +1597,37 @@ def _generate_study_excel_export_response(
 
 @router.get("/export/study/{study_id}/flattened-csv")
 def export_study_analysis(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """
     Export a comprehensive Excel report with regression analysis, segmentation, and clustering.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
-    return _generate_study_excel_export_response(db, study_obj, current_user)
+    return _generate_study_excel_export_response(
+        db,
+        access.study,
+        access.user,
+        viewer_email=analysis_viewer_email(db, access),
+    )
 
 
 @router.post("/export/study/{study_id}/flattened-csv")
 def export_study_analysis_filtered(
-    study_id: UUID,
     payload: FlattenedCsvExportPayload,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """
     Export the full Excel analysis report for a filtered respondent cohort.
     Uses the same filter logic as the analytics page.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
-    if not filters_are_active(filters_dict):
-        return _generate_study_excel_export_response(db, study_obj, current_user)
     return _generate_study_excel_export_response(
         db,
-        study_obj,
-        current_user,
-        filters_dict=filters_dict,
+        access.study,
+        access.user,
+        filters_dict=filters_dict if filters_are_active(filters_dict) else None,
+        viewer_email=analysis_viewer_email(db, access),
     )
 
 def _authorize_study_for_analysis(db: Session, study_id: UUID, current_user: User) -> Study:
@@ -1611,19 +1656,18 @@ def _authorize_study_for_analysis(db: Session, study_id: UUID, current_user: Use
 
 @router.get("/study/{study_id}/analysis-json")
 def export_study_analysis_json(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
     include_raw_data: bool = True,
 ):
     """
     Export a comprehensive JSON report with regression analysis, segmentation, and clustering.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
-    unilever_format = is_unilever_domain(current_user.email or "")
+    study_obj = access.study
+    unilever_format = is_unilever_domain(analysis_viewer_email(db, access))
     response_service = StudyResponseService(db)
     df = response_service.get_study_dataframe(
-        study_id,
+        study_obj.id,
         unilever_format=unilever_format,
         completed_only=True,
     )
@@ -1644,30 +1688,28 @@ def export_study_analysis_json(
 
 @router.get("/study/{study_id}/analysis-settings")
 def get_study_analysis_settings_endpoint(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """Return saved analysis settings for a study, or defaults if none saved."""
-    study_obj = _authorize_study_access(db, study_id, current_user.id)
-    return get_cached_analysis_settings_response(db, study_id, study=study_obj)
+    return get_cached_analysis_settings_response(db, access.study.id, study=access.study)
 
 
 @router.put("/study/{study_id}/analysis-settings")
 def save_study_analysis_settings_endpoint(
-    study_id: UUID,
     payload: StudyAnalysisSettingsPayload,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(require_analytics_owner),
     db: Session = Depends(get_db),
 ):
     """Save analysis settings for a study (rating mappings + intercept mode)."""
-    study_obj = _authorize_study_access(db, study_id, current_user.id)
+    study_obj = access.study
+    study_id = study_obj.id
     settings_dict = payload.model_dump()
     save_study_analysis_settings(
         db,
         study_id,
         settings_dict,
-        current_user.id,
+        access.user.id,
         study=study_obj,
     )
     response = build_analysis_settings_response(db, study_id, study=study_obj)
@@ -1677,17 +1719,15 @@ def save_study_analysis_settings_endpoint(
 
 @router.get("/study/{study_id}/analytics-session")
 def get_study_analytics_session(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """
     Single bootstrap call for the analytics page: returns the user's saved
     active filter (if any) and freshly computed optimized analysis JSON.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
     try:
-        return _build_analytics_session(db, study_obj, current_user)
+        return _build_analytics_session(db, access)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -1699,50 +1739,55 @@ def get_study_analytics_session(
 
 @router.get("/study/{study_id}/active-filter")
 def get_study_active_filter(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
-    """Return the persisted active filter for this user on the study (Redis-backed)."""
-    _authorize_study_for_analysis(db, study_id, current_user)
-    active = get_active_filter(db, study_id, current_user.id)
-    row = (
-        db.query(StudyActiveFilter)
-        .filter(
-            StudyActiveFilter.study_id == study_id,
-            StudyActiveFilter.user_id == current_user.id,
+    """Return the persisted active filter for this user or shared dashboard."""
+    study_id = access.study.id
+    active = _session_filters_for_access(db, access)
+    updated_at = None
+    if access.share:
+        updated_at = access.share.updated_at.isoformat() if access.share.updated_at else None
+    elif access.user:
+        row = (
+            db.query(StudyActiveFilter)
+            .filter(
+                StudyActiveFilter.study_id == study_id,
+                StudyActiveFilter.user_id == access.user.id,
+            )
+            .first()
         )
-        .first()
-    )
+        updated_at = row.updated_at.isoformat() if row and row.updated_at else None
     return {
         "study_id": str(study_id),
         "filters": active,
         "has_active_filter": filters_are_active(active),
-        "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+        "updated_at": updated_at,
     }
 
 
 @router.post("/study/{study_id}/active-filter")
 def save_study_active_filter(
-    study_id: UUID,
     payload: ActiveFilterPayload,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """
-    Save the user's active analytics filter and return filtered analysis JSON.
+    Save the active analytics filter and return filtered analysis JSON.
     Empty filters clears the active filter and returns full-study analysis.
+    Share viewers persist filters on the share row, not the owner's filter.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    study_obj = access.study
+    study_id = study_obj.id
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    saved = _save_session_filters_for_access(db, access, filters_dict)
 
-    if filters_are_active(filters_dict):
-        saved = save_active_filter(db, study_id, current_user.id, filters_dict)
-    else:
-        clear_active_filter(db, study_id, current_user.id)
-        saved = None
-
-    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(
+        db,
+        study_id,
+        access.user,
+        viewer_email=analysis_viewer_email(db, access),
+    )
     try:
         analysis = _generate_study_analysis_json(
             db,
@@ -1760,34 +1805,44 @@ def save_study_active_filter(
             detail=f"Failed to generate analysis for active filter: {str(e)}",
         )
 
-    row = (
-        db.query(StudyActiveFilter)
-        .filter(
-            StudyActiveFilter.study_id == study_id,
-            StudyActiveFilter.user_id == current_user.id,
+    updated_at = None
+    if access.share:
+        updated_at = access.share.updated_at.isoformat() if access.share.updated_at else None
+    elif access.user:
+        row = (
+            db.query(StudyActiveFilter)
+            .filter(
+                StudyActiveFilter.study_id == study_id,
+                StudyActiveFilter.user_id == access.user.id,
+            )
+            .first()
         )
-        .first()
-    )
+        updated_at = row.updated_at.isoformat() if row and row.updated_at else None
     return {
         "study_id": str(study_id),
         "filters": saved,
         "has_active_filter": filters_are_active(saved),
-        "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+        "updated_at": updated_at,
         "analysis": analysis,
     }
 
 
 @router.delete("/study/{study_id}/active-filter")
 def reset_study_active_filter(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """Clear saved active filter and return full-study optimized analysis."""
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
-    clear_active_filter(db, study_id, current_user.id)
+    study_obj = access.study
+    study_id = study_obj.id
+    _save_session_filters_for_access(db, access, None)
 
-    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(
+        db,
+        study_id,
+        access.user,
+        viewer_email=analysis_viewer_email(db, access),
+    )
     try:
         analysis = _generate_study_analysis_json(
             db,
@@ -1816,8 +1871,7 @@ def reset_study_active_filter(
 
 @router.get("/study/{study_id}/optimized-analysis-json")
 def export_study_optimized_analysis_json(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db)
 ):
     """
@@ -1825,8 +1879,7 @@ def export_study_optimized_analysis_json(
     Raw-derived overview widgets read the compact dashboard_summary instead.
     """
     return export_study_analysis_json(
-        study_id=study_id,
-        current_user=current_user,
+        access=access,
         db=db,
         include_raw_data=False,
     )
@@ -1834,9 +1887,8 @@ def export_study_optimized_analysis_json(
 
 @router.post("/study/{study_id}/optimized-analysis-json")
 def post_study_optimized_analysis_json(
-    study_id: UUID,
     payload: OptimizedAnalysisPayload,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """
@@ -1844,16 +1896,18 @@ def post_study_optimized_analysis_json(
     and classification question answers. Returns the same shape as GET
     optimized-analysis-json, with filters_applied / filter_meta when filtered.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    study_obj = access.study
+    study_id = study_obj.id
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
     has_filters = filters_are_active(filters_dict)
+    _save_session_filters_for_access(db, access, filters_dict if has_filters else None)
 
-    if has_filters:
-        save_active_filter(db, study_id, current_user.id, filters_dict)
-    else:
-        clear_active_filter(db, study_id, current_user.id)
-
-    df, unilever_format = _load_study_dataframe_for_analysis(db, study_id, current_user)
+    df, unilever_format = _load_study_dataframe_for_analysis(
+        db,
+        study_id,
+        access.user,
+        viewer_email=analysis_viewer_email(db, access),
+    )
 
     try:
         json_report = _generate_study_analysis_json(
@@ -1872,12 +1926,12 @@ def post_study_optimized_analysis_json(
             detail=f"Failed to generate filtered analysis JSON: {str(e)}",
         )
 
-    if has_filters and payload.save_to_history:
+    if has_filters and payload.save_to_history and access.user:
         try:
             from app.models.study_model import StudyFilterHistory
             record = StudyFilterHistory(
                 study_id=study_id,
-                user_id=current_user.id,
+                user_id=access.user.id,
                 filters=filters_dict or {},
                 name=payload.name[:255] if payload.name else None,
             )
@@ -1891,16 +1945,16 @@ def post_study_optimized_analysis_json(
 
 @router.post("/study/{study_id}/classification-cohort", response_model=ClassificationCohortResponse)
 def get_classification_cohort(
-    study_id: UUID,
     payload: ClassificationCohortPayload,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
     """
     Drill-down endpoint for Prelim option clicks.
     Returns only respondent-level classification profiles for the selected cohort.
     """
-    study_obj = _authorize_study_for_analysis(db, study_id, current_user)
+    study_obj = access.study
+    study_id = study_obj.id
     analysis_service = StudyAnalysisService()
     raw_filters = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
     normalized_filters = _normalize_cohort_filters(raw_filters, analysis_service)
@@ -2102,31 +2156,29 @@ def get_classification_cohort(
 
 @router.get("/study/{study_id}/saved-reports", response_model=List[SavedFilterReportOut])
 def get_study_saved_reports(
-    study_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(get_analytics_access),
     db: Session = Depends(get_db),
 ):
-    """List named saved filter reports for this study (current user). Redis-backed."""
-    _authorize_study_for_analysis(db, study_id, current_user)
-    return list_saved_reports(db, study_id, current_user.id)
+    """List named saved filter reports. Share viewers see the study owner's reports."""
+    study_id = access.study.id
+    report_user_id = access.user.id if access.user else access.study.creator_id
+    return list_saved_reports(db, study_id, report_user_id)
 
 
 @router.post("/study/{study_id}/saved-reports", response_model=SavedFilterReportOut)
 def create_study_saved_report(
-    study_id: UUID,
     payload: SavedFilterReportCreate,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(require_analytics_owner),
     db: Session = Depends(get_db),
 ):
     """Save a named filter report. Returns 409 if the same filters are already saved."""
-    _authorize_study_for_analysis(db, study_id, current_user)
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else {}
     if not filters_are_active(filters_dict):
         raise HTTPException(status_code=400, detail="Select at least one filter before saving a report.")
     return create_saved_report(
         db,
-        study_id,
-        current_user.id,
+        access.study.id,
+        access.user.id,
         payload.name,
         filters_dict,
     )
@@ -2134,18 +2186,16 @@ def create_study_saved_report(
 
 @router.put("/study/{study_id}/saved-reports/{report_id}", response_model=SavedFilterReportOut)
 def rename_study_saved_report(
-    study_id: UUID,
     report_id: UUID,
     payload: SavedFilterReportUpdate,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(require_analytics_owner),
     db: Session = Depends(get_db),
 ):
     """Rename a saved filter report."""
-    _authorize_study_for_analysis(db, study_id, current_user)
     return update_saved_report_name(
         db,
-        study_id,
-        current_user.id,
+        access.study.id,
+        access.user.id,
         report_id,
         payload.name,
     )
@@ -2153,14 +2203,12 @@ def rename_study_saved_report(
 
 @router.delete("/study/{study_id}/saved-reports/{report_id}")
 def delete_study_saved_report(
-    study_id: UUID,
     report_id: UUID,
-    current_user: User = Depends(get_current_active_user),
+    access: AnalyticsAccess = Depends(require_analytics_owner),
     db: Session = Depends(get_db),
 ):
     """Delete a saved filter report."""
-    _authorize_study_for_analysis(db, study_id, current_user)
-    delete_saved_report(db, study_id, current_user.id, report_id)
+    delete_saved_report(db, access.study.id, access.user.id, report_id)
     return {"ok": True, "id": str(report_id)}
 
 

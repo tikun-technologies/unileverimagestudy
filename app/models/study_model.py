@@ -86,6 +86,7 @@ class Study(Base):
     active_filters = relationship("StudyActiveFilter", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     analysis_settings = relationship("StudyAnalysisSettings", back_populates="study", cascade="all, delete-orphan", lazy="noload", uselist=False)
     saved_designs = relationship("StudySavedDesign", back_populates="study", cascade="all, delete-orphan", lazy="noload")
+    analytics_shares = relationship("StudyAnalyticsShare", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     task_assignments = relationship("StudyTaskAssignment", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     assistant_conversations = relationship(
         "AssistantConversation",
@@ -402,4 +403,35 @@ class StudySavedDesign(Base):
         Index('idx_study_saved_designs_study_created', 'study_id', 'created_at'),
         Index('idx_study_saved_designs_study_type_created', 'study_id', 'design_type', 'created_at'),
         Index('idx_study_saved_designs_study_updated', 'study_id', 'updated_at'),
+    )
+
+
+class StudyAnalyticsShare(Base):
+    """
+    Live analytics dashboard share link (distinct from Study.share_token / survey participate).
+    One active (unrevoked) row per study. Re-sharing after revoke mints a new token.
+    """
+    __tablename__ = "study_analytics_shares"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    study_id = Column(UUID(as_uuid=True), ForeignKey("studies.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    token = Column(String(255), nullable=False, unique=True, index=True)
+    current_filters = Column(JSONB, nullable=True)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    study = relationship("Study", back_populates="analytics_shares", lazy="noload")
+    created_by = relationship("User", lazy="noload")
+
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_study_analytics_shares_token"),
+        Index("idx_study_analytics_shares_study_revoked", "study_id", "revoked_at"),
+        Index(
+            "uq_study_analytics_shares_active_study",
+            "study_id",
+            unique=True,
+            postgresql_where=expression.text("revoked_at IS NULL"),
+        ),
     )

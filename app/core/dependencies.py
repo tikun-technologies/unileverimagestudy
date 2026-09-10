@@ -10,6 +10,7 @@ from app.services.user import get_user_by_id
 
 # Security scheme
 security = HTTPBearer()
+optional_security = HTTPBearer(auto_error=False)
 
 
 def get_current_user(
@@ -74,8 +75,37 @@ def get_current_verified_user(current_user = Depends(get_current_active_user)):
     return current_user
 
 
+def get_optional_current_active_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
+    db: Session = Depends(get_db),
+):
+    """Return the active user when a Bearer token is present; otherwise None."""
+    if not credentials:
+        return None
+
+    try:
+        token = credentials.credentials
+        payload = verify_token(token, "access")
+        if payload is None:
+            return None
+
+        user_id_str = payload.get("sub")
+        if user_id_str is None:
+            return None
+
+        try:
+            user_id = uuid.UUID(user_id_str)
+        except ValueError:
+            return None
+
+        user = get_user_by_id(db, user_id)
+        return user if user and user.is_active else None
+    except Exception:
+        return None
+
+
 def get_optional_current_user(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
     db: Session = Depends(get_db)
 ):
     """Get current user if token is provided, otherwise return None"""
