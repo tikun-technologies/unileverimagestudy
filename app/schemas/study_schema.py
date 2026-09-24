@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List, Optional, Dict, Any, Literal
 from uuid import UUID
 from datetime import datetime
-from pydantic import BaseModel, Field, ConfigDict, field_validator, AliasChoices
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator, AliasChoices
 from typing import Any, Dict, Optional
 
 StudyType = Literal['grid', 'layer', 'text', 'hybrid']
@@ -318,6 +318,69 @@ class StudySavedDesignOut(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class DesignCategoryItemOut(BaseModel):
+    id: UUID
+    saved_design_id: UUID
+    name: str
+    design_type: SavedDesignType
+    metric: str
+    segment_label: Optional[str] = None
+    selection_count: int
+    total_coefficient: Optional[float] = None
+    position: int
+
+
+class DesignCategoryOut(BaseModel):
+    id: UUID
+    study_id: UUID
+    name: str
+    position: int
+    created_at: datetime
+    updated_at: datetime
+    items: List[DesignCategoryItemOut] = Field(default_factory=list)
+
+
+class DesignCategoryAssignRequest(BaseModel):
+    category_id: Optional[UUID] = None
+    category_name: Optional[str] = Field(None, max_length=80)
+    saved_design_ids: List[UUID] = Field(default_factory=list, max_length=100)
+    design: Optional[StudySavedDesignCreate] = None
+
+    @field_validator("category_name")
+    @classmethod
+    def normalize_category_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        name = " ".join(value.strip().split())
+        return name or None
+
+    @model_validator(mode="after")
+    def require_category_and_designs(self):
+        if self.category_id is None and not self.category_name:
+            raise ValueError("Choose a category or enter a new category name")
+        if not self.saved_design_ids and self.design is None:
+            raise ValueError("Select at least one combination")
+        return self
+
+
+class DesignCategoryAssignResult(BaseModel):
+    category: DesignCategoryOut
+    created_design: Optional[StudySavedDesignOut] = None
+
+
+class DesignCategoryRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        name = " ".join(value.strip().split())
+        if not name:
+            raise ValueError("Category name is required")
+        return name
+
 
 # ---------- Read models ----------
 

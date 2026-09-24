@@ -12,11 +12,11 @@ bounded tool-calling loop:
    composite questions ("which element should I show the client, and does it
    hold for women?") resolve into multiple verified lookups.
 3. It writes the final answer through the `respond` tool, restricted to numbers
-   that appear in those tool results — every number is validated before the
-   answer leaves this module.
+   that appear in those tool results or in the T Combined table — every number
+   is validated before the answer leaves this module.
 
-All numbers still come from the existing deterministic tools. The model chooses
-what to look up and how to phrase the answer; it never produces a figure.
+The model chooses what to look up and how to phrase the answer. It must not
+invent a figure that is missing from both the tools and Combined.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -53,6 +53,7 @@ from app.services.assistant_tools import (
     extract_gender_from_text,
     resolve_age_segment_key,
 )
+from app.services.assistant_combined import combined_prompt_json, compact_combined, query_combined
 from app.services.design_optimizer import (
     build_categories_from_analysis,
     metric_prefix,
@@ -82,6 +83,28 @@ _NAME_TRUNCATE = 70
 def _short(value: Any, limit: int = _NAME_TRUNCATE) -> str:
     text = " ".join(str(value or "").split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _format_answer_text(raw: Any) -> str:
+    """Keep list line-breaks so the chat can render markdown, not one blob."""
+    text = str(raw or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+    if "\n" not in text.strip():
+        text = re.sub(r"\s+(?=\d{1,2}\.\s)", "\n", text)
+        text = re.sub(r"\s+(?=[-*]\s+\S)", "\n", text)
+    lines = [" ".join(line.split()) for line in text.split("\n")]
+    cleaned: List[str] = []
+    blank = False
+    for line in lines:
+        if not line:
+            if cleaned and not blank:
+                cleaned.append("")
+                blank = True
+            continue
+        cleaned.append(line)
+        blank = False
+    return "\n".join(cleaned).strip()
 
 
 def build_study_dictionary(study_obj: Study, analysis: Dict[str, Any]) -> Dict[str, Any]:
@@ -125,6 +148,7 @@ def build_study_dictionary(study_obj: Study, analysis: Dict[str, Any]) -> Dict[s
         )
 
     study_type = str(study_obj.study_type or "grid").lower()
+    combined = compact_combined(analysis, "T")
     return {
         "study_title": _short(study_obj.title, 120),
         "study_type": study_type,
@@ -143,6 +167,19 @@ def build_study_dictionary(study_obj: Study, analysis: Dict[str, Any]) -> Dict[s
         "categories": categories,
         "segments": segment_keys,
         "classification_questions": classification,
+        "combined_sheet": combined.get("sheet") or "(T) Combined",
+        "combined_columns": [c.get("label") for c in (combined.get("columns") or [])],
+        "combined_column_families": {
+            "overall": any(c.get("key") == "Overall" for c in (combined.get("columns") or [])),
+            "gender": [c.get("label") for c in (combined.get("columns") or []) if str(c.get("key") or "").startswith("Gender::")],
+            "age": [c.get("label") for c in (combined.get("columns") or []) if str(c.get("key") or "").startswith("Age::")],
+            "classification": [
+                c.get("label")
+                for c in (combined.get("columns") or [])
+                if str(c.get("key") or "").startswith("Classification::")
+            ],
+        },
+        "combined_source": combined.get("source"),
     }
 
 
@@ -316,6 +353,38 @@ DATA_TOOLS: List[Dict[str, Any]] = [
         "export, or download a PPT, PowerPoint, presentation, deck, or slides.",
         {},
     ),
+    _fn(
+        "query_combined",
+        "Query the verified Combined coefficient table — the same sheet as Excel "
+        "export (T)/(B)/(R) Combined. Use whenever rank/compare tools do not fit: "
+        "unusual questions, any Combined column (gender, age, classification), "
+        "'best segment', named-element lookups, or stacking a pack from codes. "
+        "Never invent a number that is not in the Combined result.",
+        {
+            "op": {
+                "type": "string",
+                "enum": ["rank", "lookup", "compare_columns", "best_segment", "compose_design"],
+                "description": "rank=top/bottom on one column; lookup=named elements; "
+                "compare_columns=two Combined columns; best_segment=strongest "
+                "Combined column; compose_design=stack element codes into a pack.",
+            },
+            "metric": _METRIC_PROP,
+            "column": {
+                "type": "string",
+                "description": "Combined column such as Overall, Male, Female, 25-34, "
+                "or a classification answer label.",
+            },
+            "left": {"type": "string", "description": "Left column for compare_columns."},
+            "right": {"type": "string", "description": "Right column for compare_columns."},
+            "direction": {"type": "string", "enum": _DIRECTION_ENUM},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "elements": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Element codes or names from the study dictionary / Combined.",
+            },
+        },
+    ),
 ]
 
 RESPOND_TOOL = _fn(
@@ -324,9 +393,12 @@ RESPOND_TOOL = _fn(
     {
         "answer": {
             "type": "string",
-            "description": "The answer, written directly to the user. Lead with the "
-                           "answer itself. Cite fact ids in square brackets like [E1] "
-                           "for each number. Every number must appear in a tool result.",
+            "description": "Markdown answer for the user. Lead with the answer itself. "
+                           "Bold element codes/names with **like this**. Put ranked items "
+                           "on their own lines as 1. 2. 3. or - bullets. Use a blank line "
+                           "between the intro, the list, and the why. Cite fact ids in "
+                           "square brackets like [E1] for each number. Every number must "
+                           "appear in a tool result.",
         },
         "follow_up_questions": {
             "type": "array",
@@ -365,6 +437,7 @@ _TOOL_TO_ASSISTANT_NAME = {
     "explain_design": AssistantToolName.explain_design,
     "list_saved_designs": AssistantToolName.list_saved_designs,
     "generate_ppt": AssistantToolName.generate_ppt,
+    "query_combined": AssistantToolName.query_combined,
 }
 
 
@@ -379,11 +452,18 @@ these answers to clients.
 HOW YOU WORK
 - Call tools to get facts, then call `respond` to answer. Never answer a data
   question from memory — you have no numbers of your own.
+- Prefer the specialised tools (rank_elements, rank_designs, compare_two,
+  classification_counts, …) when they fit. If they do not fit the question,
+  call `query_combined` on the Combined table instead of refusing.
 - You may call several tools before responding. Do that whenever the question
   needs more than one lookup (two segments, a value plus its context, a ranking
   plus a specific element).
-- The study dictionary below lists the real categories, element codes, segment
-  keys and classification options. Only ever pass values that appear there.
+- The study dictionary lists real categories, element codes, segment keys and
+  classification options. Combined columns are listed too. Only pass values
+  that appear there.
+- T Combined is the Excel/CSV sheet '(T) Combined': Overall, Gender, Age,
+  and every classification question/answer in one grid. Use query_combined
+  against those columns. Do not use the Overall-only sheet.
 
 ANSWER THE QUESTION THAT WAS ASKED
 - Lead with the direct answer in the first sentence. If asked which element to
@@ -392,8 +472,12 @@ ANSWER THE QUESTION THAT WAS ASKED
 - Then give the supporting numbers, each with its fact id in brackets: [E1].
 - Add the caveat only when it changes the decision — a small base size, a score
   below the significance threshold, a gap too narrow to matter.
-- Be specific and brief: 2-5 sentences for a simple question. No headers, no
-  bullet lists unless you are genuinely listing ranked items.
+- Format for a chat card: short intro, then a numbered or bullet list when you
+  are ranking or naming several items, then 1-2 sentences of why. Bold element
+  codes and names with **B16 — Visit Our Booth**. Never squash a list onto one
+  line. Do not use headings or tables.
+- For image or layer studies, name element codes so the product can render the
+  real images / stacked pack. Do not describe pixels.
 
 NUMBERS
 - Every number in your answer must come from a tool result, verbatim. You may
@@ -413,13 +497,20 @@ AMBIGUITY — ANSWER, DO NOT INTERROGATE
   means 5. An explicit count always wins.
 - If a tool reports it needs clarification, do not pass that back. Re-read the
   study dictionary, pick the closest real value, and call the tool again.
+- "Best segment" means the Combined column whose top coefficient is strongest
+  (query_combined op=best_segment), not a hardcoded phrase.
+- "Top N segments" / "different segments" means query_combined op=best_segment
+  with that limit across Combined columns (gender, age, classification),
+  not Age-only compare_segments.
 
-OFF-TOPIC
-- For anything outside this study's data, say plainly that you only cover this
-  study's analytics, name two things you can answer, and set data_backed false.
-- For greetings, greet briefly and suggest two questions. No tools needed.
+OUTSIDE THE TABLE
+- Greetings: greet briefly and suggest two questions. No tools needed.
 - For PowerPoint / PPT / presentation / deck requests, call `generate_ppt` then
-  `respond`. Tell the user the deck is ready and to use Download PowerPoint."""
+  `respond`. Tell the user the deck is ready and to use Download PowerPoint.
+- If the question is not in Combined or the tools (weather, news, unrelated),
+  say you only analyse this study, then still answer from Combined with the
+  closest useful finding and set data_backed false for the off-topic part.
+- Never reply that a study-analytics question is unsupported. Use query_combined."""
 
 
 # --------------------------------------------------------------------------- #
@@ -660,6 +751,17 @@ def _execute_agent_tool(
             ),
             plan,
         )
+    if name == "query_combined":
+        plan = _plan_for(
+            AssistantToolName.query_combined,
+            metric=metric,
+            direction=_direction(args),
+            limit=_limit(args),
+            section=section,
+            key=key,
+            must_include=_str_list(args.get("elements")),
+        )
+        return query_combined(analysis, study_obj, args), plan
     if name == "segment_base_sizes":
         requested_section = str(args.get("segment_section") or "Gender")
         plan = _plan_for(AssistantToolName.study_overview, metric=metric)
@@ -792,6 +894,19 @@ def _compact_result(result: Dict[str, Any]) -> Dict[str, Any]:
                 )
             if designs:
                 compact["designs"] = designs
+        elif btype == "top_bottom_elements":
+            items = [
+                {
+                    "rank": item.get("rank"),
+                    "name": _short(item.get("name"), 50),
+                    "code": item.get("code"),
+                    "value": item.get("value"),
+                    "fact_id": item.get("fact_id"),
+                }
+                for item in (data.get("items") or [])[:_MAX_FACTS_PER_TOOL]
+            ]
+            if items:
+                compact["elements"] = items
         elif btype == "classification_distribution":
             options = [
                 {"option": _short(o.get("option"), 90), "count": o.get("count"),
@@ -849,6 +964,8 @@ def _namespace_fact_ids(payload: Any, prefix: str) -> Any:
 # --------------------------------------------------------------------------- #
 
 _NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+# Age bins and similar labels ("45-54", "18–24") are not scores.
+_RANGE_LABEL_RE = re.compile(r"\b\d{1,3}\s*[-–—]\s*\d{1,3}\b")
 _MAX_GROUNDING_VALUES = 80
 
 
@@ -889,15 +1006,61 @@ def _collect_numbers(payload: Any, verbatim: List[float], measured: List[float])
             _collect_numbers(value, verbatim, measured)
 
 
-def _grounding_values(compacted: Iterable[Dict[str, Any]], question: str) -> List[float]:
+def _combined_verbatim_numbers(table: Optional[Dict[str, Any]]) -> List[float]:
+    """Scores from T Combined. Quotable, but not used to derive gaps."""
+    verbatim: List[float] = []
+    if not isinstance(table, dict):
+        return verbatim
+
+    def add(value: Any) -> None:
+        if isinstance(value, bool) or value is None:
+            return
+        if isinstance(value, (int, float)):
+            verbatim.append(float(value))
+            return
+        if isinstance(value, str):
+            for match in _NUMBER_RE.findall(value):
+                try:
+                    verbatim.append(float(match))
+                except ValueError:
+                    continue
+
+    add(table.get("threshold"))
+    add(table.get("base_size"))
+    for col in table.get("columns") or []:
+        if not isinstance(col, dict):
+            add(col)
+            continue
+        add(col.get("key"))
+        add(col.get("label"))
+        add(col.get("base_size"))
+    for el in table.get("elements") or []:
+        if not isinstance(el, dict):
+            continue
+        add(el.get("code"))
+        add(el.get("name"))
+        for val in (el.get("values") or {}).values():
+            add(val)
+    return verbatim
+
+
+def _grounding_values(
+    compacted: Iterable[Dict[str, Any]],
+    question: str,
+    combined: Optional[Dict[str, Any]] = None,
+) -> List[float]:
     """
     Every number the answer is allowed to state, plus legitimate derivations.
 
-    Only absolute gaps are derived. Ratios and percentages are deliberately not:
-    deriving them makes the allowed set dense enough to admit almost any
-    invented figure, which is exactly what this check exists to catch. The
-    system prompt tells the model not to compute them, and any percentage that
-    genuinely belongs to the data is already in the payload verbatim.
+    Combined scores are verbatim only. Pairwise diffs across the whole sheet
+    would make almost any invented figure look grounded.
+
+    Only absolute gaps are derived from tool measurements. Ratios and
+    percentages are deliberately not: deriving them makes the allowed set
+    dense enough to admit almost any invented figure, which is exactly what
+    this check exists to catch. The system prompt tells the model not to
+    compute them, and any percentage that genuinely belongs to the data is
+    already in the payload verbatim.
     """
     verbatim: List[float] = []
     measured: List[float] = []
@@ -912,7 +1075,12 @@ def _grounding_values(compacted: Iterable[Dict[str, Any]], question: str) -> Lis
     small_ordinals = {float(n) for n in range(0, 21)}
 
     measurements = sorted({round(v, 4) for v in measured})
-    allowed = {round(v, 4) for v in verbatim} | set(measurements) | small_ordinals
+    allowed = (
+        {round(v, 4) for v in verbatim}
+        | set(measurements)
+        | small_ordinals
+        | {round(v, 4) for v in _combined_verbatim_numbers(combined)}
+    )
     # A stated gap between two measured numbers is a legitimate answer.
     for i, left in enumerate(measurements):
         for right in measurements[i + 1:]:
@@ -925,6 +1093,8 @@ def _numbers_are_grounded(answer: str, allowed: Sequence[float]) -> Tuple[bool, 
         return True, None
     # Ignore bracketed fact citations like [E1] / [1.C3].
     stripped = re.sub(r"\[[^\]]*\]", " ", answer)
+    # "45-54" is an age label, not the scores 45 and 54.
+    stripped = _RANGE_LABEL_RE.sub(" ", stripped)
     for token in _NUMBER_RE.findall(stripped):
         try:
             value = float(token)
@@ -992,6 +1162,380 @@ def _openai_client():
     return build_client()
 
 
+def _is_reasoning_model(model: str) -> bool:
+    name = (model or "").lower()
+    return any(token in name for token in ("gpt-5", "o1", "o3", "o4", "luna", "terra", "sol"))
+
+
+def _emit(on_event: Optional[Callable[[str, Any], None]], kind: str, payload: Any) -> None:
+    if not on_event:
+        return
+    try:
+        on_event(kind, payload)
+    except Exception:
+        logger.debug("Assistant stream callback failed", exc_info=True)
+
+
+def _chat_create(
+    client: Any,
+    *,
+    on_event: Optional[Callable[[str, Any], None]] = None,
+    **kwargs: Any,
+):
+    """
+    Luna-safe completion.
+
+    gpt-5.6-luna cannot mix function tools + reasoning_effort on
+    /v1/chat/completions. Tool calls go through /v1/responses so thinking
+    still works. Fake test clients without ``responses`` fall back to
+    chat.completions with reasoning_effort=none.
+    """
+    model = str(kwargs.get("model") or "")
+    payload = dict(kwargs)
+    tools = payload.get("tools")
+    can_responses = bool(tools) and _is_reasoning_model(model) and hasattr(client, "responses")
+    if can_responses:
+        try:
+            return _responses_create(client, payload, on_event)
+        except Exception as exc:
+            logger.warning("Responses API failed, using chat.completions without reasoning: %s", exc)
+
+    if _is_reasoning_model(model):
+        payload.pop("temperature", None)
+        if "max_tokens" in payload:
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
+        # Chat Completions + tools: reasoning is not allowed for Luna.
+        if tools:
+            payload["reasoning_effort"] = "none"
+        else:
+            payload.setdefault(
+                "reasoning_effort", getattr(settings, "ASSISTANT_REASONING_EFFORT", "medium")
+            )
+
+    if on_event:
+        try:
+            return _stream_chat_completion(client, payload, on_event)
+        except TypeError:
+            payload.pop("reasoning_effort", None)
+            try:
+                return _stream_chat_completion(client, payload, on_event)
+            except TypeError:
+                if "max_completion_tokens" in payload:
+                    payload["max_tokens"] = payload.pop("max_completion_tokens")
+                return _stream_chat_completion(client, payload, on_event)
+        except Exception as exc:
+            logger.debug("Streaming completion failed, retrying without stream: %s", exc)
+
+    try:
+        return client.chat.completions.create(**payload)
+    except TypeError:
+        payload.pop("reasoning_effort", None)
+        if "max_completion_tokens" in payload:
+            payload["max_tokens"] = payload.pop("max_completion_tokens")
+        try:
+            return client.chat.completions.create(**payload)
+        except TypeError:
+            payload.pop("max_tokens", None)
+            return client.chat.completions.create(**payload)
+
+
+def _to_responses_tools(tools: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for tool in tools or []:
+        fn = (tool or {}).get("function") if isinstance(tool, dict) else None
+        if isinstance(fn, dict) and fn.get("name"):
+            out.append(
+                {
+                    "type": "function",
+                    "name": fn["name"],
+                    "description": fn.get("description") or "",
+                    "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                }
+            )
+        elif isinstance(tool, dict):
+            out.append(tool)
+    return out
+
+
+def _to_responses_tool_choice(tool_choice: Any) -> Any:
+    if tool_choice in (None, "auto"):
+        return "auto"
+    if isinstance(tool_choice, dict):
+        name = (tool_choice.get("function") or {}).get("name") or tool_choice.get("name")
+        if name:
+            return {"type": "function", "name": name}
+    return "auto"
+
+
+def _to_responses_input(messages: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    instructions = None
+    items: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        role = msg.get("role")
+        if role == "system" and instructions is None:
+            instructions = msg.get("content")
+            continue
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": msg.get("tool_call_id") or "",
+                    "output": msg.get("content") or "",
+                }
+            )
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": tc.get("id") or "",
+                        "name": fn.get("name") or "",
+                        "arguments": fn.get("arguments") or "{}",
+                    }
+                )
+            if msg.get("content"):
+                items.append({"role": "assistant", "content": msg.get("content")})
+            continue
+        items.append(
+            {
+                "role": "user" if role == "user" else "assistant",
+                "content": msg.get("content") or "",
+            }
+        )
+    return instructions, items
+
+
+def _usage_from_responses(usage: Any) -> Any:
+    prompt = getattr(usage, "input_tokens", None)
+    if prompt is None:
+        prompt = getattr(usage, "prompt_tokens", 0) or 0
+    completion = getattr(usage, "output_tokens", None)
+    if completion is None:
+        completion = getattr(usage, "completion_tokens", 0) or 0
+    return type("Usage", (), {"prompt_tokens": prompt or 0, "completion_tokens": completion or 0})()
+
+
+def _wrap_chat_response(content: Optional[str], tool_calls: List[Any], usage: Any):
+    message = type("Msg", (), {"content": content or None, "tool_calls": tool_calls or None})()
+    return type("Resp", (), {
+        "choices": [type("Ch", (), {"message": message})()],
+        "usage": usage or type("Usage", (), {"prompt_tokens": 0, "completion_tokens": 0})(),
+    })()
+
+
+def _tool_calls_from_responses_output(output: Any) -> Tuple[Optional[str], List[Any]]:
+    content_parts: List[str] = []
+    tool_calls: List[Any] = []
+    for item in output or []:
+        item_type = getattr(item, "type", None) or (item.get("type") if isinstance(item, dict) else None)
+        if item_type == "function_call":
+            name = getattr(item, "name", None) or (item.get("name") if isinstance(item, dict) else "")
+            arguments = getattr(item, "arguments", None) or (item.get("arguments") if isinstance(item, dict) else "{}")
+            call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or (
+                item.get("call_id") if isinstance(item, dict) else ""
+            )
+            tool_calls.append(
+                type("ToolCall", (), {
+                    "id": call_id or f"call_{len(tool_calls)}",
+                    "type": "function",
+                    "function": type("Fn", (), {"name": name or "", "arguments": arguments or "{}"})(),
+                })()
+            )
+            continue
+        if item_type == "message":
+            parts = getattr(item, "content", None)
+            if parts is None and isinstance(item, dict):
+                parts = item.get("content")
+            if isinstance(parts, str) and parts:
+                content_parts.append(parts)
+            elif isinstance(parts, list):
+                for part in parts:
+                    text = getattr(part, "text", None) or (part.get("text") if isinstance(part, dict) else None)
+                    if text:
+                        content_parts.append(text)
+    return ("".join(content_parts) or None), tool_calls
+
+
+def _responses_create(client: Any, payload: Dict[str, Any], on_event: Optional[Callable[[str, Any], None]]):
+    instructions, input_items = _to_responses_input(list(payload.get("messages") or []))
+    effort = str(getattr(settings, "ASSISTANT_REASONING_EFFORT", "medium") or "medium")
+    kwargs: Dict[str, Any] = {
+        "model": payload.get("model"),
+        "input": input_items,
+        "tools": _to_responses_tools(payload.get("tools")),
+        "tool_choice": _to_responses_tool_choice(payload.get("tool_choice")),
+        "reasoning": {"effort": effort, "summary": "auto"},
+    }
+    if instructions:
+        kwargs["instructions"] = instructions
+    max_out = payload.get("max_completion_tokens") or payload.get("max_tokens")
+    if max_out:
+        kwargs["max_output_tokens"] = max_out
+    timeout = payload.get("timeout")
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+
+    if on_event:
+        try:
+            return _stream_responses(client, kwargs, on_event)
+        except TypeError:
+            kwargs["reasoning"] = {"effort": effort}
+            try:
+                return _stream_responses(client, kwargs, on_event)
+            except Exception:
+                logger.debug("Responses stream failed, using non-stream", exc_info=True)
+        except Exception:
+            logger.debug("Responses stream failed, using non-stream", exc_info=True)
+
+    try:
+        response = client.responses.create(**kwargs)
+    except TypeError:
+        kwargs["reasoning"] = {"effort": effort}
+        response = client.responses.create(**kwargs)
+    content, tool_calls = _tool_calls_from_responses_output(getattr(response, "output", None))
+    if not content:
+        content = getattr(response, "output_text", None) or None
+    return _wrap_chat_response(content, tool_calls, _usage_from_responses(getattr(response, "usage", None)))
+
+
+def _stream_responses(client: Any, kwargs: Dict[str, Any], on_event: Callable[[str, Any], None]):
+    stream = client.responses.create(**kwargs, stream=True)
+    announced: set = set()
+    content_parts: List[str] = []
+    tool_acc: Dict[str, Dict[str, str]] = {}
+    usage = None
+    final_output = None
+
+    for event in stream:
+        etype = getattr(event, "type", None) or ""
+        if etype in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
+            delta = getattr(event, "delta", None) or ""
+            if str(delta).strip():
+                _emit(on_event, "thinking", delta)
+        elif etype == "response.output_text.delta":
+            delta = getattr(event, "delta", None) or ""
+            if delta:
+                content_parts.append(delta)
+                _emit(on_event, "token", delta)
+        elif etype == "response.output_item.added":
+            item = getattr(event, "item", None)
+            if getattr(item, "type", None) == "function_call":
+                name = getattr(item, "name", None) or ""
+                call_id = getattr(item, "call_id", None) or getattr(item, "id", None) or name
+                tool_acc[str(call_id)] = {
+                    "id": str(call_id),
+                    "name": name or "",
+                    "arguments": getattr(item, "arguments", None) or "",
+                }
+                if name and name not in announced:
+                    announced.add(name)
+                    if name != "respond":
+                        _emit(on_event, "thinking", f"Looking up {name.replace('_', ' ')}…")
+                    else:
+                        _emit(on_event, "thinking", "Writing the answer…")
+        elif etype == "response.function_call_arguments.delta":
+            call_id = str(getattr(event, "item_id", None) or getattr(event, "call_id", None) or "")
+            if call_id:
+                entry = tool_acc.setdefault(call_id, {"id": call_id, "name": "", "arguments": ""})
+                entry["arguments"] += getattr(event, "delta", None) or ""
+        elif etype == "response.completed":
+            final = getattr(event, "response", None)
+            if final is not None:
+                usage = getattr(final, "usage", None)
+                final_output = getattr(final, "output", None)
+
+    if final_output is not None:
+        content, tool_calls = _tool_calls_from_responses_output(final_output)
+        if not content:
+            content = "".join(content_parts) or None
+        return _wrap_chat_response(content, tool_calls, _usage_from_responses(usage))
+
+    tool_calls = [
+        type("ToolCall", (), {
+            "id": entry["id"] or key,
+            "type": "function",
+            "function": type("Fn", (), {"name": entry["name"], "arguments": entry["arguments"] or "{}"})(),
+        })()
+        for key, entry in tool_acc.items()
+    ]
+    return _wrap_chat_response("".join(content_parts) or None, tool_calls, _usage_from_responses(usage))
+
+
+def _stream_chat_completion(client: Any, payload: Dict[str, Any], on_event: Callable[[str, Any], None]):
+    stream_kwargs = dict(payload)
+    try:
+        stream = client.chat.completions.create(**stream_kwargs, stream=True, stream_options={"include_usage": True})
+    except TypeError:
+        stream = client.chat.completions.create(**stream_kwargs, stream=True)
+
+    tool_acc: Dict[int, Dict[str, str]] = {}
+    content_parts: List[str] = []
+    usage = None
+    announced_tools: set = set()
+
+    for chunk in stream:
+        usage = getattr(chunk, "usage", None) or usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        delta = getattr(choices[0], "delta", None)
+        if delta is None:
+            continue
+
+        reasoning = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None)
+        if isinstance(reasoning, str) and reasoning.strip():
+            _emit(on_event, "thinking", reasoning)
+        elif isinstance(reasoning, dict):
+            summary = reasoning.get("summary") or reasoning.get("content") or ""
+            if summary:
+                _emit(on_event, "thinking", summary)
+
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+            _emit(on_event, "token", delta.content)
+
+        for tc in getattr(delta, "tool_calls", None) or []:
+            idx = int(getattr(tc, "index", 0) or 0)
+            entry = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+            if getattr(tc, "id", None):
+                entry["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    entry["name"] = fn.name
+                    if fn.name not in announced_tools:
+                        announced_tools.add(fn.name)
+                        if fn.name != "respond":
+                            _emit(on_event, "thinking", f"Looking up {fn.name.replace('_', ' ')}…")
+                        else:
+                            _emit(on_event, "thinking", "Writing the answer…")
+                if getattr(fn, "arguments", None):
+                    entry["arguments"] += fn.arguments
+
+    tool_calls = []
+    for idx in sorted(tool_acc):
+        entry = tool_acc[idx]
+        tool_calls.append(
+            type("ToolCall", (), {
+                "id": entry["id"] or f"call_{idx}",
+                "type": "function",
+                "function": type("Fn", (), {"name": entry["name"], "arguments": entry["arguments"]})(),
+            })()
+        )
+
+    message = type("Msg", (), {
+        "content": "".join(content_parts) or None,
+        "tool_calls": tool_calls or None,
+    })()
+    usage_obj = usage or type("Usage", (), {"prompt_tokens": 0, "completion_tokens": 0})()
+    return type("Resp", (), {
+        "choices": [type("Ch", (), {"message": message})()],
+        "usage": usage_obj,
+    })()
+
+
 def _tool_call_args(call: Any) -> Dict[str, Any]:
     try:
         parsed = json.loads(call.function.arguments or "{}")
@@ -1010,6 +1554,7 @@ def run_agent_query(
     filters: Optional[Dict[str, Any]],
     conversation_id: Any = None,
     user_message_id: Any = None,
+    on_event: Optional[Callable[[str, Any], None]] = None,
 ) -> Dict[str, Any]:
     """
     Answer any question about this study by composing verified tool calls.
@@ -1024,17 +1569,24 @@ def run_agent_query(
 
     started = time.monotonic()
     budget = float(settings.ASSISTANT_AGENT_TOTAL_TIMEOUT_SECONDS)
-    model = settings.ASSISTANT_AGENT_MODEL or settings.ASSISTANT_MODEL or "gpt-4o-mini"
+    model = settings.ASSISTANT_AGENT_MODEL or settings.ASSISTANT_MODEL or "gpt-5.6-luna"
     max_rounds = max(1, int(settings.ASSISTANT_AGENT_MAX_ROUNDS))
     max_calls = max(1, int(settings.ASSISTANT_AGENT_MAX_TOOL_CALLS))
 
     dictionary = build_study_dictionary(study_obj, analysis)
+    combined_table = compact_combined(analysis, "T", for_prompt=True)
+    combined_blob = combined_prompt_json(analysis, "T")
     messages: List[Dict[str, Any]] = [
         {
             "role": "system",
             "content": (
                 f"{SYSTEM_PROMPT}\n\nSTUDY DICTIONARY (the only valid values):\n"
-                f"{json.dumps(dictionary, separators=(',', ':'), default=str)}"
+                f"{json.dumps(dictionary, separators=(',', ':'), default=str)}\n\n"
+                f"T COMBINED — the Excel/CSV sheet '(T) Combined'. "
+                f"This is the full matrix: Overall + Gender + Age + every "
+                f"classification question/answer. Not the Overall-only sheet. "
+                f"Quote numbers only from this table or from tool results:\n"
+                f"{combined_blob}"
             ),
         }
     ]
@@ -1055,6 +1607,8 @@ def run_agent_query(
     context_plan: Optional[AssistantQueryPlan] = None
     context_plan_is_fallback = False
 
+    _emit(on_event, "thinking", "Reading T Combined (Overall, gender, age, classification)…")
+
     for round_index in range(max_rounds + 1):
         elapsed = time.monotonic() - started
         if elapsed > budget:
@@ -1069,7 +1623,9 @@ def run_agent_query(
         )
 
         try:
-            response = client.chat.completions.create(
+            response = _chat_create(
+                client,
+                on_event=on_event,
                 model=model,
                 temperature=0,
                 max_tokens=settings.ASSISTANT_MAX_OUTPUT_TOKENS,
@@ -1200,6 +1756,7 @@ def run_agent_query(
         compacted=compacted,
         question=request.message,
         usage_meta=usage_meta,
+        combined=combined_table,
     )
     assembled["agent_plan"] = context_plan
     return assembled
@@ -1231,20 +1788,21 @@ def _assemble_response(
     compacted: List[Dict[str, Any]],
     question: str,
     usage_meta: Dict[str, Any],
+    combined: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     answer = ""
     if isinstance(final, dict):
-        answer = " ".join(str(final.get("answer") or "").split())
+        answer = _format_answer_text(str(final.get("answer") or ""))
     if not answer:
-        answer = " ".join((plain_text or "").split())
+        answer = _format_answer_text(plain_text or "")
 
     primary = _primary_result(executed)
     primary_name, primary_result = primary if primary else (None, {})
 
-    # Every number must trace back to a tool result. This runs even when no tool
-    # ran: an answer with no data behind it must contain no data.
+    # Every number must trace back to a tool result or T Combined. This runs
+    # even when no tool ran: an answer with no data behind it must contain no data.
     grounding_fallback = False
-    allowed = _grounding_values(compacted, question)
+    allowed = _grounding_values(compacted, question, combined)
     ok, offender = _numbers_are_grounded(answer, allowed)
     if not ok:
         logger.warning(

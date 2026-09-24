@@ -142,29 +142,31 @@ class Settings(BaseSettings):
     MERGE_STUDY_A: str | None = None
     MERGE_STUDY_B: str | None = None
 
-    # Analytics Assistant (GPT-4o-mini for intent only; facts are deterministic)
+    # Analytics Assistant uses GPT-5.6 Luna. OPENAI_MODEL stays mini for
+    # synthetic respondents and other non-analytics LLM work.
     OPENAI_API_KEY: str | None = None
     OPENAI_MODEL: str = "gpt-4o-mini"
-    ASSISTANT_MODEL: str = "gpt-4o-mini"
+    ASSISTANT_MODEL: str = "gpt-5.6-luna"
     ASSISTANT_MAX_INPUT_TOKENS: int = 1200
-    ASSISTANT_MAX_OUTPUT_TOKENS: int = 600
-    ASSISTANT_TIMEOUT_SECONDS: float = 12.0
+    ASSISTANT_MAX_OUTPUT_TOKENS: int = 2000
+    ASSISTANT_TIMEOUT_SECONDS: float = 45.0
     ASSISTANT_RATE_LIMIT_PER_MINUTE: int = 30
     ASSISTANT_CACHE_TTL_SECONDS: int = 300
     # Cross-request cache for the heavy analysis report (per study/format/filters).
-    ASSISTANT_ANALYSIS_CACHE_TTL_SECONDS: int = 120
-    ASSISTANT_MAX_RESULT_LIMIT: int = 20
+    ASSISTANT_ANALYSIS_CACHE_TTL_SECONDS: int = 900
+    ASSISTANT_MAX_RESULT_LIMIT: int = 50
     ASSISTANT_OPTIMIZER_TIMEOUT_MS: int = 1500
 
     # Dynamic tool-calling agent. Composes several verified tools per question so
     # arbitrary questions get answered instead of falling through to "clarify".
-    # Falls back to the single-tool planner whenever it cannot produce a grounded
-    # answer, so turning this off is always safe.
+    # Falls back to Combined + the single-tool planner whenever it cannot produce
+    # a grounded answer, so turning this off is always safe.
     ASSISTANT_AGENT_ENABLED: bool = True
-    ASSISTANT_AGENT_MODEL: str = "gpt-4o-mini"
+    ASSISTANT_AGENT_MODEL: str = "gpt-5.6-luna"
+    ASSISTANT_REASONING_EFFORT: str = "medium"
     # Tool rounds, not LLM calls: N rounds allows at most N+1 calls.
-    ASSISTANT_AGENT_MAX_ROUNDS: int = 2
-    ASSISTANT_AGENT_MAX_TOOL_CALLS: int = 4
-    ASSISTANT_AGENT_TOTAL_TIMEOUT_SECONDS: float = 24.0
+    ASSISTANT_AGENT_MAX_ROUNDS: int = 5
+    ASSISTANT_AGENT_MAX_TOOL_CALLS: int = 8
+    ASSISTANT_AGENT_TOTAL_TIMEOUT_SECONDS: float = 60.0
 
 settings = Settings()

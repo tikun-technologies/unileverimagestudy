@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, Optional, Callable, Tuple
@@ -176,6 +177,8 @@ def run_simulation(
         from app.synthetic.layer_stimulus import StimulusComposer, is_layer_study
         if is_layer_study(study_data) and not isinstance(study_data.get("_layer_composer"), StimulusComposer):
             study_data["_layer_composer"] = StimulusComposer()
+        if study_data.get("_ai_semaphore") is None:
+            study_data["_ai_semaphore"] = threading.BoundedSemaphore(MAX_CONCURRENT_AI)
     
     tasks = study_data.get("tasks") or {}
     if not isinstance(tasks, dict) or len(tasks) == 0:

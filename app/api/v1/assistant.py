@@ -30,7 +30,11 @@ from app.services.assistant_message_service import (
     get_conversation,
     list_messages_page,
 )
-from app.services.assistant_service import run_assistant_query
+from app.services.assistant_service import (
+    format_sse,
+    iter_assistant_query_events,
+    run_assistant_query,
+)
 from app.services.assistant_tools import (
     AssistantToolError,
     authorize_study_for_assistant,
@@ -53,8 +57,8 @@ def assistant_query(
     """
     Ask a verified analytics/design question about a study.
 
-    GPT-4o-mini only builds a tiny query plan. All facts are computed
-    deterministically from analysis tools (low token cost, no hallucinations).
+    GPT-5.6 Luna chooses tools and wording. All facts are computed
+    deterministically from analysis tools or T Combined (no invented numbers).
     User and assistant turns are persisted privately per (study, user).
     """
     try:
@@ -67,6 +71,47 @@ def assistant_query(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Assistant query failed: {exc}") from exc
+
+
+@router.post("/{study_id}/assistant/query/stream")
+def assistant_query_stream(
+    study_id: UUID,
+    payload: AssistantQueryRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """SSE stream: thinking, tokens, then a final `done` payload with cards/images."""
+    try:
+        authorize_study_for_assistant(db, study_id, current_user)
+    except AssistantToolError as exc:
+        raise HTTPException(status_code=403 if "denied" in (exc.message or "").lower() else 400, detail=exc.message)
+
+    user_id = current_user.id
+
+    def generate():
+        yield format_sse("thinking", "Starting analysis…")
+        try:
+            for item in iter_assistant_query_events(study_id, user_id, payload):
+                kind = item[0]
+                if kind == "event":
+                    yield format_sse(str(item[1]), item[2])
+                elif kind == "done":
+                    yield format_sse("done", item[1])
+                elif kind == "error":
+                    yield format_sse("error", item[1])
+        except Exception as exc:
+            yield format_sse("error", str(exc)[:400])
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 
 @router.post("/{study_id}/assistant/export-ppt")

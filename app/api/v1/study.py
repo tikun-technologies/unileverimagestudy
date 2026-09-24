@@ -18,6 +18,13 @@ from app.core.dependencies import get_current_active_user
 from app.db.session import get_db
 from app.models.user_model import User
 from app.models.study_model import Study, StudyMember, StudySavedDesign
+from app.services.design_categories import (
+    assign_designs_to_category,
+    delete_design_category,
+    list_design_categories,
+    remove_design_from_category,
+    rename_design_category,
+)
 from app.schemas.study_schema import (
     StudyCreate, StudyUpdate, StudyOut, StudyListItem, StudyListResponse, StudyStatusCounts,
     StudyLaunchOut,
@@ -26,6 +33,7 @@ from app.schemas.study_schema import (
     ValidateDesignConstraintsResponse,
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
     StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest,
+    DesignCategoryOut, DesignCategoryAssignRequest, DesignCategoryAssignResult, DesignCategoryRenameRequest,
     DesignConstraintIn
 )
 from app.services import study as study_service
@@ -1356,6 +1364,24 @@ def list_saved_designs_endpoint(
     return [_saved_design_to_out(design) for design in designs]
 
 
+@router.get("/{study_id}/saved-designs/{design_id}", response_model=StudySavedDesignOut)
+def get_saved_design_endpoint(
+    design_id: UUID,
+    access: AnalyticsAccess = Depends(get_analytics_access),
+    db: Session = Depends(get_db),
+):
+    study_id = access.study.id
+    design = db.scalar(
+        select(StudySavedDesign).where(
+            StudySavedDesign.study_id == study_id,
+            StudySavedDesign.id == design_id,
+        )
+    )
+    if design is None:
+        raise HTTPException(status_code=404, detail="Saved design not found.")
+    return _saved_design_to_out(design)
+
+
 @router.post("/{study_id}/saved-designs/compare", response_model=List[StudySavedDesignOut])
 def compare_saved_designs_endpoint(
     payload: StudySavedDesignCompareRequest,
@@ -1397,6 +1423,65 @@ def delete_saved_design_endpoint(
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Saved design not found.")
     db.commit()
+    return None
+
+
+# ---------- Design categories ----------
+
+@router.get("/{study_id}/design-categories", response_model=List[DesignCategoryOut])
+def list_design_categories_endpoint(
+    access: AnalyticsAccess = Depends(get_analytics_access),
+    db: Session = Depends(get_db),
+):
+    return list_design_categories(db, access.study.id)
+
+
+@router.post(
+    "/{study_id}/design-categories/assignments",
+    response_model=DesignCategoryAssignResult,
+    status_code=status.HTTP_201_CREATED,
+)
+def assign_design_category_endpoint(
+    payload: DesignCategoryAssignRequest,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
+    db: Session = Depends(get_db),
+):
+    if not access.user:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return assign_designs_to_category(db, access.study.id, access.user.id, payload)
+
+
+@router.patch("/{study_id}/design-categories/{category_id}", response_model=DesignCategoryOut)
+def rename_design_category_endpoint(
+    category_id: UUID,
+    payload: DesignCategoryRenameRequest,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
+    db: Session = Depends(get_db),
+):
+    return rename_design_category(db, access.study.id, category_id, payload)
+
+
+@router.delete("/{study_id}/design-categories/{category_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_design_category_endpoint(
+    category_id: UUID,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
+    db: Session = Depends(get_db),
+):
+    delete_design_category(db, access.study.id, category_id)
+    return None
+
+
+@router.delete(
+    "/{study_id}/design-categories/{category_id}/items/{saved_design_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def remove_design_category_item_endpoint(
+    category_id: UUID,
+    saved_design_id: UUID,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
+    db: Session = Depends(get_db),
+):
+    remove_design_from_category(db, access.study.id, category_id, saved_design_id)
     return None
 
 

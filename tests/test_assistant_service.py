@@ -157,7 +157,7 @@ class AssistantPlannerTests(unittest.TestCase):
         plan = _parse_plan({"tool": "hack_the_planet", "metric": "Z", "limit": 99}, req)
         self.assertEqual(plan.tool, AssistantToolName.clarify)
         self.assertEqual(plan.metric.value, "T")
-        self.assertEqual(plan.limit, 20)
+        self.assertEqual(plan.limit, 50)
 
     def test_parse_plan_accepts_word_confidence(self):
         req = AssistantQueryRequest(message="show best design for men")

@@ -58,7 +58,10 @@ class AssistantConversation(Base):
     messages = relationship(
         "AssistantMessage",
         back_populates="conversation",
-        cascade="all, delete-orphan",
+        # FK ON DELETE CASCADE removes rows. delete-orphan + noload treats the
+        # unloaded collection as empty and can DELETE the parent user message
+        # in the same flush as the assistant insert.
+        cascade="save-update, merge",
         lazy="noload",
         passive_deletes=True,
     )

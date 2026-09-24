@@ -86,6 +86,7 @@ class Study(Base):
     active_filters = relationship("StudyActiveFilter", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     analysis_settings = relationship("StudyAnalysisSettings", back_populates="study", cascade="all, delete-orphan", lazy="noload", uselist=False)
     saved_designs = relationship("StudySavedDesign", back_populates="study", cascade="all, delete-orphan", lazy="noload")
+    design_categories = relationship("StudyDesignCategory", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     analytics_shares = relationship("StudyAnalyticsShare", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     task_assignments = relationship("StudyTaskAssignment", back_populates="study", cascade="all, delete-orphan", lazy="noload")
     assistant_conversations = relationship(
@@ -397,12 +398,69 @@ class StudySavedDesign(Base):
 
     study = relationship("Study", back_populates="saved_designs", lazy="noload")
     created_by = relationship("User", back_populates="saved_designs", lazy="noload")
+    category_items = relationship(
+        "StudyDesignCategoryItem",
+        back_populates="saved_design",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="noload",
+    )
 
     __table_args__ = (
         UniqueConstraint('study_id', 'design_type', 'normalized_name', name='uq_study_saved_designs_study_type_name'),
         Index('idx_study_saved_designs_study_created', 'study_id', 'created_at'),
         Index('idx_study_saved_designs_study_type_created', 'study_id', 'design_type', 'created_at'),
         Index('idx_study_saved_designs_study_updated', 'study_id', 'updated_at'),
+    )
+
+
+class StudyDesignCategory(Base):
+    """
+    Named group of saved configurator combinations for one study.
+    Categories stay small; combination snapshots live on study_saved_designs.
+    """
+    __tablename__ = "study_design_categories"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    study_id = Column(UUID(as_uuid=True), ForeignKey('studies.id', ondelete='CASCADE'), nullable=False, index=True)
+    created_by_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    name = Column(String(80), nullable=False)
+    normalized_name = Column(String(80), nullable=False)
+    position = Column(Integer, nullable=False, server_default=expression.text('0'))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    study = relationship("Study", back_populates="design_categories", lazy="noload")
+    items = relationship(
+        "StudyDesignCategoryItem",
+        back_populates="category",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        lazy="noload",
+    )
+
+    __table_args__ = (
+        UniqueConstraint('study_id', 'normalized_name', name='uq_study_design_categories_study_name'),
+        Index('idx_study_design_categories_study_position', 'study_id', 'position', 'created_at'),
+    )
+
+
+class StudyDesignCategoryItem(Base):
+    """Membership of a saved design in a category. Unlimited items; uniqueness is per category."""
+    __tablename__ = "study_design_category_items"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    category_id = Column(UUID(as_uuid=True), ForeignKey('study_design_categories.id', ondelete='CASCADE'), nullable=False, index=True)
+    saved_design_id = Column(UUID(as_uuid=True), ForeignKey('study_saved_designs.id', ondelete='CASCADE'), nullable=False, index=True)
+    position = Column(Integer, nullable=False, server_default=expression.text('0'))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    category = relationship("StudyDesignCategory", back_populates="items", lazy="noload")
+    saved_design = relationship("StudySavedDesign", back_populates="category_items", lazy="noload")
+
+    __table_args__ = (
+        UniqueConstraint('category_id', 'saved_design_id', name='uq_study_design_category_items_design'),
+        Index('idx_study_design_category_items_category_position', 'category_id', 'position', 'created_at'),
     )
 
 

@@ -39,6 +39,22 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def sanitize_postgres_json(value: Any) -> Any:
+    """Postgres text/JSONB cannot store NUL (\\u0000). Strip it recursively."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {
+            (sanitize_postgres_json(key) if isinstance(key, str) else key): sanitize_postgres_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_postgres_json(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_postgres_json(item) for item in value)
+    return value
+
+
 def encode_cursor(created_at: datetime, message_id: UUID) -> str:
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
@@ -144,7 +160,7 @@ def insert_user_message(
         study_id=conversation.study_id,
         user_id=conversation.user_id,
         role="user",
-        content=content,
+        content=sanitize_postgres_json(content),
         client_message_id=client_message_id,
         status="complete",
     )
@@ -194,18 +210,24 @@ def insert_assistant_message(
 
     Idempotent on parent_message_id — retries return the existing reply.
     """
-    existing = get_assistant_reply_for_parent(db, parent_message_id=parent_message.id)
+    parent_id = parent_message.id
+    conversation_id = conversation.id
+    study_id = conversation.study_id
+    user_id = conversation.user_id
+
+    existing = get_assistant_reply_for_parent(db, parent_message_id=parent_id)
     if existing:
         return existing
 
-    payload = json.loads(response.model_dump_json())
+    payload = sanitize_postgres_json(json.loads(response.model_dump_json()))
+    content = sanitize_postgres_json(content)
     message = AssistantMessage(
-        conversation_id=conversation.id,
-        study_id=conversation.study_id,
-        user_id=conversation.user_id,
+        conversation_id=conversation_id,
+        study_id=study_id,
+        user_id=user_id,
         role="assistant",
         content=content,
-        parent_message_id=parent_message.id,
+        parent_message_id=parent_id,
         response_payload=payload,
         status=status if status in {"pending", "complete", "error", "failed"} else "complete",
     )
@@ -213,16 +235,38 @@ def insert_assistant_message(
 
     follow_up = response.follow_up_context
     if follow_up is not None:
-        conversation.follow_up_context = json.loads(follow_up.model_dump_json())
+        conversation.follow_up_context = sanitize_postgres_json(
+            json.loads(follow_up.model_dump_json())
+        )
     conversation.updated_at = _utc_now()
 
     try:
         db.commit()
     except IntegrityError:
         db.rollback()
-        existing = get_assistant_reply_for_parent(db, parent_message_id=parent_message.id)
+        existing = get_assistant_reply_for_parent(db, parent_message_id=parent_id)
         if existing:
             return existing
+        parent = db.get(AssistantMessage, parent_id)
+        if parent is None:
+            logger.warning(
+                "Parent user message %s missing; saving assistant reply without parent link",
+                parent_id,
+            )
+            orphan = AssistantMessage(
+                conversation_id=conversation_id,
+                study_id=study_id,
+                user_id=user_id,
+                role="assistant",
+                content=content,
+                parent_message_id=None,
+                response_payload=payload,
+                status=status if status in {"pending", "complete", "error", "failed"} else "complete",
+            )
+            db.add(orphan)
+            db.commit()
+            db.refresh(orphan)
+            return orphan
         raise
     db.refresh(message)
     return message
@@ -236,7 +280,9 @@ def update_conversation_follow_up(
 ) -> None:
     if follow_up is None:
         return
-    conversation.follow_up_context = json.loads(follow_up.model_dump_json())
+    conversation.follow_up_context = sanitize_postgres_json(
+        json.loads(follow_up.model_dump_json())
+    )
     conversation.updated_at = _utc_now()
     db.commit()
 

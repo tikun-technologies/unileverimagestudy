@@ -64,6 +64,15 @@ from app.services.assistant_tools import (
 
 logger = logging.getLogger(__name__)
 
+
+def _emit_stream(on_event, kind: str, payload: Any) -> None:
+    if not on_event:
+        return
+    try:
+        on_event(kind, payload)
+    except Exception:
+        logger.debug("Assistant stream callback failed", exc_info=True)
+
 try:
     from openai import OpenAI  # type: ignore
 
@@ -81,7 +90,7 @@ must_include, clarification_prompt, clarification_options, unsupported_reason, c
 Allowed tools:
 greeting, study_overview, classification_distribution, rank_elements, rank_designs,
 compare, compare_segments, executive_summary, use_avoid_elements, response_time_summary, fatigue_summary,
-explain_mindset, explain_design, list_saved_designs, generate_ppt, clarify, unsupported.
+explain_mindset, explain_design, list_saved_designs, generate_ppt, query_combined, clarify, unsupported.
 
 Your job is INTENT understanding. Clients paraphrase freely — slang, typos, and
 informal wording are normal. Map MEANING, never require exact keywords.
@@ -107,7 +116,10 @@ Rules:
 - If the request is ambiguous between designs vs elements, or two valid intents, use
   tool=clarify with a short clarification_prompt and 2-5 clarification_options the user
   can tap (e.g. "Best 2 designs", "Top 2 elements", "Compare best vs worst").
-- If outside verified study analytics/design, use tool=unsupported.
+- If the specialised tools do not fit but the question is still about this study's
+  results, use tool=query_combined (the Excel Combined sheet).
+- If outside this study entirely (weather, news), still prefer query_combined for a
+  closest Combined finding rather than unsupported.
 - confidence: 0.85-1.0 when intent is clear; 0.5-0.7 when guessed; below 0.45 only with clarify.
 
 Tool mapping (paraphrases count as the same intent):
@@ -168,6 +180,13 @@ def _openai_client():
     if not api_key:
         return None
     return OpenAI(api_key=api_key)
+
+
+def _luna_planner_complete(client, **kwargs):
+    """Planner call that stays compatible with GPT-5.6 Luna parameter rules."""
+    from app.services.assistant_agent import _chat_create
+
+    return _chat_create(client, **kwargs)
 
 
 _RATE_BUCKET: Dict[str, list] = {}
@@ -679,17 +698,14 @@ def _deterministic_plan(message: str, request: AssistantQueryRequest) -> Assista
         )
 
     return AssistantQueryPlan(
-        tool=AssistantToolName.clarify,
-        clarification_prompt="I’m not sure what you mean — what should I analyze?",
-        clarification_options=[
-            "Best design overall",
-            "Top 2 designs",
-            "Top 10 elements",
-            "Compare best vs worst design",
-            "Study overview",
-            "Classification answer counts",
-        ],
-        confidence=0.35,
+        tool=AssistantToolName.query_combined,
+        metric=metric,
+        direction=direction,
+        limit=limit,
+        segment_section=segment_section,
+        segment_key=segment_key,
+        must_include=_extract_must_include(message),
+        confidence=0.55,
     )
 
 
@@ -1099,6 +1115,9 @@ def _normalize_plan_for_question(
             ]
         return plan
 
+    if plan.tool == AssistantToolName.query_combined:
+        return plan
+
     # No metric in the user's words always means T. UI tab state must not
     # silently change the meaning of an otherwise "overall" question.
     if "bottom up" in text or re.search(r"\bmetric\s*b\b|\busing\s+b\b|\(b\)", text):
@@ -1384,9 +1403,9 @@ def plan_query(message: str, request: AssistantQueryRequest) -> Tuple[AssistantQ
         "context": compact_context,
     }
     try:
-        response = client.chat.completions.create(
-            model=settings.ASSISTANT_MODEL or settings.OPENAI_MODEL or "gpt-4o-mini",
-            temperature=0,
+        response = _luna_planner_complete(
+            client,
+            model=settings.ASSISTANT_MODEL or settings.OPENAI_MODEL or "gpt-5.6-luna",
             max_tokens=settings.ASSISTANT_MAX_OUTPUT_TOKENS,
             response_format={"type": "json_object"},
             messages=[
@@ -1400,7 +1419,7 @@ def plan_query(message: str, request: AssistantQueryRequest) -> Tuple[AssistantQ
         plan = _parse_plan(raw, request)
         usage = {
             "planner": "openai",
-            "model": settings.ASSISTANT_MODEL or settings.OPENAI_MODEL or "gpt-4o-mini",
+            "model": settings.ASSISTANT_MODEL or settings.OPENAI_MODEL or "gpt-5.6-luna",
             "prompt_tokens": getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0,
             "completion_tokens": getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0,
         }
@@ -1648,6 +1667,7 @@ def run_assistant_query(
     study_id,
     current_user: User,
     request: AssistantQueryRequest,
+    on_event: Optional[Any] = None,
 ) -> AssistantQueryResponse:
     request_id = str(uuid.uuid4())
     if not _rate_limit_ok(str(current_user.id)):
@@ -1729,7 +1749,7 @@ def run_assistant_query(
     cache_payload = {
         # Bumped for the tool-calling agent: cached template answers from the
         # single-tool planner must not be replayed over the new behaviour.
-        "assistant_semantics_version": 24,
+        "assistant_semantics_version": 29,
         "message": request.message,
         "filters": filters,
         "metric": request.metric.value if request.metric else None,
@@ -1747,7 +1767,6 @@ def run_assistant_query(
             response = AssistantQueryResponse(**cached)
             response.conversation_id = conversation.id
             response.user_message_id = user_message.id
-            # Persist cache hit as a normal chat turn so history stays complete.
             assistant_row = insert_assistant_message(
                 db,
                 conversation=conversation,
@@ -1757,6 +1776,8 @@ def run_assistant_query(
                 status="complete" if response.status != "error" else "error",
             )
             response.assistant_message_id = assistant_row.id
+            _emit_stream(on_event, "thinking", "Loaded a cached verified answer…")
+            _emit_stream(on_event, "token", response.answer_text)
             return response
         except Exception:
             pass
@@ -1766,11 +1787,7 @@ def run_assistant_query(
     # On the fallback path the planner still runs concurrently with the prefetch
     # (network I/O releases the GIL). Only the main thread touches `db`, and
     # plan_query is pure network/regex, so that overlap stays safe.
-    use_agent = (
-        bool(settings.ASSISTANT_AGENT_ENABLED)
-        and not _is_simple_greeting(request.message)
-        and not _is_ppt_generation_query(request.message.casefold())
-    )
+    use_agent = bool(settings.ASSISTANT_AGENT_ENABLED)
     plan_future = None if use_agent else _PLANNER_POOL.submit(plan_query, request.message, request)
 
     prefetched_analysis: Optional[Dict[str, Any]] = None
@@ -1800,6 +1817,7 @@ def run_assistant_query(
                 filters=filters,
                 conversation_id=conversation.id,
                 user_message_id=user_message.id,
+                on_event=on_event,
             )
         except AgentUnavailable as exc:
             logger.info("Assistant agent deferred to the planner: %s", exc)
@@ -1828,6 +1846,7 @@ def run_assistant_query(
             planner_usage = {"planner": "deterministic", "planner_error": str(exc)[:200]}
     else:
         # Agent path was tried and declined; plan inline.
+        _emit_stream(on_event, "thinking", "Tools could not finish — reading T Combined…")
         try:
             plan, planner_usage = plan_query(request.message, request)
             planner_usage = {**planner_usage, "agent_fallback": True}
@@ -1957,3 +1976,60 @@ def run_assistant_query(
     if status == "answered":
         RedisCache.set(cache_key, json.loads(response.model_dump_json()), ttl_seconds=settings.ASSISTANT_CACHE_TTL_SECONDS)
     return response
+
+
+def iter_assistant_query_events(
+    study_id,
+    user_id,
+    request: AssistantQueryRequest,
+):
+    """
+    Yield (kind, name_or_response, payload) as the analytics assistant works.
+
+    Runs in a worker thread with its own DB session so the SSE generator can
+    flush thinking tokens while tools and Luna are still running.
+    """
+    from queue import Queue
+    from threading import Thread
+
+    from app.db.session import SessionLocal
+    from app.models.user_model import User as UserModel
+
+    q: Queue = Queue()
+    SENTINEL = object()
+
+    def on_event(kind: str, payload: Any) -> None:
+        q.put(("event", kind, payload))
+
+    def worker() -> None:
+        db = SessionLocal()
+        try:
+            user = db.get(UserModel, user_id)
+            if user is None:
+                q.put(("error", "User not found", None))
+                return
+            response = run_assistant_query(db, study_id, user, request, on_event=on_event)
+            q.put(("done", response, None))
+        except Exception as exc:
+            logger.exception("Streaming assistant query failed")
+            q.put(("error", str(exc)[:400], None))
+        finally:
+            db.close()
+            q.put(SENTINEL)
+
+    Thread(target=worker, daemon=True, name="assistant-sse").start()
+    while True:
+        item = q.get()
+        if item is SENTINEL:
+            break
+        yield item
+
+
+def format_sse(event: str, payload: Any) -> bytes:
+    if hasattr(payload, "model_dump_json"):
+        body = json.loads(payload.model_dump_json())
+    else:
+        body = payload
+    data = json.dumps({"event": event, "data": body}, default=str)
+    return f"data: {data}\n\n".encode("utf-8")
+

@@ -21,6 +21,7 @@ from app.schemas.assistant_schema import (
 from app.services import assistant_agent
 from app.services.assistant_agent import (
     AgentUnavailable,
+    _format_answer_text,
     _grounding_values,
     _namespace_fact_ids,
     _numbers_are_grounded,
@@ -298,6 +299,62 @@ class GroundingTests(unittest.TestCase):
         ok, offender = _numbers_are_grounded("There were 396 responses.", allowed)
         self.assertFalse(ok)
         self.assertEqual(offender, "396")
+
+    def test_combined_table_scores_are_quotable(self):
+        combined = {
+            "elements": [{"code": "A1", "name": "Claim", "values": {"Overall": 16.5}}],
+            "threshold": 5,
+            "base_size": 40,
+        }
+        allowed = _grounding_values([], "best element?", combined)
+        ok, offender = _numbers_are_grounded("A1 scores 16.50.", allowed)
+        self.assertTrue(ok, offender)
+
+    def test_combined_does_not_vouch_for_invented_scores(self):
+        combined = {
+            "elements": [{"code": "A1", "name": "Claim", "values": {"Overall": 16.5}}],
+        }
+        allowed = _grounding_values([], "best element?", combined)
+        ok, offender = _numbers_are_grounded("A1 scores 47.", allowed)
+        self.assertFalse(ok)
+        self.assertEqual(offender, "47")
+
+    def test_combined_gaps_are_not_auto_derived(self):
+        """Pairwise Combined diffs would make almost any figure look grounded."""
+        combined = {
+            "elements": [
+                {"values": {"Overall": 16.5}},
+                {"values": {"Overall": 12.0}},
+            ],
+        }
+        allowed = _grounding_values([], "gap?", combined)
+        ok, offender = _numbers_are_grounded("The gap is 4.5.", allowed)
+        self.assertFalse(ok)
+        self.assertEqual(offender, "4.5")
+
+    def test_age_range_labels_are_not_treated_as_scores(self):
+        allowed = _grounding_values([{"facts": [{"value": 35}]}], "top segments")
+        ok, offender = _numbers_are_grounded(
+            "Strongest top-element lift is in “45-54” at 35.0 [S4].",
+            allowed,
+        )
+        self.assertTrue(ok, offender)
+
+
+class FormatAnswerTextTests(unittest.TestCase):
+    def test_inline_numbered_list_is_split_onto_lines(self):
+        text = _format_answer_text(
+            "The top five overall elements are: 1. **B16 — Visit Our Booth:** 26.0 [E1] "
+            "2. **B14 — Win a Free Month:** 26.0 [E2] They are the strongest drivers."
+        )
+        self.assertIn("\n1. **B16", text)
+        self.assertIn("\n2. **B14", text)
+        self.assertTrue(text.endswith("They are the strongest drivers."))
+
+    def test_existing_newlines_are_kept(self):
+        text = _format_answer_text("Take this design:\n\n- **A1 Cotton**\n- **B16 Headline**")
+        self.assertIn("- **A1 Cotton**", text.splitlines())
+        self.assertIn("- **B16 Headline**", text.splitlines())
 
 
 class FactNamespacingTests(unittest.TestCase):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -18,6 +19,7 @@ from app.services.assistant_message_service import (
     decode_cursor,
     encode_cursor,
     list_messages_page,
+    sanitize_postgres_json,
 )
 
 
@@ -48,6 +50,24 @@ def _msg(
         response_payload=response_payload,
         status=status,
     )
+
+
+class SanitizePostgresJsonTests(unittest.TestCase):
+    def test_null_bytes_are_stripped_from_nested_json(self):
+        payload = {
+            "answer_text": "Convenience",
+            "blocks": [
+                {
+                    "title": "When you buy groceries, which of these do you prioritize the most?\u0000",
+                    "data": {"rows": [{"segment": "Convenience\u0000"}]},
+                }
+            ],
+        }
+        cleaned = sanitize_postgres_json(payload)
+        dumped = json.dumps(cleaned)
+        self.assertNotIn("\\u0000", dumped)
+        self.assertNotIn("\x00", cleaned["blocks"][0]["title"])
+        self.assertTrue(cleaned["blocks"][0]["title"].endswith("most?"))
 
 
 class CursorCodecTests(unittest.TestCase):

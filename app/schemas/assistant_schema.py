@@ -34,6 +34,7 @@ class AssistantToolName(str, Enum):
     explain_mindset = "explain_mindset"
     list_saved_designs = "list_saved_designs"
     generate_ppt = "generate_ppt"
+    query_combined = "query_combined"
     clarify = "clarify"
     unsupported = "unsupported"
 
@@ -63,11 +64,11 @@ class AssistantFollowUpContext(BaseModel):
     classification_options: List[str] = Field(default_factory=list, max_length=8)
     last_tool: Optional[AssistantToolName] = None
     last_direction: Optional[RankDirection] = None
-    last_limit: Optional[int] = Field(None, ge=1, le=20)
+    last_limit: Optional[int] = Field(None, ge=1, le=50)
 
 
 class AssistantQueryRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=500)
+    message: str = Field(..., min_length=1, max_length=2000)
     filters: Optional[StudyFilterCriteria] = None
     use_active_filters: bool = True
     metric: Optional[AssistantMetric] = None
@@ -99,7 +100,7 @@ class AssistantQueryPlan(BaseModel):
     tool: AssistantToolName
     metric: Optional[AssistantMetric] = AssistantMetric.T
     direction: Optional[RankDirection] = RankDirection.highest
-    limit: int = Field(default=10, ge=1, le=20)
+    limit: int = Field(default=10, ge=1, le=50)
     segment_section: Optional[str] = None
     segment_key: Optional[str] = None
     # Optional dual demographic filters (used heavily by classification counts).

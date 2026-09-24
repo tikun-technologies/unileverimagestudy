@@ -7,9 +7,11 @@ than individual elements.
 """
 
 import json
+import logging
 import os
 import random
-from typing import Dict, List, Any, Optional
+import time
+from typing import Dict, List, Any, Optional, Set, Tuple
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,6 +23,14 @@ from app.synthetic.layer_stimulus import (
     is_probably_image_url,
     iter_shown_elements,
 )
+
+logger = logging.getLogger(__name__)
+
+# First pass uses the caller's worker count. Failed tasks are parked, then
+# retried 3 times at lower concurrency so a 429 does not become a random rating.
+AI_RETRY_PASSES = 3
+AI_RETRY_WORKERS = (3, 2, 1)
+AI_RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
 # Try to load environment variables from .env file
 try:
@@ -35,6 +45,91 @@ try:
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
+
+
+class TransientAIRatingError(Exception):
+    """A vignette rating failed but should be retried later, not randomized yet."""
+
+    def __init__(
+        self,
+        message: str,
+        kind: str = "other",
+        exclude_urls: Optional[Set[str]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.exclude_urls = set(exclude_urls or [])
+
+
+def classify_ai_error(exc: BaseException) -> str:
+    """Classify an OpenAI / network failure so the queue can retry the right way."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    try:
+        status_int = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status_int = None
+
+    code = None
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error") if isinstance(body.get("error"), dict) else {}
+        code = err.get("code")
+    code = str(code or getattr(exc, "code", "") or "").strip().lower()
+    text = str(exc).lower()
+
+    if (
+        status_int == 429
+        or code in {"rate_limit", "rate_limit_exceeded", "rate_limit_error"}
+        or "rate_limit" in text
+        or "rate limit" in text
+        or "too many requests" in text
+        or "429" in text
+    ):
+        return "rate_limit"
+    if (
+        code == "invalid_image_url"
+        or "invalid_image_url" in text
+        or "error while downloading file" in text
+        or "invalid image" in text
+    ):
+        return "image_url"
+    if (
+        status_int == 408
+        or "timeout" in text
+        or "timed out" in text
+        or "deadline exceeded" in text
+    ):
+        return "timeout"
+    if status_int is not None and status_int >= 500:
+        return "server"
+    if "connection" in text or "connect" in text:
+        return "connection"
+    return "other"
+
+
+def _image_url_from_part(part: Any) -> Optional[str]:
+    if not isinstance(part, dict) or part.get("type") != "image_url":
+        return None
+    image = part.get("image_url")
+    if isinstance(image, dict):
+        url = image.get("url")
+        return url if isinstance(url, str) and url else None
+    if isinstance(image, str) and image:
+        return image
+    return None
+
+
+def _next_image_to_drop(image_urls: List[str], exclude_urls: Set[str], exc: BaseException) -> Optional[str]:
+    remaining = [url for url in image_urls if url and url not in exclude_urls]
+    if not remaining:
+        return None
+    text = str(exc)
+    for url in remaining:
+        if url and url in text:
+            return url
+    return remaining[0]
 
 
 class AIRespondent:
@@ -131,44 +226,24 @@ Rate the entire SET as a WHOLE in response to the question on a scale of 1-5 whe
 5 = {max_label}>>"""
         
         return prompt
-    
-    def rate_vignette_with_ai(self, task: Dict[str, Any], persona_prompt: str, study_context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Rate an entire vignette (task with combined elements) based on the persona.
-        
-        IMPORTANT: This rates the ENTIRE VIGNETTE as a whole, not individual elements.
-        A vignette is a combination of multiple elements shown together, and we rate
-        how well this combination works together based on the persona.
-        
-        Args:
-            task: Task dictionary with elements_shown_content and elements_shown
-            persona_prompt: The persona description
-            study_context: Study context (background, main question, etc.)
-        
-        Returns:
-            Dictionary with rating (1-5) and reasoning for the entire vignette
-        """
-        if study_context.get("randomize") or not self.client:
-            return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
-        
-        shown_pairs = iter_shown_elements(task)
-        shown_elements = [data for _, data in shown_pairs]
-        
-        if not shown_elements:
-            # No elements shown, return neutral rating (or 5 when special creator = polar only)
-            no_rating = 5 if study_context.get("is_special_creator") else 3
-            return {
-                'rating': no_rating,
-                'reasoning': 'No elements shown in this vignette',
-                'method': 'fallback'
-            }
 
+    def _build_rating_payload(
+        self,
+        task: Dict[str, Any],
+        persona_prompt: str,
+        study_context: Dict[str, Any],
+        exclude_urls: Optional[Set[str]] = None,
+        *,
+        force_layer_urls: bool = False,
+    ) -> Dict[str, Any]:
+        exclude_urls = set(exclude_urls or [])
+        shown_pairs = iter_shown_elements(task)
         layer_mode = is_layer_study(study_context)
-        vignette_text_parts = []
-        image_urls = []
+        vignette_text_parts: List[str] = []
+        image_parts: List[Dict[str, Any]] = []
         composed = False
 
-        if layer_mode:
+        if layer_mode and not force_layer_urls:
             composer = study_context.get("_layer_composer")
             if composer is None or not callable(getattr(composer, "compose_data_url", None)):
                 composer = StimulusComposer()
@@ -176,14 +251,17 @@ Rate the entire SET as a WHOLE in response to the question on a scale of 1-5 whe
                     study_context["_layer_composer"] = composer
             composed_url = composer.compose_data_url(task, study_context)
             vignette_text_parts.append(describe_layer_stack(task, study_context))
-            if composed_url:
-                image_urls.append({
+            if composed_url and composed_url not in exclude_urls:
+                image_parts.append({
                     "type": "image_url",
                     "image_url": {"url": composed_url},
                 })
                 composed = True
             else:
-                image_urls.extend(self._layer_fallback_image_parts(shown_pairs, study_context))
+                image_parts.extend(self._layer_fallback_image_parts(shown_pairs, study_context, exclude_urls))
+        elif layer_mode:
+            vignette_text_parts.append(describe_layer_stack(task, study_context))
+            image_parts.extend(self._layer_fallback_image_parts(shown_pairs, study_context, exclude_urls))
         else:
             for key, element in shown_pairs:
                 category = element.get("category_name") or element.get("layer_name") or "Unknown"
@@ -191,20 +269,19 @@ Rate the entire SET as a WHOLE in response to the question on a scale of 1-5 whe
                 element_type = element.get("element_type", "text")
                 url = content if isinstance(content, str) else None
                 if is_probably_image_url(url, element_type, layer_mode=False):
-                    image_urls.append({
-                        "type": "image_url",
-                        "image_url": {"url": url},
-                    })
-                    vignette_text_parts.append(f"{category}: [Image]")
+                    if url in exclude_urls:
+                        vignette_text_parts.append(f"{category}: [Image omitted — unavailable]")
+                    else:
+                        image_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": url},
+                        })
+                        vignette_text_parts.append(f"{category}: [Image]")
                 else:
                     vignette_text_parts.append(f"{category}: {content}")
 
         vignette_text = "\n".join(vignette_text_parts)
-        
-        # Build the user message content
-        user_content = []
-        
-        has_images = len(image_urls) > 0
+        has_images = len(image_parts) > 0
         if composed:
             image_instruction = """
 IMPORTANT: The attached image is the EXACT composed stimulus shown to human participants:
@@ -229,8 +306,7 @@ IMPORTANT: This stimulus set contains IMAGES. Please carefully analyze each imag
 """
         else:
             image_instruction = ""
-        
-        # Add text prompt
+
         text_prompt = f"""{persona_prompt}
 
 STIMULUS SET (evaluate as ONE combined proposition):
@@ -243,63 +319,143 @@ Respond ONLY with a JSON object in this exact format:
     "reasoning": "<brief explanation of why you gave this rating based on your role, the factors shaping your perspective, and how the stimulus set resonates with you>"
 }}
 """
-        user_content.append({"type": "text", "text": text_prompt})
-        
-        # Add images if any
-        user_content.extend(image_urls)
-        
+        user_content: List[Any] = [{"type": "text", "text": text_prompt}]
+        user_content.extend(image_parts)
+        image_urls = [url for url in (_image_url_from_part(part) for part in image_parts) if url]
+        return {
+            "user_content": user_content,
+            "image_urls": image_urls,
+            "composed": composed,
+            "layer_mode": layer_mode,
+            "shown_pairs": shown_pairs,
+            "vignette_text": vignette_text,
+        }
+
+    def rate_vignette_attempt(
+        self,
+        task: Dict[str, Any],
+        persona_prompt: str,
+        study_context: Dict[str, Any],
+        exclude_urls: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        One AI rating attempt. Transient failures raise TransientAIRatingError
+        so the caller can park the task and finish other work first.
+        """
+        exclude_urls = set(exclude_urls or [])
+        if study_context.get("randomize") or not self.client:
+            return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
+
+        shown_pairs = iter_shown_elements(task)
+        if not shown_pairs:
+            no_rating = 5 if study_context.get("is_special_creator") else 3
+            return {
+                "rating": no_rating,
+                "reasoning": "No elements shown in this vignette",
+                "method": "fallback",
+            }
+
+        payload = self._build_rating_payload(task, persona_prompt, study_context, exclude_urls)
         try:
-            return self._complete_vignette_rating(user_content, study_context)
-        except Exception as e:
-            if composed:
-                # Composed data-URL can fail (size/provider). Retry with source layer URLs.
-                print(f"Error calling AI API with composed layer image: {e}. Retrying with individual layer URLs.")
-                fallback_images = self._layer_fallback_image_parts(shown_pairs, study_context)
-                retry_instruction = """
-IMPORTANT: Composition upload failed, so you are seeing separate layer assets.
-Mentally assemble them using the listed z-index (higher = in front) and transform percents
-(x/y/width/height of the background box). Include the background if one is listed.
-Rate the assembled design, not the loose assets.
-"""
-                retry_prompt = f"""{persona_prompt}
+            return self._complete_vignette_rating(payload["user_content"], study_context)
+        except Exception as exc:
+            kind = classify_ai_error(exc)
+            current_exclude = set(exclude_urls)
 
-STIMULUS SET (evaluate as ONE combined proposition):
-{vignette_text}
-{retry_instruction}
-
-Respond ONLY with a JSON object in this exact format:
-{{
-    "rating": <number between 1 and 5>,
-    "reasoning": "<brief explanation of why you gave this rating based on your role, the factors shaping your perspective, and how the stimulus set resonates with you>"
-}}
-"""
-                retry_content = [{"type": "text", "text": retry_prompt}]
-                retry_content.extend(fallback_images)
+            # Composed JPEG failed for a payload/image reason: try source layer URLs now.
+            # Rate limits / timeouts / 5xx are parked instead so we do not double-hit the API.
+            if payload["composed"] and kind not in {"rate_limit", "timeout", "server"}:
+                logger.info("Composed layer image failed (%s): %s. Trying individual layer URLs.", kind, exc)
                 try:
-                    return self._complete_vignette_rating(retry_content, study_context)
-                except Exception as retry_error:
-                    print(f"Error calling AI API on layer fallback: {retry_error}. Using fallback method.")
-                    return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
-            print(f"Error calling AI API: {e}. Using fallback method.")
+                    layer_payload = self._build_rating_payload(
+                        task,
+                        persona_prompt,
+                        study_context,
+                        current_exclude,
+                        force_layer_urls=True,
+                    )
+                    return self._complete_vignette_rating(layer_payload["user_content"], study_context)
+                except Exception as layer_exc:
+                    exc = layer_exc
+                    kind = classify_ai_error(layer_exc)
+                    payload = layer_payload
+
+            if kind == "image_url":
+                drop = _next_image_to_drop(payload["image_urls"], current_exclude, exc)
+                if drop:
+                    current_exclude.add(drop)
+                    logger.info("Skipping unavailable image and retrying the remaining set: %s", drop[:160])
+                    try:
+                        skipped_payload = self._build_rating_payload(
+                            task,
+                            persona_prompt,
+                            study_context,
+                            current_exclude,
+                            force_layer_urls=payload["layer_mode"] and not payload["composed"],
+                        )
+                        if payload["layer_mode"] and payload["composed"]:
+                            skipped_payload = self._build_rating_payload(
+                                task,
+                                persona_prompt,
+                                study_context,
+                                current_exclude,
+                                force_layer_urls=True,
+                            )
+                        result = self._complete_vignette_rating(skipped_payload["user_content"], study_context)
+                        result["excluded_image_urls"] = sorted(current_exclude)
+                        return result
+                    except Exception as skip_exc:
+                        exc = skip_exc
+                        kind = classify_ai_error(skip_exc)
+
+            raise TransientAIRatingError(str(exc), kind=kind, exclude_urls=current_exclude) from exc
+
+    def rate_vignette_with_ai(self, task: Dict[str, Any], persona_prompt: str, study_context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Rate an entire vignette (task with combined elements) based on the persona.
+        
+        IMPORTANT: This rates the ENTIRE VIGNETTE as a whole, not individual elements.
+        A vignette is a combination of multiple elements shown together, and we rate
+        how well this combination works together based on the persona.
+        
+        Args:
+            task: Task dictionary with elements_shown_content and elements_shown
+            persona_prompt: The persona description
+            study_context: Study context (background, main question, etc.)
+        
+        Returns:
+            Dictionary with rating (1-5) and reasoning for the entire vignette
+        """
+        try:
+            return self.rate_vignette_attempt(task, persona_prompt, study_context)
+        except TransientAIRatingError as exc:
+            logger.warning("AI rating failed after local recovery (%s): %s. Using fallback.", exc.kind, exc)
             return self._generate_fallback_vignette_rating(task, persona_prompt, study_context)
 
     def _layer_fallback_image_parts(
         self,
         shown_pairs: List[Any],
         study_context: Dict[str, Any],
+        exclude_urls: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
+        exclude_urls = set(exclude_urls or [])
         parts: List[Dict[str, Any]] = []
         seen = set()
         bg = ""
         if isinstance(study_context, dict):
             bg = str(study_context.get("background_image_url") or "").strip()
-        if bg and is_probably_image_url(bg, "image", layer_mode=True) and bg not in seen:
+        if bg and is_probably_image_url(bg, "image", layer_mode=True) and bg not in seen and bg not in exclude_urls:
             seen.add(bg)
             parts.append({"type": "image_url", "image_url": {"url": bg}})
         for key, element in shown_pairs:
             enriched = enrich_shown_element(key, element, study_context)
             url = enriched.get("url")
-            if url and url not in seen and is_probably_image_url(url, enriched.get("element_type"), layer_mode=True):
+            if (
+                url
+                and url not in seen
+                and url not in exclude_urls
+                and is_probably_image_url(url, enriched.get("element_type"), layer_mode=True)
+            ):
                 seen.add(url)
                 parts.append({"type": "image_url", "image_url": {"url": url}})
         return parts
@@ -307,15 +463,25 @@ Respond ONLY with a JSON object in this exact format:
     def _complete_vignette_rating(self, user_content: List[Any], study_context: Dict[str, Any]) -> Dict[str, Any]:
         if not self.client:
             raise RuntimeError("OpenAI client is not available")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": "You are a role-based evaluator providing ratings from within a defined human context. Your judgment reflects perceived sense-making, not expertise or factual knowledge. Always respond with valid JSON only."},
-                {"role": "user", "content": user_content}
-            ],
-            temperature=0.7,
-            response_format={"type": "json_object"}
-        )
+        semaphore = study_context.get("_ai_semaphore") if isinstance(study_context, dict) else None
+        if semaphore is not None:
+            semaphore.acquire()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a role-based evaluator providing ratings from within a defined human context. Your judgment reflects perceived sense-making, not expertise or factual knowledge. Always respond with valid JSON only."},
+                    {"role": "user", "content": user_content}
+                ],
+                temperature=0.7,
+                response_format={"type": "json_object"}
+            )
+        finally:
+            if semaphore is not None:
+                try:
+                    semaphore.release()
+                except Exception:
+                    pass
         raw_content = response.choices[0].message.content if response.choices else None
         result = json.loads(raw_content or "{}")
         try:
@@ -360,6 +526,125 @@ Respond ONLY with a JSON object in this exact format:
         }
 
 
+def _retry_settings(study_data: Dict[str, Any]) -> Tuple[int, Tuple[int, ...], Tuple[float, ...]]:
+    passes = int(study_data.get("_ai_retry_passes", AI_RETRY_PASSES) or AI_RETRY_PASSES)
+    workers = study_data.get("_ai_retry_workers", AI_RETRY_WORKERS) or AI_RETRY_WORKERS
+    backoff = study_data.get("_ai_retry_backoff", AI_RETRY_BACKOFF_SECONDS) or AI_RETRY_BACKOFF_SECONDS
+    workers_tuple = tuple(max(1, int(w)) for w in workers)
+    backoff_tuple = tuple(max(0.0, float(s)) for s in backoff)
+    return max(0, passes), workers_tuple, backoff_tuple
+
+
+def _task_result_shell(
+    panelist_number: Any,
+    idx: int,
+    task: Dict[str, Any],
+    study_data: Dict[str, Any],
+    rating_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    task_id = task.get("task_id", f"{panelist_number}_{idx}")
+    task_index = task.get("task_index", idx)
+    shown_elements = []
+    vignette_parts = []
+    for key, element_data in iter_shown_elements(task):
+        enriched = enrich_shown_element(key, element_data, study_data)
+        url_or_content = enriched.get("content") or enriched.get("url") or enriched.get("name")
+        shown_elements.append({
+            "key": key,
+            "element_id": enriched.get("element_id") or element_data.get("element_id"),
+            "name": enriched.get("name"),
+            "content": url_or_content,
+            "category_name": enriched.get("category_name") or enriched.get("layer_name"),
+            "element_type": enriched.get("element_type") or "text",
+        })
+        vignette_parts.append(f"{enriched.get('category_name') or 'Unknown'}: {url_or_content}")
+    return {
+        "task_id": task_id,
+        "task_index": task_index,
+        "main_question": study_data.get("main_question", ""),
+        "vignette_content": "\n".join(vignette_parts),
+        "rating": rating_result["rating"],
+        "reasoning": rating_result.get("reasoning", ""),
+        "elements_shown": shown_elements,
+        "method": rating_result.get("method", "unknown"),
+        "_original_index": idx,
+    }
+
+
+def _run_rating_pass(
+    ai_respondent: AIRespondent,
+    pending: List[Dict[str, Any]],
+    persona_prompt: str,
+    study_data: Dict[str, Any],
+    panelist_number: Any,
+    max_workers: int,
+) -> Tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]]]:
+    if not pending:
+        return {}, []
+    workers = max(1, min(int(max_workers or 1), len(pending)))
+    completed: Dict[int, Dict[str, Any]] = {}
+    failed: List[Dict[str, Any]] = []
+
+    def _one(item: Dict[str, Any]) -> Dict[str, Any]:
+        rating_result = ai_respondent.rate_vignette_attempt(
+            item["task"],
+            persona_prompt,
+            study_data,
+            item.get("exclude_urls") or set(),
+        )
+        return _task_result_shell(panelist_number, item["idx"], item["task"], study_data, rating_result)
+
+    if workers == 1:
+        for item in pending:
+            try:
+                result = _one(item)
+                completed[item["idx"]] = result
+            except TransientAIRatingError as exc:
+                item["exclude_urls"] = set(exc.exclude_urls)
+                item["last_error"] = str(exc)
+                item["last_kind"] = exc.kind
+                failed.append(item)
+                logger.warning(
+                    "Parking vignette %s after %s: %s",
+                    item.get("idx"),
+                    exc.kind,
+                    exc,
+                )
+            except Exception as exc:
+                item["exclude_urls"] = set(item.get("exclude_urls") or set())
+                item["last_error"] = str(exc)
+                item["last_kind"] = classify_ai_error(exc)
+                failed.append(item)
+                logger.warning("Parking vignette %s after unexpected error: %s", item.get("idx"), exc)
+        return completed, failed
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_item = {executor.submit(_one, item): item for item in pending}
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            try:
+                result = future.result()
+                completed[item["idx"]] = result
+            except TransientAIRatingError as exc:
+                item["exclude_urls"] = set(exc.exclude_urls)
+                item["last_error"] = str(exc)
+                item["last_kind"] = exc.kind
+                failed.append(item)
+                logger.warning(
+                    "Parking vignette %s after %s: %s",
+                    item.get("idx"),
+                    exc.kind,
+                    exc,
+                )
+            except Exception as exc:
+                item["exclude_urls"] = set(item.get("exclude_urls") or set())
+                item["last_error"] = str(exc)
+                item["last_kind"] = classify_ai_error(exc)
+                failed.append(item)
+                logger.warning("Parking vignette %s after unexpected error: %s", item.get("idx"), exc)
+    return completed, failed
+
+
 def generate_panelist_response_from_json(
     panelist_json: Dict[str, Any],
     tasks_json: Dict[str, List[Dict[str, Any]]],
@@ -373,6 +658,7 @@ def generate_panelist_response_from_json(
     
     Designed for multithreading and Selenium automation with vignette-based tasks.
     This function rates entire vignettes (combinations of elements), not individual elements.
+    Failed AI calls are parked and retried 3 times at lower concurrency before fallback.
     """
     # Initialize AI respondent
     ai_respondent = AIRespondent(openai_api_key=openai_api_key, model=model)
@@ -390,78 +676,64 @@ def generate_panelist_response_from_json(
     
     if not panelist_tasks:
         raise ValueError(f"No tasks found for panelist number {panelist_number}")
-    
-    # Rate each vignette/task in parallel
-    def rate_single_task(task_data: tuple) -> Dict[str, Any]:
-        """Helper function to rate a single task/vignette."""
-        idx, task = task_data
-        task_id = task.get('task_id', f"{panelist_number}_{idx}")
-        task_index = task.get('task_index', idx)
-        
-        # Rate the entire vignette (all elements combined together as one unit)
-        rating_result = ai_respondent.rate_vignette_with_ai(task, persona_prompt, study_data)
-        
-        # Extract shown elements (layer tasks use 'url', grid/text use 'content')
-        shown_elements = []
-        vignette_parts = []
-        for key, element_data in iter_shown_elements(task):
-            enriched = enrich_shown_element(key, element_data, study_data)
-            url_or_content = enriched.get("content") or enriched.get("url") or enriched.get("name")
-            shown_elements.append({
-                "key": key,
-                "element_id": enriched.get("element_id") or element_data.get("element_id"),
-                "name": enriched.get("name"),
-                "content": url_or_content,
-                "category_name": enriched.get("category_name") or enriched.get("layer_name"),
-                "element_type": enriched.get("element_type") or "text",
-            })
-            vignette_parts.append(f"{enriched.get('category_name') or 'Unknown'}: {url_or_content}")
-        vignette_content = "\n".join(vignette_parts)
-        
-        return {
-            'task_id': task_id,
-            'task_index': task_index,
-            'main_question': study_data.get('main_question', ''),
-            'vignette_content': vignette_content,
-            'rating': rating_result['rating'],
-            'reasoning': rating_result.get('reasoning', ''),
-            'elements_shown': shown_elements,
-            'method': rating_result.get('method', 'unknown'),
-            '_original_index': idx  # Preserve original order
-        }
-    
-    # Process all tasks in parallel
-    max_workers = min(max_vignette_workers, len(panelist_tasks))
-    task_ratings = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {
-            executor.submit(rate_single_task, (idx, task)): idx
-            for idx, task in enumerate(panelist_tasks)
-        }
-        
-        results = {}
-        for future in as_completed(future_to_index):
-            try:
-                result = future.result()
-                results[result['_original_index']] = result
-            except Exception as e:
-                idx = future_to_index[future]
-                results[idx] = {
-                    'task_id': f"{panelist_number}_{idx}",
-                    'task_index': idx,
-                    'main_question': study_data.get('main_question', ''),
-                    'vignette_content': '',
-                    'rating': 3,
-                    'reasoning': f'Error during rating: {str(e)}',
-                    'elements_shown': [],
-                    'method': 'error',
-                    '_original_index': idx
-                }
-        
-        task_ratings = [results[i] for i in sorted(results.keys())]
-        for tr in task_ratings:
-            tr.pop('_original_index', None)
+
+    pending: List[Dict[str, Any]] = [
+        {"idx": idx, "task": task, "exclude_urls": set()}
+        for idx, task in enumerate(panelist_tasks)
+    ]
+    results: Dict[int, Dict[str, Any]] = {}
+    retry_passes, retry_workers, retry_backoff = _retry_settings(study_data if isinstance(study_data, dict) else {})
+
+    completed, pending = _run_rating_pass(
+        ai_respondent,
+        pending,
+        persona_prompt,
+        study_data,
+        panelist_number,
+        max_vignette_workers,
+    )
+    results.update(completed)
+
+    for pass_index in range(retry_passes):
+        if not pending:
+            break
+        delay = retry_backoff[min(pass_index, len(retry_backoff) - 1)] if retry_backoff else 0.0
+        if delay > 0:
+            time.sleep(delay)
+        workers = retry_workers[min(pass_index, len(retry_workers) - 1)] if retry_workers else 1
+        logger.info(
+            "Retrying %s parked vignette(s) for panelist %s (pass %s/%s, workers=%s)",
+            len(pending),
+            panelist_number,
+            pass_index + 1,
+            retry_passes,
+            workers,
+        )
+        completed, pending = _run_rating_pass(
+            ai_respondent,
+            pending,
+            persona_prompt,
+            study_data,
+            panelist_number,
+            workers,
+        )
+        results.update(completed)
+
+    for item in pending:
+        fallback = ai_respondent._generate_fallback_vignette_rating(
+            item["task"], persona_prompt, study_data
+        )
+        kind = item.get("last_kind") or "other"
+        fallback["reasoning"] = (
+            f"Fallback heuristic rating after {retry_passes} retries ({kind})"
+        )
+        results[item["idx"]] = _task_result_shell(
+            panelist_number, item["idx"], item["task"], study_data, fallback
+        )
+
+    task_ratings = [results[i] for i in sorted(results.keys())]
+    for tr in task_ratings:
+        tr.pop("_original_index", None)
     
     # Extract classification answers in a clean format
     classification_answers = {}

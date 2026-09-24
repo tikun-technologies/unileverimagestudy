@@ -3049,14 +3049,6 @@ def tool_compare_segments(analysis: Dict[str, Any], plan: AssistantQueryPlan) ->
             title=f"{section_name} comparison",
             data={"rows": rows, "metric": METRIC_LABELS.get(metric, metric)},
         ),
-        AssistantBlock(
-            type="chart",
-            title="Top element by segment",
-            data={
-                "chart_type": "horizontal_bar",
-                "items": [{"name": r["segment"], "value": r["top"], "fact_id": r["fact_id"]} for r in rows],
-            },
-        ),
     ]
     return {
         "answer_text": answer,
@@ -3504,6 +3496,10 @@ def execute_tool(
             context=context,
             filters=filters,
         )
+    if tool == AssistantToolName.query_combined:
+        from app.services.assistant_combined import execute_combined_plan
+
+        return execute_combined_plan(analysis, study_obj, plan, message=message)
 
     return {
         "status": "unsupported",
