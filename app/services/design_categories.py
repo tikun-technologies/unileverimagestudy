@@ -1,7 +1,8 @@
 """Study-scoped categories of saved configurator combinations.
 
-List reads are a single join that omits configuration JSONB. Writes attach
-existing designs, or create one design and attach it, in one transaction.
+The list is one join. Each item includes the saved-design configuration so
+callers get element urls, z-index, transforms, and the layer background
+without a second request.
 """
 
 from __future__ import annotations
@@ -38,10 +39,12 @@ def _category_columns():
         StudyDesignCategoryItem.position.label("item_position"),
         StudySavedDesign.name.label("design_name"),
         StudySavedDesign.design_type.label("design_type"),
+        StudySavedDesign.study_type.label("study_type"),
         StudySavedDesign.metric.label("metric"),
         StudySavedDesign.segment_label.label("segment_label"),
         StudySavedDesign.selection_count.label("selection_count"),
         StudySavedDesign.total_coefficient.label("total_coefficient"),
+        StudySavedDesign.configuration.label("configuration"),
     )
 
 
@@ -71,11 +74,13 @@ def _rows_to_categories(rows: Iterable[Any]) -> List[Dict[str, Any]]:
                 "saved_design_id": row.saved_design_id,
                 "name": row.design_name,
                 "design_type": row.design_type,
+                "study_type": row.study_type,
                 "metric": row.metric,
                 "segment_label": row.segment_label,
                 "selection_count": row.selection_count or 0,
                 "total_coefficient": row.total_coefficient,
                 "position": row.item_position or 0,
+                "configuration": row.configuration or {},
             }
         )
     return categories

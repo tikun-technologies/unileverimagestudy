@@ -536,6 +536,24 @@ class FlattenedCsvExportPayload(BaseModel):
     )
 
 
+class AppealPptExportPayload(BaseModel):
+    """Request body for POST /study/{study_id}/export-appeal-ppt.
+
+    ``analysis`` lets the analytics page hand back the analysis JSON it already
+    holds so the server does not recompute the regression (the expensive step
+    for large respondent counts). ``filters`` is used only for the fallback
+    server-side compute when ``analysis`` is omitted.
+    """
+    filters: Optional[StudyFilterCriteria] = Field(
+        None,
+        description="Optional filter criteria. Used only when analysis is not supplied.",
+    )
+    analysis: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Precomputed analysis JSON from the analytics page. Skips server recompute when present.",
+    )
+
+
 class OptimizedAnalysisPayload(BaseModel):
     """Request body for POST /study/{study_id}/optimized-analysis-json."""
     filters: Optional[StudyFilterCriteria] = Field(

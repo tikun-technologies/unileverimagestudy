@@ -297,6 +297,18 @@ class StudySavedDesignCreate(BaseModel):
         return name
 
 
+class StudySavedDesignRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        name = " ".join(value.strip().split())
+        if not name:
+            raise ValueError("Design name is required")
+        return name
+
+
 class StudySavedDesignCompareRequest(BaseModel):
     design_ids: List[UUID] = Field(..., min_length=2, max_length=4)
     design_type: SavedDesignType = 'configurator'
@@ -325,11 +337,13 @@ class DesignCategoryItemOut(BaseModel):
     saved_design_id: UUID
     name: str
     design_type: SavedDesignType
+    study_type: Optional[StudyType] = None
     metric: str
     segment_label: Optional[str] = None
     selection_count: int
     total_coefficient: Optional[float] = None
     position: int
+    configuration: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DesignCategoryOut(BaseModel):

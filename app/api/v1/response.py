@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from collections import Counter, defaultdict
 from uuid import UUID
 from datetime import datetime
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from fastapi.responses import StreamingResponse
@@ -43,6 +44,7 @@ from app.schemas.response_schema import (
     ElementInteractionCreate, CompletedTaskCreate, ClassificationAnswerCreate, StudyResponseCreate,
     StudyFilterPayload,
     OptimizedAnalysisPayload,
+    AppealPptExportPayload,
     ActiveFilterPayload,
     ActiveFilterResponse,
     AnalyticsSessionResponse,
@@ -112,6 +114,7 @@ def _build_study_data_dict(study_obj: Study) -> Dict[str, Any]:
     study_data = {
         "title": study_obj.title,
         "study_type": study_obj.study_type,
+        "main_question": getattr(study_obj, "main_question", None) or "",
         "background": getattr(study_obj, "background_image_url", None) or "",
         "language": study_obj.language,
         "launched_at": study_obj.created_at.isoformat() if study_obj.created_at else "",
@@ -239,7 +242,66 @@ def _generate_study_analysis_json(
         analysis_options=analysis_options,
         filters=filters_dict if filters_are_active(filters_dict) else None,
     )
-    return _sanitize_analysis_json(json_report)
+    report = _sanitize_analysis_json(json_report)
+    # The analytics page loads this once. Keep the lean copy so Export PPT
+    # can reuse it instead of running the regression again.
+    if not include_raw_data and isinstance(report, dict) and report:
+        _remember_page_analysis(
+            study_obj.id,
+            unilever_format,
+            filters_dict if filters_are_active(filters_dict) else None,
+            analysis_options,
+            report,
+        )
+    return report
+
+
+# Page-load analytics, reused by Export PPT. Longer than the assistant memo
+# (20s) so a user can read the dashboard and then export.
+_PAGE_ANALYSIS_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_PAGE_ANALYSIS_TTL = 900.0
+_PAGE_ANALYSIS_MAX = 24
+
+
+def _page_analysis_key(study_id, unilever_format: bool, filters, analysis_options) -> str:
+    from app.services.assistant_tools import _analysis_cache_key
+
+    return _analysis_cache_key(study_id, unilever_format, filters, analysis_options)
+
+
+def _remember_page_analysis(study_id, unilever_format: bool, filters, analysis_options, report: Dict[str, Any]) -> None:
+    try:
+        key = _page_analysis_key(study_id, unilever_format, filters, analysis_options)
+        _PAGE_ANALYSIS_CACHE[key] = (time.monotonic(), report)
+        if len(_PAGE_ANALYSIS_CACHE) > _PAGE_ANALYSIS_MAX:
+            oldest = min(_PAGE_ANALYSIS_CACHE, key=lambda item: _PAGE_ANALYSIS_CACHE[item][0])
+            _PAGE_ANALYSIS_CACHE.pop(oldest, None)
+        from app.core.config import settings
+
+        RedisCache.set(key, report, ttl_seconds=settings.ASSISTANT_ANALYSIS_CACHE_TTL_SECONDS)
+    except Exception:
+        pass
+
+
+def _recall_page_analysis(study_id, unilever_format: bool, filters, analysis_options) -> Optional[Dict[str, Any]]:
+    try:
+        key = _page_analysis_key(study_id, unilever_format, filters, analysis_options)
+    except Exception:
+        return None
+    cached = _PAGE_ANALYSIS_CACHE.get(key)
+    if cached:
+        ts, value = cached
+        if (time.monotonic() - ts) <= _PAGE_ANALYSIS_TTL and isinstance(value, dict):
+            return value
+        _PAGE_ANALYSIS_CACHE.pop(key, None)
+    try:
+        stored = RedisCache.get(key)
+    except Exception:
+        stored = None
+    if isinstance(stored, dict) and stored:
+        _PAGE_ANALYSIS_CACHE[key] = (time.monotonic(), stored)
+        return stored
+    return None
 
 
 def _load_study_dataframe_for_analysis(
@@ -1941,6 +2003,137 @@ def post_study_optimized_analysis_json(
             db.rollback()
 
     return json_report
+
+
+def _ascii_fallback_filename(name: str, default: str) -> str:
+    """A plain-ASCII filename for the legacy ``filename=`` field."""
+    cleaned = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in (name or ""))
+    cleaned = cleaned.strip().strip(".") or default
+    return cleaned[:200]
+
+
+def _content_disposition(filename: str, default: str) -> str:
+    """RFC 5987 Content-Disposition so unicode titles download correctly."""
+    from urllib.parse import quote as _quote
+
+    ascii_name = _ascii_fallback_filename(filename, default)
+    encoded = _quote(filename or default, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded}"
+
+
+def _analysis_has_scores(analysis: Any) -> bool:
+    """True when the analysis carries scored elements the deck can chart."""
+    if not isinstance(analysis, dict):
+        return False
+    inner = analysis.get("analysis") if isinstance(analysis.get("analysis"), dict) else analysis
+    overall = inner.get("(T) Overall") if isinstance(inner, dict) else None
+    if not isinstance(overall, dict):
+        return False
+    categories = overall.get("categories")
+    return isinstance(categories, list) and any(
+        (cat or {}).get("elements") for cat in categories if isinstance(cat, dict)
+    )
+
+
+@router.post("/study/{study_id}/export-appeal-ppt")
+def export_study_appeal_ppt(
+    payload: AppealPptExportPayload,
+    access: AnalyticsAccess = Depends(get_analytics_access),
+    db: Session = Depends(get_db),
+):
+    """Build and download the Design Element Appeal PowerPoint for a study.
+
+    Prefers the ``analysis`` JSON the analytics page already holds so the server
+    skips the (expensive) regression recompute — the main cost for large
+    respondent counts. Falls back to a server-side compute (honouring the
+    optional filter body) only when the client does not supply it. Runs on a
+    sync route, so FastAPI executes the heavy build in its threadpool.
+    """
+    from app.services.appeal_report import DefaultReportError, build_appeal_pptx
+
+    study_obj = access.study
+    study_id = study_obj.id
+    filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
+    active_filters = filters_dict if filters_are_active(filters_dict) else None
+
+    # 1. Analytics already on the page (sent with this request).
+    # 2. The copy saved when the analytics page loaded.
+    # 3. Recompute only if neither exists (the page was never opened).
+    analysis = payload.analysis if _analysis_has_scores(payload.analysis) else None
+    source = "page"
+    if analysis is None:
+        viewer_email = analysis_viewer_email(db, access)
+        unilever_format = is_unilever_domain(viewer_email or "")
+        analysis_options = get_study_analysis_settings(db, study_id, study=study_obj)
+        analysis = _recall_page_analysis(study_id, unilever_format, active_filters, analysis_options)
+        source = "page-cache"
+    if analysis is None or not _analysis_has_scores(analysis):
+        source = "recomputed"
+        df, unilever_format = _load_study_dataframe_for_analysis(
+            db,
+            study_id,
+            access.user,
+            viewer_email=analysis_viewer_email(db, access),
+        )
+        try:
+            analysis = _generate_study_analysis_json(
+                db,
+                study_obj,
+                df,
+                include_raw_data=False,
+                filters_dict=active_filters,
+                unilever_format=unilever_format,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to prepare analytics for the report: {str(e)}",
+            )
+    print(f"appeal-ppt {study_id}: analytics source={source}")
+
+    try:
+        exporter = access.user
+        if exporter is None:
+            from app.services.user import get_user_by_id
+
+            exporter = get_user_by_id(db, study_obj.creator_id)
+        report = build_appeal_pptx(
+            study_obj=study_obj,
+            analysis=analysis,
+            prepared_by_name=getattr(exporter, "name", None),
+            prepared_by_email=getattr(exporter, "email", None),
+        )
+    except DefaultReportError as exc:
+        # Analytics not ready, or a filter cohort of zero — nothing to chart.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This report needs analytics with scored elements. "
+                "The study may still be collecting responses, or the current "
+                "filter matches no respondents. "
+                f"({str(exc)})"
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate the PowerPoint report: {exc}")
+
+    filename = report.filename or "Appeal Report.pptx"
+    headers = {
+        "Content-Disposition": _content_disposition(filename, "Appeal Report.pptx"),
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Appeal-Source",
+        "X-Appeal-Source": source,
+    }
+    return StreamingResponse(
+        iter([report.content]),
+        media_type=report.media_type,
+        headers=headers,
+    )
 
 
 @router.post("/study/{study_id}/classification-cohort", response_model=ClassificationCohortResponse)

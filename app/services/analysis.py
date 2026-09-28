@@ -515,6 +515,7 @@ class StudyAnalysisService:
         # 5a. Front Page
         result["Front Page"] = {
             "Title": study_data.get("title", ""),
+            "Main Question": study_data.get("main_question", ""),
             "Background": study_data.get("background", ""),
             "Language": study_data.get("language", ""),
             "Launched At": study_data.get("launched_at", ""),
@@ -838,6 +839,7 @@ class StudyAnalysisService:
             "filter_meta": {**filter_meta, "error": "No respondents match the applied filters."},
             "Front Page": {
                 "Title": study_data.get("title", ""),
+                "Main Question": study_data.get("main_question", ""),
                 "Background": study_data.get("background", ""),
                 "Language": study_data.get("language", ""),
                 "Launched At": study_data.get("launched_at", ""),

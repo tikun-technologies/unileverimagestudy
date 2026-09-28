@@ -64,9 +64,8 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    # ConfigParser treats "%" as interpolation. URL-encoded passwords contain "%",
-    # so escape them; Alembic restores a single "%" when it reads the option back.
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
+    # Set database URL from settings
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
@@ -86,9 +85,8 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    # ConfigParser treats "%" as interpolation. URL-encoded passwords contain "%",
-    # so escape them; Alembic restores a single "%" when it reads the option back.
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
+    # Set database URL from settings
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),

@@ -32,7 +32,7 @@ from app.schemas.study_schema import (
     GenerateTasksRequest, GenerateTasksResult, StudyPublicMinimal, StudyBasicDetails, StudyBasicDetailsV2, SimulateAIRespondentsRequest,
     ValidateDesignConstraintsResponse,
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
-    StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest,
+    StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest, StudySavedDesignRenameRequest,
     DesignCategoryOut, DesignCategoryAssignRequest, DesignCategoryAssignResult, DesignCategoryRenameRequest,
     DesignConstraintIn
 )
@@ -1405,6 +1405,50 @@ def compare_saved_designs_endpoint(
         raise HTTPException(status_code=404, detail="One or more saved designs were not found.")
 
     return [_saved_design_to_out(by_id[design_id]) for design_id in unique_ids]
+
+
+@router.patch("/{study_id}/saved-designs/{design_id}", response_model=StudySavedDesignOut)
+def rename_saved_design_endpoint(
+    design_id: UUID,
+    payload: StudySavedDesignRenameRequest,
+    access: AnalyticsAccess = Depends(require_analytics_owner),
+    db: Session = Depends(get_db),
+):
+    study_id = access.study.id
+    normalized_name = _normalize_saved_design_name(payload.name)
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="Design name is required")
+
+    design = db.scalar(
+        select(StudySavedDesign).where(
+            StudySavedDesign.study_id == study_id,
+            StudySavedDesign.id == design_id,
+        )
+    )
+    if design is None:
+        raise HTTPException(status_code=404, detail="Saved design not found.")
+
+    if design.normalized_name != normalized_name:
+        existing_id = db.scalar(
+            select(StudySavedDesign.id).where(
+                StudySavedDesign.study_id == study_id,
+                StudySavedDesign.design_type == design.design_type,
+                StudySavedDesign.normalized_name == normalized_name,
+                StudySavedDesign.id != design.id,
+            )
+        )
+        if existing_id:
+            raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
+        design.name = payload.name
+        design.normalized_name = normalized_name
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
+        db.refresh(design)
+
+    return _saved_design_to_out(design)
 
 
 @router.delete("/{study_id}/saved-designs/{design_id}", status_code=status.HTTP_204_NO_CONTENT)
