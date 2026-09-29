@@ -9,7 +9,9 @@ segment: a divider, a comparison chart, and one detail slide per design.
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -24,6 +26,7 @@ from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION
 from pptx.enum.shapes import MSO_CONNECTOR
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Emu, Inches, Pt
+from PIL import Image
 
 from app.services.reportgen.composite import composite_pack
 from app.services.reportgen.theme import (
@@ -102,6 +105,38 @@ def _digits(kind: str) -> int:
     return 3 if kind == "response" else 1
 
 
+def _named_visual(value) -> str | None:
+    """Layer, grid, or text. Hybrid uses the layer layout."""
+    text = str(value or "").strip().lower()
+    if text == "hybrid":
+        return "layer"
+    if text in {"layer", "grid", "text"}:
+        return text
+    return None
+
+
+def _choose_visual(explicit: str | None, groups: list[Group], fallback: str) -> str:
+    """An explicit type wins, then the type stored on each saved item, then the study file."""
+    found = _named_visual(explicit)
+    if found:
+        return found
+    for group in groups:
+        for build in group.builds:
+            found = _named_visual(build.study_type)
+            if found:
+                return found
+    return _named_visual(fallback) or "layer"
+
+
+def _http_url(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.lower().startswith(("http://", "https://")):
+        return text
+    return None
+
+
 def _optional_float(value) -> float | None:
     if value is None:
         return None
@@ -134,6 +169,7 @@ class Build:
     elements: list[Element]
     total: float
     metric: str = "Top Down"
+    study_type: str = ""
     background_url: str | None = None
     background_path: Path | None = None
 
@@ -164,7 +200,10 @@ class StudyInfo:
     base_response: float | None
     model_name: str
     aspect: float
+    visual: str = "layer"
     segment_sizes: dict[str, int] = field(default_factory=dict)
+    prepared_by: str = ""
+    main_question: str = ""
 
 
 def build_combination_readout(
@@ -173,11 +212,17 @@ def build_combination_readout(
     output_path: str | Path,
     analysis_path: str | Path | None = None,
     download_images: bool = True,
+    study_type: str | None = None,
+    cache_dir: str | Path | None = None,
+    prepared_by: str | None = None,
 ) -> Path:
     groups = load_groups(combinations_path)
     study = load_study(study_path, analysis_path)
-    if download_images:
-        cache = Path(combinations_path).parent / ".cache" / "elements"
+    study.visual = _choose_visual(study_type, groups, study.visual)
+    if prepared_by:
+        study.prepared_by = prepared_by
+    if download_images and study.visual != "text":
+        cache = Path(cache_dir) if cache_dir else Path(combinations_path).parent / ".cache" / "elements"
         _download(groups, cache)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -249,6 +294,7 @@ def load_study(study_path: str | Path, analysis_path: str | Path | None = None) 
     config = study.get("study_config") or {}
     analysis = _load_analysis(study_path, analysis_path, str(study.get("id") or ""))
     front = (analysis or {}).get("Front Page") or {}
+    info = (analysis or {}).get("Information Block") or {}
     overall = (analysis or {}).get("(T) Overall") or {}
     intercepts = (analysis or {}).get("(T) Intercepts") or {}
     bottom_intercepts = (analysis or {}).get("(B) Intercepts") or {}
@@ -257,11 +303,17 @@ def load_study(study_path: str | Path, analysis_path: str | Path | None = None) 
     settings = (analysis or {}).get("analysis_settings") or {}
     bands = ((settings.get("top") or {}).get("hundred") or [4, 5])
     raw_intercept = intercepts.get("intercept")
+    main_question = " ".join(str(
+        study.get("main_question")
+        or front.get("Main Question")
+        or info.get("Main Question")
+        or ""
+    ).split())
     sizes = {"Overall": int(overall.get("base_size") or dashboard.get("totalRespondents") or config.get("number_of_respondents") or 0)}
     gender = ((analysis or {}).get("(T) Gender") or {}).get("segments") or {}
-    for label, info in gender.items():
-        if isinstance(info, dict) and info.get("base_size"):
-            sizes[str(label)] = int(info["base_size"])
+    for label, segment in gender.items():
+        if isinstance(segment, dict) and segment.get("base_size"):
+            sizes[str(label)] = int(segment["base_size"])
     return StudyInfo(
         title=str(front.get("Title") or study.get("title") or "Design Study"),
         country=str(config.get("country") or "Overall"),
@@ -272,7 +324,9 @@ def load_study(study_path: str | Path, analysis_path: str | Path | None = None) 
         base_response=_optional_float(response_intercepts.get("intercept")),
         model_name=f"Top-{len(bands)} Box" if len(bands) > 1 else "Top Box",
         aspect=_aspect(config.get("aspect_ratio") or front.get("Aspect Ratio") or "9:16"),
+        visual=_named_visual(study.get("study_type")) or _named_visual(info.get("Study Type")) or "layer",
         segment_sizes=sizes,
+        main_question=main_question,
     )
 
 
@@ -292,14 +346,20 @@ def _build_from_item(item: dict) -> Build:
     for raw in config.get("selected_elements") or []:
         name = str(raw.get("name") or "")
         category = str(raw.get("category") or "")
+        content = raw.get("content")
+        image_url = _http_url(raw.get("image_url")) or _http_url(content)
+        if isinstance(content, str) and content.strip() and image_url is None:
+            label = re.sub(r"\s+", " ", content).strip()
+        else:
+            label = _pretty(name)
         elements.append(
             Element(
                 name=name,
-                label=_pretty(name),
+                label=label,
                 lift=float(raw.get("value") or 0),
                 category=category,
                 z_index=int(raw.get("z_index") or 0),
-                image_url=raw.get("image_url") or raw.get("content"),
+                image_url=image_url,
             )
         )
     elements.sort(key=lambda element: element.z_index)
@@ -312,7 +372,8 @@ def _build_from_item(item: dict) -> Build:
         elements=elements,
         total=float(total),
         metric=str(item.get("metric") or config.get("metric") or "Top Down"),
-        background_url=config.get("background_url"),
+        study_type=str(item.get("study_type") or config.get("study_type") or ""),
+        background_url=_http_url(config.get("background_url")),
     )
 
 
@@ -398,9 +459,28 @@ def _download(groups: list[Group], cache: Path) -> None:
         key, dest, url = item
         if dest.exists() and dest.stat().st_size > 0:
             return key, dest
-        request = urllib.request.Request(quote(url, safe=":/?#[]@!$&'()*+,;=%"), headers={"User-Agent": "presentation-generator"})
-        with urllib.request.urlopen(request, timeout=40) as response:
-            dest.write_bytes(response.read())
+        request = urllib.request.Request(
+            quote(url, safe=":/?#[]@!$&'()*+,;=%"),
+            headers={"User-Agent": "presentation-generator"},
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            data = response.read(15 * 1024 * 1024 + 1)
+        if not data or len(data) > 15 * 1024 * 1024:
+            raise ValueError(f"image too large or empty: {url[:120]}")
+        from app.services.reportgen.study import _shrink_source
+
+        payload = _shrink_source(data)
+        fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), suffix=".part")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            os.replace(tmp_name, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         return key, dest
 
     saved: dict[str, Path] = {}
@@ -427,7 +507,7 @@ def _group_slides(presentation, study: StudyInfo, group: Group, builds: list[Bui
     slides = [("plain", _market(presentation, group, kind))]
     slides.append(("content", _compare(presentation, study, group, builds, kind)))
     for index, build in enumerate(builds):
-        headline = meta["ranks"][index] if index < len(meta["ranks"]) else f"PACK {index + 1}"
+        headline = _rank_headline(kind, index, study.visual)
         slides.append(("content", _pack(presentation, study, group, build, headline, kind)))
     return slides
 
@@ -465,14 +545,33 @@ def _page_number(slide, number: int):
 
 
 def _report_line(study: StudyInfo) -> str:
-    return f"{study.title}  |  {study.launched_label}".strip(" |")
+    title = (study.title or "").strip() or "Design Study"
+    return f"{title} Combination Readout"
+
+
+def _mga_logo() -> Path | None:
+    """Brain mark on the cover and the closing slide."""
+    for name in ("mga_logo.png", "cover_Picture_17.png"):
+        path = ASSETS / name
+        if path.exists() and path.stat().st_size > 0:
+            return path
+    return None
 
 
 def _marks(slide):
-    mga = ASSETS / "mga_logo.png"
-    _text(slide, "MGA", 1.15, 2.45, 2.4, 0.5, size=28, bold=True, color=NAVY, align=PP_ALIGN.CENTER)
-    if mga.exists():
-        slide.shapes.add_picture(str(mga), Inches(1.377), Inches(3.55), Inches(1.795), Inches(1.795))
+    logo = _mga_logo()
+    if logo is not None:
+        slide.shapes.add_picture(str(logo), Inches(1.377), Inches(3.915), Inches(1.795), Inches(1.795))
+
+
+def _cover_headline(study: StudyInfo) -> str:
+    question = (study.main_question or "").strip()
+    return question or "Design Combination Readout v2"
+
+
+def _prepared_by_line(study: StudyInfo) -> str:
+    credit = (study.prepared_by or "").strip()
+    return f"Prepared by: {credit}" if credit else "Prepared by:"
 
 
 def _cover(presentation, study: StudyInfo):
@@ -481,15 +580,18 @@ def _cover(presentation, study: StudyInfo):
     _marks(slide)
     _hairline(slide, 4.2464, 1.3478, 4.2464, 1.3478 + 4.7826)
     _hairline(slide, 4.5996, 3.75, 4.5996 + 6.8551, 3.75)
-    _text(slide, "Design Combination Readout v2", 4.60, 1.98, 8.48, 0.85, size=32, bold=True, color=NAVY)
+    headline = _cover_headline(study)
+    headline_size = 28 if len(headline) > 70 else 32 if len(headline) > 40 else 36
+    headline_height = 1.55 if len(headline) > 40 else 0.85
+    _text(slide, headline, 4.60, 1.98, 8.48, headline_height, size=headline_size, bold=True, color=NAVY)
     _text(slide, _report_line(study), 4.60, 4.24, 8.2, 0.37, size=16, color=NAVY)
     _text(
         slide,
-        "Prepared by: J Brown Fitterman | jbrown@mindgenomicsassociates.com",
-        4.60, 4.63, 7.64, 0.37, size=16, color=NAVY,
+        _prepared_by_line(study),
+        4.60, 4.63, 8.4, 0.37, size=16, color=NAVY,
     )
     _text(slide, "Mind Genomics Associates, Inc", 4.60, 5.01, 4.2, 0.37, size=16, color=NAVY)
-    _text(slide, study.country, 4.60, 5.71, 8.0, 0.44, size=16, color=NAVY)
+    _text(slide, study.title, 4.60, 5.71, 8.4, 0.55, size=16, color=NAVY)
     return slide
 
 
@@ -504,11 +606,11 @@ def _thanks(presentation, study: StudyInfo):
     _text(slide, _report_line(study), 4.60, 4.24, 8.2, 0.37, size=16, color=NAVY)
     _text(
         slide,
-        "Prepared by: J Brown Fitterman | jbrown@mindgenomicsassociates.com",
-        4.60, 4.63, 7.64, 0.37, size=16, color=NAVY,
+        _prepared_by_line(study),
+        4.60, 4.63, 8.4, 0.37, size=16, color=NAVY,
     )
     _text(slide, "Mind Genomics Associates, Inc", 4.60, 5.01, 4.2, 0.37, size=16, color=NAVY)
-    _text(slide, study.country, 4.60, 5.71, 8.0, 0.44, size=16, color=NAVY)
+    _text(slide, study.title, 4.60, 5.71, 8.4, 0.55, size=16, color=NAVY)
     return slide
 
 
@@ -550,35 +652,65 @@ def _how_to_read(presentation, study: StudyInfo, groups: list[Group]):
     )
     add_rect(slide, 0.83, 1.32, 6.05, 5.45, WHITE, rounded=True, radius=0.04, line=RGBColor(0xF0, 0xE4, 0xEA))
     _text(slide, "How the model works", 1.05, 1.48, 5.6, 0.32, size=16, bold=True, color=NAVY)
-    _text(
-        slide,
-        (
-            "Respondents rated a large number of sign combinations — each showing different design elements. "
-            "The model then separates those ratings into an individual lift score.\n\n"
-            "Each lift score shows how much that element raises or lowers appeal relative to the model baseline.\n\n"
-            "A saved combination keeps one option from each layer. Swapping one element only changes that slot. "
-            "Everything else stays, because each score was measured on its own."
-        ),
-        1.05, 1.90, 5.6, 4.5, size=14, color=INK,
-    )
+    _text(slide, _model_copy(study.visual), 1.05, 1.90, 5.6, 4.5, size=14, color=INK)
     add_rect(slide, 7.08, 1.32, 5.75, 5.45, CARD, rounded=True, radius=0.04)
     add_rect(slide, 7.08, 1.32, 5.75, 0.1, TEAL)
     _text(slide, "Example from the saved builds", 7.28, 1.55, 5.35, 0.4, size=16, bold=True, color=NAVY)
-    _text(slide, _example_copy(groups), 7.28, 2.15, 5.35, 4.3, size=14, color=INK)
+    _text(slide, _example_copy(groups, study.visual), 7.28, 2.15, 5.35, 4.3, size=14, color=INK)
     return slide
 
 
-def _example_copy(groups: list[Group]) -> str:
+def _slot_words(visual: str) -> tuple[str, str]:
+    if visual == "text":
+        return "statement", "statements"
+    if visual == "grid":
+        return "image", "images"
+    return "layer", "layers"
+
+
+def _model_copy(visual: str) -> str:
+    one, many = _slot_words(visual)
+    if visual == "grid":
+        opening = "Respondents rated grids of images — one image from each set. "
+        closing = (
+            "A saved combination keeps one image from each set. The images sit side by side. They are not stacked. "
+            "Swapping one image only changes that set. Everything else stays, because each score was measured on its own."
+        )
+    elif visual == "text":
+        opening = "Respondents rated mixes of statements. "
+        closing = (
+            "A saved combination keeps one statement from each group, written in full. "
+            "Swapping one statement only changes that line. Everything else stays, because each score was measured on its own."
+        )
+    else:
+        opening = "Respondents rated a large number of sign combinations — each showing different design elements. "
+        closing = (
+            "A saved combination keeps one option from each layer. Swapping one element only changes that slot. "
+            "Everything else stays, because each score was measured on its own."
+        )
+    return (
+        f"{opening}"
+        "The model then separates those ratings into an individual lift score.\n\n"
+        f"Each lift score shows how much that {one} raises or lowers appeal relative to the model baseline.\n\n"
+        f"{closing}"
+    )
+
+
+def _example_copy(groups: list[Group], visual: str = "layer") -> str:
+    one, many = _slot_words(visual)
     pair = _swap_example(groups)
     if pair is None:
-        return "Each row in the build slides is one layer. The number beside it is that element’s lift. The total is the sum of the selected lifts."
+        return (
+            f"Each row in the build slides is one {one}. The number beside it is that {one}’s lift. "
+            "The total is the sum of the selected lifts."
+        )
     group, higher, lower, index = pair
     changed_high = higher.elements[index]
     changed_low = lower.elements[index]
     return (
         f"In {group.segment}, one build uses {changed_high.label} ({_lift(changed_high.lift)}) in {changed_high.category}.\n\n"
         f"Swapping to {changed_low.label} ({_lift(changed_low.lift)}) only changes that slot. "
-        f"The other layers stay as they are.\n\n"
+        f"The other {many} stay as they are.\n\n"
         f"The result: {changed_low.label} totals {_lift(lower.total)} against {_lift(higher.total)} "
         f"for {changed_high.label} — a difference of {abs(higher.total - lower.total):.1f} points."
     )
@@ -637,7 +769,10 @@ def _compare(presentation, study: StudyInfo, group: Group, builds: list[Build], 
     _text(slide, meta["chip"], 0.83, 1.36, 4.2, 0.22, size=11, bold=True, color=GRAY)
 
     _variance_chart(slide, builds, kind, 0.55, 1.68, 7.7, 5.05)
-    _thumbnail_panel(slide, study, builds, kind, 8.50, 0.95, 4.52, 5.75)
+    if study.visual == "layer":
+        _thumbnail_panel(slide, study, builds, kind, 8.50, 0.95, 4.52, 5.75)
+    else:
+        _open_thumbnails(slide, study, builds, kind, 8.50, 0.95, 4.52, 5.75)
     note = _text(slide, _sample_line(study, group, kind), 0.75, 7.05, 12.0, 0.36, size=9, color=GRAY)
     note.text_frame.word_wrap = True
     return slide
@@ -669,13 +804,23 @@ def _variance_chart(slide, builds: list[Build], kind: str, x, y, w, h):
         point.format.fill.solid()
         point.format.fill.fore_color.rgb = _BAR_COLORS[index % len(_BAR_COLORS)]
 
-    peak = max((build.total for build in builds), default=4)
-    headroom = max(peak * 0.28, 0.25 if peak < 5 else 4)
-    axis_max = _nice_ceiling(peak + headroom)
+    values = [build.total for build in builds] or [0.0]
+    low = min(min(values), 0.0)
+    high = max(max(values), 0.0)
+    if low >= 0:
+        peak = max(values)
+        headroom = max(peak * 0.28, 0.25 if peak < 5 else 4)
+        axis_min = 0.0
+        axis_max = _nice_ceiling(peak + headroom)
+    else:
+        span = max(high - low, 1)
+        pad = max(span * 0.28, 0.5)
+        axis_min = -_nice_ceiling(abs(low) + pad)
+        axis_max = _nice_ceiling(high + pad) if high > 0 else _nice_ceiling(pad)
     value_axis = chart.value_axis
-    value_axis.minimum_scale = 0
-    value_axis.maximum_scale = axis_max
-    value_axis.major_unit = _axis_step(axis_max)
+    value_axis.minimum_scale = axis_min
+    value_axis.maximum_scale = axis_max if axis_max > axis_min else axis_min + 1
+    value_axis.major_unit = _axis_step(axis_max - axis_min)
     value_axis.has_major_gridlines = True
     value_axis.major_gridlines.format.line.color.rgb = RGBColor(0xE2, 0xE2, 0xE2)
     value_axis.has_title = True
@@ -733,9 +878,13 @@ def _thumbnail_panel(slide, study: StudyInfo, builds: list[Build], kind: str, x,
 
 
 def _chart_label(label: str) -> str:
-    if " · " in label and len(label) > 22:
-        return label.replace(" · ", "\n", 1)
-    return label
+    text = label.replace(" · ", "\n", 1) if " · " in label and len(label) > 22 else label
+    lines = []
+    for line in text.split("\n"):
+        if len(line) > 36:
+            line = line[:35].rstrip(" .,;:—-") + "…"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _nice_ceiling(value: float) -> float:
@@ -786,7 +935,7 @@ def _pack(presentation, study: StudyInfo, group: Group, build: Build, headline: 
     digits = _digits(kind)
     _text(slide, f"A-FRAME KEY FINDINGS: {meta['family']}", 0.83, 0.38, 8.2, 0.22, size=11, bold=True, color=_EYEBROW)
     add_rect(slide, 0.83, 0.68, 8.20, 0.36, _BAR)
-    _text(slide, f"{meta['prefix']} · {headline}", 0.95, 0.68, 6.05, 0.36, size=11, bold=True, color=_TITLE, anchor=MSO_ANCHOR.MIDDLE)
+    _text(slide, f"{_prefix(kind, study.visual)} · {headline}", 0.95, 0.68, 6.05, 0.36, size=11, bold=True, color=_TITLE, anchor=MSO_ANCHOR.MIDDLE)
     _text(
         slide, meta["metric"],
         7.05, 0.68, 1.85, 0.36,
@@ -799,13 +948,18 @@ def _pack(presentation, study: StudyInfo, group: Group, build: Build, headline: 
     _text(slide, base, 2.52, 1.10, 1.35, 0.50, size=22, bold=True, color=_TITLE, anchor=MSO_ANCHOR.MIDDLE)
     _text(slide, meta["base_note"], 3.95, 1.18, 4.4, 0.38, size=11, color=_MUTED, anchor=MSO_ANCHOR.MIDDLE)
     add_rect(slide, 0.83, 1.66, 8.20, 0.012, _RULE)
-    _place_element_list(slide, build, digits)
-
-    image = _render(study, build)
-    pack_h = 6.44
-    pack_w = pack_h * study.aspect
-    if image:
-        slide.shapes.add_picture(str(image), Inches(9.20), Inches(0.46), Inches(pack_w), Inches(pack_h))
+    if study.visual == "text":
+        _place_statements(slide, build, digits)
+    else:
+        _place_element_list(slide, build, digits)
+        if study.visual == "grid":
+            _place_grid_images(slide, build)
+        else:
+            image = _render(study, build)
+            pack_h = 6.44
+            pack_w = pack_h * study.aspect
+            if image:
+                slide.shapes.add_picture(str(image), Inches(9.20), Inches(0.46), Inches(pack_w), Inches(pack_h))
 
     places = "three decimals" if digits == 3 else "one decimal"
     _text(slide, _sample_line(study, group, kind, short=True), 0.75, 7.18, 4.6, 0.20, size=7, color=_MUTED)
@@ -816,6 +970,166 @@ def _pack(presentation, study: StudyInfo, group: Group, build: Build, headline: 
         size=7, bold=True, color=_TITLE,
     )
     return slide
+
+
+def _rank_headline(kind: str, index: int, visual: str) -> str:
+    if visual == "layer":
+        ranks = _KIND[kind]["ranks"]
+        if index < len(ranks):
+            return ranks[index]
+        return f"PACK {index + 1}"
+    noun = "STATEMENT" if visual == "text" else "SET"
+    if kind == "bottom":
+        ranks = (
+            f"BOTTOM {noun} 1 — LOWEST LIFT",
+            f"BOTTOM {noun} 2",
+            f"BOTTOM {noun} 3",
+        )
+    elif kind == "response":
+        ranks = (f"{noun} 1", f"{noun} 2", f"{noun} 3")
+    else:
+        ranks = (
+            f"{noun} 1 — HIGHEST LIFT",
+            f"{noun} 2 — SECOND HIGHEST LIFT",
+            f"{noun} 3 — THIRD HIGHEST LIFT",
+        )
+    if index < len(ranks):
+        return ranks[index]
+    return f"{noun} {index + 1}"
+
+
+def _prefix(kind: str, visual: str) -> str:
+    if visual == "text":
+        return {"top": "TOP 3 STATEMENTS", "bottom": "BOTTOM 3 STATEMENTS", "response": "RESPONSE TIME"}[kind]
+    if visual == "grid":
+        return {"top": "TOP 3 IMAGE SETS", "bottom": "BOTTOM 3 IMAGE SETS", "response": "RESPONSE TIME"}[kind]
+    return _KIND[kind]["prefix"]
+
+
+def _open_thumbnails(slide, study: StudyInfo, builds: list[Build], kind: str, x, y, w, h):
+    """One row per build. Grid shows the images side by side. Text shows the statement."""
+    digits = _digits(kind)
+    add_rect(slide, x, y, w, h, CARD, rounded=True, radius=0.04)
+    count = max(len(builds), 1)
+    cell_h = h / count
+    for index, build in enumerate(builds):
+        cell_y = y + index * cell_h
+        score_h = 0.28
+        if study.visual == "grid":
+            image_h = max(0.32, cell_h - score_h - 0.22)
+            _grid_thumb_row(slide, build, x + 0.12, cell_y + 0.08, w - 0.24, image_h)
+            label_top = cell_y + 0.08 + image_h
+        else:
+            note = _text(
+                slide, _variant_label(builds, build),
+                x + 0.14, cell_y + 0.06, w - 0.28, max(0.32, cell_h - score_h - 0.12),
+                size=11, color=NAVY,
+            )
+            note.text_frame.word_wrap = True
+            label_top = cell_y + cell_h - score_h - 0.06
+        _text(
+            slide, _lift(build.total, digits),
+            x + 0.12, label_top, w - 0.24, score_h,
+            size=14, bold=True, color=GREEN, align=PP_ALIGN.CENTER,
+        )
+
+
+def _grid_thumb_row(slide, build: Build, x, y, w, h):
+    paths = [element.image_path for element in build.elements if element.image_path and element.image_path.exists()]
+    if not paths:
+        names = " · ".join(element.label for element in build.elements[:4])
+        note = _text(slide, names, x, y, w, h, size=10, color=NAVY, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+        note.text_frame.word_wrap = True
+        return
+    gap = 0.06
+    cell_w = (w - gap * (len(paths) - 1)) / len(paths)
+    for index, path in enumerate(paths):
+        _place_fit(slide, path, x + index * (cell_w + gap), y, cell_w, h)
+
+
+def _place_grid_images(slide, build: Build):
+    """Each selected image in its own cell. Nothing is stacked into a pack."""
+    paths = [element.image_path for element in build.elements if element.image_path and element.image_path.exists()]
+    if not paths:
+        return
+    x, y, w, h = 9.15, 1.85, 3.85, 5.05
+    cols = 2 if len(paths) > 3 else 1
+    rows = (len(paths) + cols - 1) // cols
+    gap = 0.08
+    cell_w = (w - gap * (cols - 1)) / cols
+    cell_h = (h - gap * (rows - 1)) / rows
+    for index, path in enumerate(paths):
+        col = index % cols
+        row = index // cols
+        _place_fit(slide, path, x + col * (cell_w + gap), y + row * (cell_h + gap), cell_w, cell_h)
+
+
+def _place_statements(slide, build: Build, digits: int):
+    """Full statements across the slide. There is no picture column."""
+    elements = build.elements
+    if not elements:
+        _total_row(slide, build.total, 1.85, 0.83, 8.2, 9.2, digits)
+        return
+    top = 1.82
+    bottom = 6.72
+    gap = 0.08
+    cat_w = 1.9
+    text_x = 0.83 + cat_w + 0.1
+    pill_x = 11.85
+    text_w = pill_x - text_x - 0.12
+    size = 13
+    heights = [_statement_height(element.label, text_w, size) for element in elements]
+    block = sum(heights) + gap * (len(elements) - 1) + 0.50
+    if block > bottom - top:
+        size = 11
+        gap = 0.05
+        heights = [_statement_height(element.label, text_w, size) for element in elements]
+    room = bottom - top - 0.50
+    body = sum(heights) + gap * (len(elements) - 1)
+    if body > room and body > 0:
+        scale = room / body
+        heights = [max(0.34, height * scale) for height in heights]
+    cursor = top
+    for element, row_h in zip(elements, heights):
+        _text(slide, element.category, 0.83, cursor, cat_w, row_h, size=11, bold=True, color=_SEGMENT, anchor=MSO_ANCHOR.MIDDLE)
+        statement = _text(slide, element.label, text_x, cursor, text_w, row_h, size=size, color=_INK, anchor=MSO_ANCHOR.MIDDLE)
+        statement.text_frame.word_wrap = True
+        _score_pill(slide, element.lift, pill_x, cursor, row_h, size=12, digits=digits)
+        cursor += row_h + gap
+    if cursor > bottom:
+        cursor = bottom
+    _total_row(slide, build.total, cursor, 0.83, 7.4, pill_x, digits)
+
+
+def _statement_height(text: str, width_in: float, size: float) -> float:
+    chars = max(8, int(width_in * 11 * (11 / max(size, 1))))
+    words = str(text).split() or [""]
+    lines = 1
+    current = 0
+    for word in words:
+        extra = len(word) if current == 0 else current + 1 + len(word)
+        if extra <= chars:
+            current = extra
+            continue
+        lines += 1
+        current = len(word)
+    return max(0.42, lines * (size / 72 * 1.4) + 0.1)
+
+
+def _place_fit(slide, path: Path, x, y, max_w, max_h) -> None:
+    try:
+        with Image.open(path) as image:
+            aspect = image.width / image.height if image.height else 1
+    except OSError:
+        return
+    width = max_h * aspect
+    height = max_h
+    if width > max_w:
+        width = max_w
+        height = width / aspect if aspect else max_h
+    left = x + max(0, (max_w - width) / 2)
+    top = y + max(0, (max_h - height) / 2)
+    slide.shapes.add_picture(str(path), Inches(left), Inches(top), Inches(width), Inches(height))
 
 
 def _place_element_list(slide, build: Build, digits: int = 1):

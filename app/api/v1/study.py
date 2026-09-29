@@ -21,6 +21,7 @@ from app.models.study_model import Study, StudyMember, StudySavedDesign
 from app.services.design_categories import (
     assign_designs_to_category,
     delete_design_category,
+    get_design_category,
     list_design_categories,
     remove_design_from_category,
     rename_design_category,
@@ -34,6 +35,7 @@ from app.schemas.study_schema import (
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
     StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest, StudySavedDesignRenameRequest,
     DesignCategoryOut, DesignCategoryAssignRequest, DesignCategoryAssignResult, DesignCategoryRenameRequest,
+    DesignCategoryPptRequest,
     DesignConstraintIn
 )
 from app.services import study as study_service
@@ -1478,6 +1480,61 @@ def list_design_categories_endpoint(
     db: Session = Depends(get_db),
 ):
     return list_design_categories(db, access.study.id)
+
+
+@router.post("/{study_id}/design-categories/{category_id}/export-ppt")
+def export_design_category_ppt(
+    category_id: UUID,
+    payload: DesignCategoryPptRequest,
+    access: AnalyticsAccess = Depends(get_analytics_access),
+    db: Session = Depends(get_db),
+):
+    """Download the Design Combination Readout for one report-builder category."""
+    from urllib.parse import quote as url_quote
+
+    from app.api.v1.response import _analysis_has_scores, _recall_page_analysis
+    from app.core.analytics_access import analysis_viewer_email
+    from app.core.domain import is_unilever_domain
+    from app.services.analysis_settings import get_study_analysis_settings
+    from app.services.combination_report import CombinationReportError, build_category_pptx
+    from app.services.user import get_user_by_id
+
+    study_obj = access.study
+    category = get_design_category(db, study_obj.id, category_id)
+    analysis = payload.analysis if _analysis_has_scores(payload.analysis) else None
+    source = "page"
+    if analysis is None:
+        source = "page-cache"
+        viewer_email = analysis_viewer_email(db, access)
+        unilever_format = is_unilever_domain(viewer_email or "")
+        options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
+        analysis = _recall_page_analysis(study_obj.id, unilever_format, None, options)
+    if not _analysis_has_scores(analysis):
+        source = "category-only"
+    print(f"combination-ppt {study_obj.id}: analytics source={source}")
+
+    exporter = access.user or get_user_by_id(db, study_obj.creator_id)
+    try:
+        content, filename = build_category_pptx(
+            study_obj=study_obj,
+            category=category,
+            analysis=analysis if isinstance(analysis, dict) else None,
+            prepared_by_name=getattr(exporter, "name", None),
+            prepared_by_email=getattr(exporter, "email", None),
+        )
+    except CombinationReportError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to generate the category report: {exc}") from exc
+
+    ascii_name = "".join(ch if 32 <= ord(ch) < 127 and ch not in '"\\' else "_" for ch in filename).strip(" .") or "Combination Readout.pptx"
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{url_quote(filename, safe='')}",
+        "Access-Control-Expose-Headers": "Content-Disposition",
+    }
+    return StreamingResponse(iter([content]), media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", headers=headers)
 
 
 @router.post(

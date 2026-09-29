@@ -384,6 +384,11 @@ class DesignCategoryAssignResult(BaseModel):
     created_design: Optional[StudySavedDesignOut] = None
 
 
+class DesignCategoryPptRequest(BaseModel):
+    """Optional analysis already loaded on the analytics page. Skips a recompute."""
+    analysis: Optional[Dict[str, Any]] = None
+
+
 class DesignCategoryRenameRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=80)
 
