@@ -2550,6 +2550,9 @@ class StudyAnalysisService:
             ws.cell(row=footer_row, column=1, value="Threshold").font = self.bold_font
             ws.cell(row=footer_row, column=2, value=threshold)
 
-        # Highlight rows where t_with_intercept >= 2 (column C)
-        rule = CellIsRule(operator="greaterThanOrEqual", formula=["2.0"], fill=fill)
-        ws.conditional_formatting.add(f"C2:C{data_last_row}", rule)
+        # Highlight rows where t_with_intercept >= 2 (column C). An empty
+        # coefficient table has only its header (row 1), so C2:C1 would be an
+        # invalid reversed range and openpyxl rejects it as a MultiCellRange.
+        if data_last_row >= 2:
+            rule = CellIsRule(operator="greaterThanOrEqual", formula=["2.0"], fill=fill)
+            ws.conditional_formatting.add(f"C2:C{data_last_row}", rule)

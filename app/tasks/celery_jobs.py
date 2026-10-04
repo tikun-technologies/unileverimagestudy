@@ -18,6 +18,7 @@ import app.models.study_model  # noqa: F401
 import app.models.response_model  # noqa: F401
 import app.models.job_model  # noqa: F401
 import app.models.assistant_message_model  # noqa: F401  # User/Study relationships resolve AssistantConversation
+import app.models.video_asset_model  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +57,12 @@ def _generate_grid_tasks(
     payload: Dict,
     phase_type: Optional[str] = None,
     progress_range: tuple = (20.0, 90.0),
+    generator=None,
 ) -> Dict[str, Any]:
     """Generate grid-style tasks for a phase."""
     from app.services.golden_task_generator import generate_grid_tasks_golden
+
+    generate = generator or generate_grid_tasks_golden
 
     categories_data = []
     payload_categories = payload.get("categories") or []
@@ -103,7 +107,7 @@ def _generate_grid_tasks(
     tpr = int(payload.get("tasks_per_respondent") or 0)
 
     try:
-        result = generate_grid_tasks_golden(
+        result = generate(
             categories_data=categories_data,
             number_of_respondents=payload.get("audience_segmentation", {}).get("number_of_respondents", 0),
             exposure_tolerance_cv=payload.get("exposure_tolerance_cv", 1.0),
@@ -118,6 +122,13 @@ def _generate_grid_tasks(
                 f"Study configuration error{' in ' + phase_type + ' phase' if phase_type else ''}: {str(e)}."
             )
         raise
+
+
+def _generate_video_tasks(job_id: str, payload: Dict) -> Dict[str, Any]:
+    """Video studies use their own service. It currently delegates to the grid matrix."""
+    from app.services.video_matrix.video_task_generator import generate_video_tasks_golden
+
+    return _generate_grid_tasks(job_id, payload, generator=generate_video_tasks_golden)
 
 
 def _generate_layer_tasks(job_id: str, payload: Dict) -> Dict[str, Any]:
@@ -403,6 +414,8 @@ def generate_tasks_celery(
 
         if study_type in ("grid", "text"):
             result = _generate_grid_tasks(job_id, payload)
+        elif study_type == "video":
+            result = _generate_video_tasks(job_id, payload)
         elif study_type == "layer":
             result = _generate_layer_tasks(job_id, payload)
         elif study_type == "hybrid":

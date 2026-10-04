@@ -168,6 +168,8 @@ class BackgroundTaskService:
             
             if study_type in ('grid', 'text'):
                 result = await self._generate_grid_tasks_async(job, payload, db)
+            elif study_type == 'video':
+                result = await self._generate_video_tasks_async(job, payload, db)
             elif study_type == 'layer':
                 result = await self._generate_layer_tasks_async(job, payload, db)
             elif study_type == 'hybrid':
@@ -419,8 +421,15 @@ class BackgroundTaskService:
     async def _generate_grid_tasks_async(self, job: Job, payload: Dict, db: Session):
         return await self._generate_tasks_for_phase(job, payload, db, phase_type=None)
 
-    async def _generate_tasks_for_phase(self, job: Job, payload: Dict, db: Session, phase_type: Optional[str] = None, progress_range: tuple = (20.0, 90.0)):
+    async def _generate_video_tasks_async(self, job: Job, payload: Dict, db: Session):
+        from app.services.video_matrix.video_task_generator import generate_video_tasks_golden
+        return await self._generate_tasks_for_phase(
+            job, payload, db, phase_type=None, generator=generate_video_tasks_golden
+        )
+
+    async def _generate_tasks_for_phase(self, job: Job, payload: Dict, db: Session, phase_type: Optional[str] = None, progress_range: tuple = (20.0, 90.0), generator=None):
         from app.services.golden_task_generator import generate_grid_tasks_golden
+        generate = generator or generate_grid_tasks_golden
 
         categories_data = []
         payload_categories = payload.get('categories') or []
@@ -490,7 +499,7 @@ class BackgroundTaskService:
         try:
             result = await loop.run_in_executor(
                 None,
-                lambda: generate_grid_tasks_golden(
+                lambda: generate(
                     categories_data=categories_data,
                     number_of_respondents=payload.get('audience_segmentation', {}).get('number_of_respondents', 0),
                     exposure_tolerance_cv=payload.get('exposure_tolerance_cv', 1.0),

@@ -16,6 +16,7 @@ from app.models import (
     template_model,
     assistant_message_model,
     contact_inquiry_model,
+    video_asset_model,
 )
 
 
@@ -64,8 +65,8 @@ def run_migrations_offline() -> None:
     script output.
 
     """
-    # Set database URL from settings
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+    # Set database URL from settings (escape % for ConfigParser interpolation)
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
     url = config.get_main_option("sqlalchemy.url")
     context.configure(
         url=url,
@@ -85,8 +86,8 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
-    # Set database URL from settings
-    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+    # Set database URL from settings (escape % for ConfigParser interpolation)
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("%", "%%"))
 
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),

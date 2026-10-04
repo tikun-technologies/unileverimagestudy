@@ -6,9 +6,9 @@ from datetime import datetime
 from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator, AliasChoices
 from typing import Any, Dict, Optional
 
-StudyType = Literal['grid', 'layer', 'text', 'hybrid']
+StudyType = Literal['grid', 'layer', 'text', 'hybrid', 'video']
 StudyStatus = Literal['draft', 'active', 'paused', 'completed']
-ElementType = Literal['image', 'text']
+ElementType = Literal['image', 'text', 'video']
 LayerType = Literal['image', 'text']
 StudyRole = Literal['admin', 'editor', 'viewer']
 DesignMetric = Literal['Top Down', 'Bottom Up', 'Response Time']

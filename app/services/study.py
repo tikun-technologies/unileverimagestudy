@@ -52,13 +52,16 @@ def _ensure_study_type_constraints(payload: StudyCreate) -> None:
     elif payload.study_type == 'text':
         if not payload.elements or len(payload.elements) < 1:
             raise HTTPException(status_code=400, detail="Text study requires non-empty elements (statements).")
+    elif payload.study_type == 'video':
+        if not payload.elements or len(payload.elements) < 1:
+            raise HTTPException(status_code=400, detail="Video study requires non-empty elements.")
     elif payload.study_type == 'hybrid':
         if not payload.elements or len(payload.elements) < 1:
             raise HTTPException(status_code=400, detail="Hybrid study requires non-empty elements.")
         if not payload.phase_order or len(payload.phase_order) < 1:
             raise HTTPException(status_code=400, detail="Hybrid study requires phase_order (e.g., ['grid', 'text'] or ['mix']).")
     else:
-        raise HTTPException(status_code=400, detail="Unsupported study_type. Must be 'grid', 'layer', 'text', or 'hybrid'.")
+        raise HTTPException(status_code=400, detail="Unsupported study_type. Must be 'grid', 'layer', 'text', 'hybrid', or 'video'.")
 
 def _validate_rating_scale(rating_scale: Dict[str, Any]) -> None:
     logger.info(f"Validating rating scale: {rating_scale}")
@@ -147,7 +150,7 @@ def _serialize_grid_element_for_result(element: Any) -> Dict[str, Any]:
         "alt_text": element.alt_text,
         "description": element.description,
     }
-    if element_type == "image":
+    if element_type == "image" or element_type == "video":
         payload["url"] = content
     else:
         payload["text_content"] = content
@@ -179,7 +182,7 @@ def build_study_elements_payload(study: Study) -> Dict[str, List[Dict[str, Any]]
             })
 
     categories: List[Dict[str, Any]] = []
-    if study_type in ("grid", "text", "hybrid"):
+    if study_type in ("grid", "text", "hybrid", "video"):
         elements_by_category_id: Dict[Any, List[Any]] = {}
         for element in study.elements or []:
             elements_by_category_id.setdefault(element.category_id, []).append(element)
@@ -223,7 +226,7 @@ def load_study_elements_payload(
             .options(selectinload(Study.layers).selectinload(StudyLayer.images))
             .where(Study.id == study_id)
         )
-    elif normalized_type in ("grid", "text", "hybrid"):
+    elif normalized_type in ("grid", "text", "hybrid", "video"):
         stmt = (
             select(Study)
             .options(
@@ -525,7 +528,7 @@ def create_study(
 
     # Children (optimize by avoiding intermediate flushes and using bulk saves)
     with db.no_autoflush:
-        if payload.study_type in ('grid', 'text', 'hybrid') and payload.elements:
+        if payload.study_type in ('grid', 'text', 'hybrid', 'video') and payload.elements:
             # Create categories first if provided
             category_map = {}  # category_id -> category_uuid
             if payload.categories:
@@ -1546,8 +1549,8 @@ def update_study(
     # Replace children collections if provided
     if payload.elements is not None:
         # Only valid for grid, text, and hybrid
-        if study.study_type not in ('grid', 'text', 'hybrid'):
-            raise HTTPException(status_code=400, detail="elements can only be set for grid, text, and hybrid studies.")
+        if study.study_type not in ('grid', 'text', 'hybrid', 'video'):
+            raise HTTPException(status_code=400, detail="elements can only be set for grid, text, hybrid, and video studies.")
 
         # Handle categories first - they must be provided when updating elements
         category_map = {}  # category_id -> category_uuid
@@ -2075,7 +2078,10 @@ def regenerate_tasks(
     # Note: Regenerating tasks for active studies may affect ongoing participants
 
     # Default to adapter-backed generators if none provided
-    generator = generator or {"grid": generate_grid_tasks, "layer": generate_layer_tasks}
+    from app.services.video_matrix.video_task_generator import generate_video_tasks
+    generator = generator or {"grid": generate_grid_tasks, "layer": generate_layer_tasks, "video": generate_video_tasks}
+    if "video" not in generator:
+        generator["video"] = generate_video_tasks
 
     if 'grid' not in generator or 'layer' not in generator:
         raise HTTPException(status_code=500, detail="Task generator not configured.")
@@ -2084,7 +2090,7 @@ def regenerate_tasks(
     audience = study.audience_segmentation or {}
     number_of_respondents = audience.get('number_of_respondents')
     computed_total: int = 0
-    if study.study_type in ('grid', 'text'):
+    if study.study_type in ('grid', 'text', 'video'):
         # Cache constants to avoid repeated lookups
         exposure_tolerance_cv = 1.0
         seed = None
@@ -2104,7 +2110,8 @@ def regenerate_tasks(
             num_elements, number_of_respondents, len(elements)
         )
 
-        result = generator['grid'](
+        generator_key = 'video' if study.study_type == 'video' else 'grid'
+        result = generator[generator_key](
             num_elements=num_elements,
             tasks_per_consumer=None,
             number_of_respondents=number_of_respondents,
@@ -2342,7 +2349,7 @@ def validate_tasks(
     # Simplified validation without IPED parameters
     totals: Dict[str, Any] = {}
 
-    if study.study_type in ('grid', 'text', 'hybrid'):
+    if study.study_type in ('grid', 'text', 'hybrid', 'video'):
         # Basic structural checks (skip design_matrix key)
         for respondent, task_list in tasks.items():
             if not str(respondent).isdigit():

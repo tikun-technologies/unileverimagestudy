@@ -41,6 +41,7 @@ from app.schemas.study_schema import (
 from app.services import study as study_service
 from app.services.response import StudyResponseService
 from app.services.task_generation_adapter import generate_grid_tasks, generate_layer_tasks
+from app.services.video_matrix.video_task_generator import generate_video_tasks, generate_video_tasks_golden
 from app.services.study_member_service import study_member_service
 from app.schemas.study_schema import StudyMemberInvite, StudyMemberOut, StudyMemberUpdate
 from app.core.config import settings
@@ -83,7 +84,7 @@ def _generate_preview_tasks(payload: GenerateTasksRequest, number_of_respondents
     # Generate tasks for just 1-3 respondents as a preview
     preview_respondents = min(3, number_of_respondents)
     
-    if payload.study_type == 'grid' or payload.study_type == 'text':
+    if payload.study_type in ('grid', 'text', 'video'):
         # Create a minimal preview for grid and text studies (both use same structure)
         if not payload.elements or not payload.categories:
             return {}
@@ -106,9 +107,11 @@ def _generate_preview_tasks(payload: GenerateTasksRequest, number_of_respondents
                 ]
             })
         
-        from app.services.golden_task_generator import generate_grid_tasks_golden
+        generate_preview = generate_video_tasks_golden if payload.study_type == 'video' else None
+        if generate_preview is None:
+            from app.services.golden_task_generator import generate_grid_tasks_golden as generate_preview
         try:
-            result = generate_grid_tasks_golden(
+            result = generate_preview(
                 categories_data=categories_data,
                 number_of_respondents=preview_respondents,
                 exposure_tolerance_cv=payload.exposure_tolerance_cv or 1.0,
@@ -1250,6 +1253,7 @@ def regenerate_tasks_endpoint(
     generator: Dict[str, Any] = {
         "grid": generate_grid_tasks,
         "layer": generate_layer_tasks,
+        "video": generate_video_tasks,
     }
     result = study_service.regenerate_tasks(
         db=db, study_id=study_id, owner_id=current_user.id, generator=generator
@@ -1947,7 +1951,7 @@ def generate_tasks_from_body_endpoint(
     if payload.design_constraints is not None:
         study_row.design_constraints = [c.model_dump(exclude_none=True) for c in payload.design_constraints]
 
-    if payload.study_type in ('grid', 'text'):
+    if payload.study_type in ('grid', 'text', 'video'):
         if not payload.elements or len(payload.elements) == 0:
             raise HTTPException(status_code=400, detail="Grid study requires elements")
         if not payload.categories or len(payload.categories) == 0:
@@ -2015,8 +2019,10 @@ def generate_tasks_from_body_endpoint(
             # If the quick preflight itself fails for unexpected reasons, proceed to generation as before
             pass
         
-        from app.services.golden_task_generator import generate_grid_tasks_golden
-        result = generate_grid_tasks_golden(
+        generate_fn = generate_video_tasks_golden if payload.study_type == 'video' else None
+        if generate_fn is None:
+            from app.services.golden_task_generator import generate_grid_tasks_golden as generate_fn
+        result = generate_fn(
             categories_data=categories_data,
             number_of_respondents=payload.audience_segmentation.number_of_respondents,
             exposure_tolerance_cv=payload.exposure_tolerance_cv or 1.0,

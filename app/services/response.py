@@ -525,7 +525,7 @@ class StudyResponseService:
             except Exception:
                 pass
         
-        if study_row and effective_study_type in ('grid', 'text'):
+        if study_row and effective_study_type in ('grid', 'text', 'video'):
             # Load element id->name map in E-number order
             elements = self.db.execute(
                 select(StudyElement).where(StudyElement.study_id == study_row.id)
@@ -629,7 +629,7 @@ class StudyResponseService:
         task_type_value = task_phase_type if task_phase_type else (str(study_row.study_type) if study_row else None)
 
         # Idempotency: ignore duplicate of same task_id within the same task phase/type.
-        if task_type_value in ('grid', 'text', 'layer') and self._completed_task_exists(
+        if task_type_value in ('grid', 'text', 'layer', 'video') and self._completed_task_exists(
             response.id,
             request.task_id,
             task_type=task_type_value,
@@ -686,7 +686,7 @@ class StudyResponseService:
                 if completed_task.elements_shown_content is None:
                     completed_task.elements_shown_content = layer_payload
         # For grid/text studies (or hybrid with grid/text phase), if elements_shown_content is missing, hydrate from generated tasks
-        if study_row and effective_study_type in ('grid', 'text'):
+        if study_row and effective_study_type in ('grid', 'text', 'video'):
             try:
                 if completed_task.elements_shown_content is None:
                     from app.services.task_service import TaskService
@@ -920,9 +920,9 @@ class StudyResponseService:
         now_utc = datetime.utcnow()
         study_row: Optional[Study] = self.db.get(Study, response.study_id)
 
-        # Preload element name->url once for grid/text/hybrid enrichment
+        # Preload element name->url once for category-based study enrichment.
         name_to_url: Dict[str, str] = {}
-        if study_row and str(study_row.study_type) in ('grid', 'text', 'hybrid'):
+        if study_row and str(study_row.study_type) in ('grid', 'text', 'hybrid', 'video'):
             elems = self.db.execute(
                 select(StudyElement.name, StudyElement.content).where(StudyElement.study_id == response.study_id)
             ).all()
@@ -1071,7 +1071,10 @@ class StudyResponseService:
             # For hybrid studies, use the phase_type as task_type; otherwise use study_type
             task_type_value = task_phase_type if task_phase_type else (str(study_row.study_type) if study_row else None)
             task_key = (item.task_id, task_type_value)
-            dedupe_allowed = task_type_value in ('grid', 'text', 'layer')
+            # Video tasks use the same stable task IDs and retry/recovery flow as
+            # grid tasks. Treat them as idempotent too so a network retry or the
+            # participant's localStorage recovery cannot save the same rating twice.
+            dedupe_allowed = task_type_value in ('grid', 'text', 'layer', 'video')
             if dedupe_allowed:
                 # Idempotency guards (phase-aware):
                 # 1) task_id+task_type already persisted for this session
@@ -1096,7 +1099,7 @@ class StudyResponseService:
             task_model.study_response_id = response.id
 
             # Grid/text enrichment for content map if missing (also applies to hybrid grid/text phases)
-            if study_row and effective_study_type in ('grid', 'text') and task_model.elements_shown_in_task and not task_model.elements_shown_content:
+            if study_row and effective_study_type in ('grid', 'text', 'video') and task_model.elements_shown_in_task and not task_model.elements_shown_content:
                 enriched = None
                 # Try: resolve from tasks_dict using actual_task_index (NOT parsed from task_id)
                 # because task_id can be duplicated across phases (e.g., "5_0" in both grid and text)
@@ -1482,9 +1485,10 @@ class StudyResponseService:
         header: List[str] = ["Panelist"]
         header.extend([question_id_to_col[qid] for qid in question_id_to_col])
         header.extend(["Gender", "Age", "Task"])
-        # If study is grid, add CategoryName_ImageName columns; else add layer columns
+        # Category-based studies share the same element-presence columns; only
+        # layer studies use the layer-slot representation.
         study_obj: Optional[Study] = self.db.get(Study, study_id)
-        is_grid = bool(study_obj and str(study_obj.study_type) in ('grid', 'text', 'hybrid'))
+        is_grid = bool(study_obj and str(study_obj.study_type) in ('grid', 'text', 'hybrid', 'video'))
         grid_columns: List[tuple[str, str, int]] = []  # (cat_name, element_name, one_based_index_within_cat)
         if is_grid:
             # Load categories with elements to build deterministic headers
@@ -1954,9 +1958,9 @@ class StudyResponseService:
 
                 layer_key_to_header[key] = header_name
 
-        # Grid headers (CategoryName_ImageName by category order and element_id)
+        # Category-based headers (CategoryName_ImageName by category order and element_id)
         grid_columns_opt: List[tuple[str, str, int]] = []  # (cat_name, element_name, one_based_index)
-        if str(study.study_type) in ('grid', 'text', 'hybrid'):
+        if str(study.study_type) in ('grid', 'text', 'hybrid', 'video'):
             from app.models.study_model import StudyCategory, StudyElement
             categories = self.db.execute(
                 select(StudyCategory)
@@ -2737,7 +2741,7 @@ class StudyResponseService:
         if unilever_format:
             response_cols.append(StudyResponse.panelist_id)
             response_cols.append(StudyResponse.session_start_time)  # For panelist deduplication (keep first completed)
-        if str(study.study_type) in ('grid', 'text', 'hybrid'):
+        if str(study.study_type) in ('grid', 'text', 'hybrid', 'video'):
             response_cols.append(StudyResponse.respondent_id)
         responses_query = select(*response_cols).where(StudyResponse.study_id == study_id)
         if completed_only:
@@ -2784,7 +2788,7 @@ class StudyResponseService:
             CompletedTask.elements_shown_content,
             CompletedTask.layers_shown_in_task,
         ]
-        if unilever_format or str(study.study_type) in ('hybrid', 'grid', 'text'):
+        if unilever_format or str(study.study_type) in ('hybrid', 'grid', 'text', 'video'):
             task_cols.append(CompletedTask.task_type)
         tasks_query = select(*task_cols).where(CompletedTask.study_response_id.in_(response_ids))
         tasks_df = pd.read_sql(tasks_query, self.db.bind)
@@ -2939,7 +2943,9 @@ class StudyResponseService:
         full_df['Task'] = full_df['task_index'].fillna(0).astype(int) + 1
         
         # Determine dynamic columns
-        is_grid = str(study.study_type) in ('grid', 'text', 'hybrid')
+        # Video uses the same category/element matrix as grid; the media type
+        # changes rendering, not analytics column construction.
+        is_grid = str(study.study_type) in ('grid', 'text', 'hybrid', 'video')
         dynamic_cols = []
                 
         if is_grid:
@@ -3161,6 +3167,8 @@ class StudyResponseService:
             st = str(study.study_type)
             if st == 'grid':
                 full_df['Task type'] = 'Image'
+            elif st == 'video':
+                full_df['Task type'] = 'Video'
             elif st == 'text':
                 full_df['Task type'] = 'Text'
             elif st == 'layer':

@@ -22,7 +22,7 @@ celery_app = Celery(
     "mindsurve_celery",
     broker=BROKER_URL,
     backend=RESULT_BACKEND,
-    include=["app.tasks.celery_jobs"],
+    include=["app.tasks.celery_jobs", "app.tasks.video_encode"],
 )
 
 celery_app.conf.update(
@@ -39,6 +39,9 @@ celery_app.conf.update(
     task_soft_time_limit=28200,  # 7h50m soft limit (10m before hard)
     broker_heartbeat=1800,       # 30 min heartbeat (match RabbitMQ)
     broker_connection_timeout=30,
+    task_routes={
+        "celery_job.encode_video": {"queue": "video"},
+    },
 )
 
 # Redis-only transport options (skip for rpc:// or amqp)
