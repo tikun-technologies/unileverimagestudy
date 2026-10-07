@@ -125,6 +125,8 @@ class StudyResponse(Base):
     session_start_time = Column(DateTime(timezone=True), nullable=False)
     session_end_time = Column(DateTime(timezone=True), nullable=True)
     is_completed = Column(Boolean, default=False)
+    # True once this respondent has been accepted against screening-option quotas.
+    quota_reserved = Column(Boolean, nullable=False, default=False, server_default="false")
     status = Column(String(20), nullable=True, index=True)
     
     # Classification and Demographics
@@ -176,6 +178,35 @@ class StudyResponse(Base):
         Index("idx_study_response_analytics", "study_id", "is_completed", "is_abandoned"),
         Index("idx_study_response_duration", "study_id", "total_study_duration"),
     )
+
+
+class ScreeningOptionQuota(Base):
+    """Atomic seat counter for one screening-question option."""
+    __tablename__ = "screening_option_quotas"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    study_id = Column(UUID(as_uuid=True), ForeignKey("studies.id", ondelete="CASCADE"), nullable=False)
+    question_id = Column(String(10), nullable=False)
+    option_id = Column(String(10), nullable=False)
+    max_respondents = Column(Integer, nullable=False)
+    accepted_count = Column(Integer, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        UniqueConstraint("study_id", "question_id", "option_id", name="uq_screening_option_quota"),
+        Index("idx_screening_option_quota_lookup", "study_id", "question_id", "option_id"),
+    )
+
+
+class FreedRespondentId(Base):
+    """Respondent numbers returned after a response row is deleted.
+
+    The primary key is (study_id, respondent_id), so claiming the smallest
+    free number is a single index lookup rather than a scan of every response.
+    """
+    __tablename__ = "freed_respondent_ids"
+
+    study_id = Column(UUID(as_uuid=True), ForeignKey("studies.id", ondelete="CASCADE"), primary_key=True)
+    respondent_id = Column(Integer, primary_key=True)
 
 # ---------- Task Session Table ----------
 class TaskSession(Base):

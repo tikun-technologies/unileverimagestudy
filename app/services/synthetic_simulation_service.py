@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.services.synthetic_study_adapter import build_study_data_for_synthetic
 from app.synthetic import process_panelist_response, generate_all_panelist_combinations, expand_panelists_to_count
 from app.services.response import StudyResponseService
+from app.services.screening_quota import assign_panelists_within_option_limits, remaining_screening_seats
 from app.schemas.response_schema import (
     SyntheticRespondentPayload,
     SyntheticClassificationAnswerItem,
@@ -222,6 +223,15 @@ def run_simulation(
     # Same expansion is used for AI and randomize — rating method is chosen later per vignette.
     task_numbers = sorted(available_panelist_numbers)
     panelists_to_run = expand_panelists_to_count(unique_panelists, N, task_numbers)
+    requested = len(panelists_to_run)
+    # If the lined-up option is full, move that respondent to one that still has
+    # room. Skip them only when every option on the question is full.
+    seats = remaining_screening_seats(db, study_id)
+    panelists_to_run, quota_skipped = assign_panelists_within_option_limits(
+        panelists_to_run,
+        study_data.get("classification_questions") or [],
+        seats,
+    )
     total = len(panelists_to_run)
     response_service = StudyResponseService(db)
     simulated = 0
@@ -230,8 +240,20 @@ def run_simulation(
     workers = min(max(1, int(max_panelist_workers or 1)), MAX_CONCURRENT_AI)
     max_vignette_workers = max(1, MAX_CONCURRENT_AI // workers)
 
+    if total == 0:
+        message = f"Simulated 0 of {requested} respondents."
+        if quota_skipped:
+            message += f" {quota_skipped} were not generated because an option limit was already reached."
+        return {"success": True, "respondents_simulated": 0, "message": message}
+
     if progress_callback:
-        progress_callback(0, total, f"Starting simulation for {total} respondent(s)...")
+        start_message = f"Starting simulation for {total} respondent(s)..."
+        if quota_skipped:
+            start_message = (
+                f"Skipping {quota_skipped} respondent(s); an option limit is full. "
+                f"Starting {total}..."
+            )
+        progress_callback(0, total, start_message)
 
     def _build_payload(response: Dict[str, Any], panelist: Dict[str, Any], idx: int) -> SyntheticRespondentPayload:
         classification_answers = {}
@@ -307,6 +329,28 @@ def run_simulation(
         except Exception as e:
             return (idx, None, str(e))
 
+    def _store_generated(idx: int, panelist: Dict[str, Any], response: Dict[str, Any]) -> None:
+        nonlocal simulated, quota_skipped, last_error
+        payload = _build_payload(response, panelist, idx)
+        try:
+            submit_result = _submit_respondent_with_fresh_session(study_id, payload, idx, total)
+        except Exception as e:
+            last_error = str(e)
+            logger.error(f"Respondent {idx + 1}/{total} submission failed: {e}")
+            if progress_callback:
+                progress_callback(simulated, total, f"Respondent {idx + 1}/{total} failed: {e}")
+            return
+        if submit_result.get("quota_full"):
+            quota_skipped += 1
+            logger.info("Respondent %s/%s skipped because an option limit was reached", idx + 1, total)
+            if progress_callback:
+                progress_callback(simulated, total, f"Respondent {idx + 1}/{total} skipped — option limit reached")
+            return
+        simulated += 1
+        session_id = submit_result.get("session_id", "")
+        if progress_callback:
+            progress_callback(simulated, total, f"Respondent {simulated}/{total} done — session_id: {session_id}")
+
     if workers <= 1:
         # Sequential: original loop with fresh DB session per respondent
         for idx, panelist in enumerate(panelists_to_run):
@@ -317,19 +361,7 @@ def run_simulation(
             if err:
                 last_error = err
                 continue
-            payload = _build_payload(response, panelist, idx)
-            try:
-                # Use fresh session to avoid stale connection after long AI processing
-                submit_result = _submit_respondent_with_fresh_session(study_id, payload, idx, total)
-                simulated += 1
-                session_id = submit_result.get("session_id", "")
-                if progress_callback:
-                    progress_callback(simulated, total, f"Respondent {simulated}/{total} done — session_id: {session_id}")
-            except Exception as e:
-                last_error = str(e)
-                logger.error(f"Respondent {idx + 1}/{total} submission failed: {e}")
-                if progress_callback:
-                    progress_callback(simulated, total, f"Respondent {idx + 1}/{total} failed: {e}")
+            _store_generated(idx, panelist, response)
     else:
         # Parallel AI phase: run process_panelist_response in threads.
         # Write to DB in index order as soon as each result is available (buffer approach),
@@ -353,19 +385,7 @@ def run_simulation(
                     continue
                 if response is None:
                     continue
-                payload = _build_payload(response, panelist, idx)
-                try:
-                    # Use fresh session to avoid stale connection after long AI processing
-                    submit_result = _submit_respondent_with_fresh_session(study_id, payload, idx, total)
-                    simulated += 1
-                    session_id = submit_result.get("session_id", "")
-                    if progress_callback:
-                        progress_callback(simulated, total, f"Respondent {simulated}/{total} done — session_id: {session_id}")
-                except Exception as e:
-                    last_error = str(e)
-                    logger.error(f"Respondent {idx + 1}/{total} submission failed: {e}")
-                    if progress_callback:
-                        progress_callback(simulated, total, f"Respondent {idx + 1}/{total} failed: {e}")
+                _store_generated(idx, panelist, response)
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_run_one_panelist, (idx, panelist)): idx for idx, panelist in enumerate(panelists_to_run)}
@@ -379,8 +399,13 @@ def run_simulation(
                 drain_writes()
         drain_writes()
 
+    message = f"Simulated {simulated} of {requested} respondents."
+    if quota_skipped:
+        message += f" {quota_skipped} were not generated because an option limit was already reached."
+    if last_error and simulated + quota_skipped < requested:
+        message += f" Last error: {last_error}"
     return {
         "success": True,
         "respondents_simulated": simulated,
-        "message": f"Simulated {simulated} of {total} respondents." + (f" Last error: {last_error}" if last_error and simulated < total else ""),
+        "message": message,
     }

@@ -548,7 +548,27 @@ def simulate_synthetic_respondents_celery(
     def progress_callback(done: int, total: int, msg: str) -> None:
         try:
             pct = (100.0 * done / total) if total else 0
-            _update_job_progress(job_id, pct, msg)
+            # Always save. The shared progress helper skips moves of 1% or less,
+            # which left the status poll sitting still until a refresh.
+            db_progress = SessionLocal()
+            try:
+                job_row = db_progress.query(Job).filter(Job.job_id == job_id).first()
+                if job_row:
+                    job_row.progress = pct
+                    job_row.message = msg
+                    db_progress.commit()
+            except Exception as db_err:
+                logger.warning(f"Simulate progress DB update failed (non-fatal): {db_err}")
+                try:
+                    db_progress.rollback()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    db_progress.close()
+                except Exception:
+                    pass
+
             logger.info(f"[Simulate AI respondents] {msg} — progress: {pct:.0f}% ({done}/{total})")
 
             job_progress_notifier.notify(

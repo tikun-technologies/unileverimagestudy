@@ -127,7 +127,7 @@ async def upload_videos(
             if not it.get("ok"):
                 continue
             try:
-                asset = register_uploaded_video(record_db, it["public_id"], it["secure_url"])
+                asset = register_uploaded_video(record_db, it["public_id"], it["secure_url"], str(current_user.id))
                 queued.append((it, asset))
             except Exception:
                 logger.exception("Could not record video %s", it.get("public_id"))
@@ -141,7 +141,7 @@ async def upload_videos(
 
         async def _enqueue(item: dict, asset):
             try:
-                await asyncio.to_thread(enqueue_encode, asset)
+                await asyncio.to_thread(enqueue_encode, asset, str(current_user.id))
                 return item, asset.status
             except Exception as exc:
                 logger.exception("Video encode was not queued for %s", asset.public_id)
@@ -198,9 +198,9 @@ def complete_video_upload(
     source_url = _public_url(container, public_id)
     db = SessionLocal()
     try:
-        asset = register_uploaded_video(db, public_id, source_url)
+        asset = register_uploaded_video(db, public_id, source_url, str(current_user.id))
         try:
-            enqueue_encode(asset)
+            enqueue_encode(asset, str(current_user.id))
             encode_status = asset.status
         except Exception as exc:
             logger.exception("Video encode was not queued for %s", public_id)

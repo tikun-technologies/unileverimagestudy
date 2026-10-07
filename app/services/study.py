@@ -23,6 +23,7 @@ from app.services.task_generation_adapter import generate_grid_tasks, generate_l
 from app.services.cloudinary_service import upload_base64, delete_public_id
 from app.core.config import settings
 from app.core.cache import invalidate_study_cache
+from app.services.screening_quota import sync_screening_quotas
 from app.core.domain import (
     is_unilever_domain,
     FRAGRANCE_QUESTION_ID,
@@ -665,7 +666,7 @@ def create_study(
                     raise HTTPException(status_code=409, detail=f"Duplicate question_id: {question.question_id}")
                 seen_question_ids.add(question.question_id)
                 order_offset = 1 if is_special_creator else 0
-                answer_options_json = [option.model_dump() for option in question.answer_options] if question.answer_options else None
+                answer_options_json = [option.model_dump(exclude_none=True) for option in question.answer_options] if question.answer_options else None
                 new_questions.append(StudyClassificationQuestion(
                     id=uuid4(),
                     study_id=study.id,
@@ -679,6 +680,8 @@ def create_study(
                 ))
         if new_questions:
             db.bulk_save_objects(new_questions)
+            db.flush()
+            sync_screening_quotas(db, study.id)
 
     db.commit()
     db.refresh(study)
@@ -928,6 +931,8 @@ def copy_study(db: Session, study_id: UUID, user_id: UUID, project_id: Optional[
                 config=q.config,
             ))
         db.bulk_save_objects(new_questions)
+        db.flush()
+        sync_screening_quotas(db, new_study.id)
 
     db.commit()
     db.refresh(new_study)
@@ -1714,7 +1719,7 @@ def update_study(
             order_offset = 1 if is_special_update else 0
             answer_options_json = None
             if question.answer_options:
-                answer_options_json = [option.model_dump() for option in question.answer_options]
+                answer_options_json = [option.model_dump(exclude_none=True) for option in question.answer_options]
             db.add(StudyClassificationQuestion(
                 id=uuid4(),
                 study_id=study.id,
@@ -1726,6 +1731,9 @@ def update_study(
                 answer_options=answer_options_json,
                 config=_classification_question_config(question)
             ))
+
+        db.flush()
+        sync_screening_quotas(db, study.id)
 
     db.commit()
     db.refresh(study)

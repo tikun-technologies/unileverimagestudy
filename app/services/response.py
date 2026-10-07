@@ -10,12 +10,20 @@ import pandas as pd
 
 from sqlalchemy.orm import Session, selectinload, load_only
 from sqlalchemy import select, func, desc, and_, or_, text, delete
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from fastapi import HTTPException, status
 
 from app.models.response_model import (
     StudyResponse, CompletedTask, ClassificationAnswer, 
     ElementInteraction, TaskSession
+)
+from app.services.screening_quota import (
+    QUOTA_FULL_MESSAGE,
+    quota_full_redirect_url,
+    quota_question_ids,
+    reserve_screening_quotas,
+    resolve_screening_option_id,
+    study_has_screening_quotas,
 )
 from app.models.panelist_model import Panelist
 from app.models.study_model import Study, StudyClassificationQuestion, StudyElement
@@ -359,11 +367,12 @@ class StudyResponseService:
         return response
     
     def delete_response(self, response_id: UUID) -> bool:
-        """Delete a study response."""
+        """Delete a study response and return its respondent number for reuse."""
         response = self.get_response(response_id)
         if not response:
             return False
-        
+
+        self._release_respondent_slot(response.study_id, response.respondent_id)
         self.db.delete(response)
         self.db.commit()
         return True
@@ -373,11 +382,22 @@ class StudyResponseService:
         Fast path delete by (study_id, session_id).
         Uses indexed filters and avoids loading ORM objects into memory.
         """
-        stmt = delete(StudyResponse).where(
-            StudyResponse.study_id == study_id,
-            StudyResponse.session_id == session_id,
+        row = self.db.execute(
+            select(StudyResponse.respondent_id).where(
+                StudyResponse.study_id == study_id,
+                StudyResponse.session_id == session_id,
+            )
+        ).first()
+        if row is None:
+            return False
+
+        self._release_respondent_slot(study_id, row.respondent_id)
+        result = self.db.execute(
+            delete(StudyResponse).where(
+                StudyResponse.study_id == study_id,
+                StudyResponse.session_id == session_id,
+            )
         )
-        result = self.db.execute(stmt)
         deleted = (result.rowcount or 0) > 0
         if not deleted:
             self.db.rollback()
@@ -386,6 +406,66 @@ class StudyResponseService:
         self._update_study_counters(study_id)
         self.db.commit()
         return True
+
+    def _release_respondent_slot(self, study_id: UUID, respondent_id: Optional[int]) -> None:
+        """Put a deleted respondent number back. One indexed insert, no scan."""
+        if respondent_id is None:
+            return
+        bind = getattr(self.db, "bind", None)
+        if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
+            return
+        try:
+            self.db.execute(
+                text(
+                    """
+                    INSERT INTO freed_respondent_ids (study_id, respondent_id)
+                    VALUES (CAST(:study_id AS uuid), :respondent_id)
+                    ON CONFLICT (study_id, respondent_id) DO NOTHING
+                    """
+                ),
+                {"study_id": str(study_id), "respondent_id": int(respondent_id)},
+            )
+        except ProgrammingError:
+            self.db.rollback()
+            raise
+
+    def _claim_freed_respondent_id(self, study_id: UUID) -> Optional[int]:
+        """Take the smallest freed respondent number, or None if there is no gap.
+
+        SKIP LOCKED keeps two starts from receiving the same number, and the
+        lookup uses the primary key so it does not read the response table.
+        """
+        bind = getattr(self.db, "bind", None)
+        if getattr(getattr(bind, "dialect", None), "name", None) != "postgresql":
+            return None
+        try:
+            row = self.db.execute(
+                text(
+                    """
+                    WITH picked AS (
+                        SELECT respondent_id
+                        FROM freed_respondent_ids
+                        WHERE study_id = CAST(:study_id AS uuid)
+                        ORDER BY respondent_id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    DELETE FROM freed_respondent_ids AS freed
+                    USING picked
+                    WHERE freed.study_id = CAST(:study_id AS uuid)
+                      AND freed.respondent_id = picked.respondent_id
+                    RETURNING freed.respondent_id
+                    """
+                ),
+                {"study_id": str(study_id)},
+            ).first()
+        except ProgrammingError:
+            # Table is created by migration. Until then, keep assigning max + 1.
+            self.db.rollback()
+            return None
+        if row is None:
+            return None
+        return int(row[0])
     
     # ---------- Study Participation Flow ----------
     
@@ -774,14 +854,47 @@ class StudyResponseService:
             completion_percentage=response.completion_percentage
         )
     
-    def submit_classification(self, session_id: str, request: SubmitClassificationRequest) -> bool:
+    def submit_classification(self, session_id: str, request: SubmitClassificationRequest) -> Dict[str, Any]:
         """Submit classification answers with upsert logic to prevent duplicates."""
-        response = self.get_response_by_session(session_id)
+        if request.enforce_quota:
+            response = self._get_response_by_session_for_update(session_id)
+        else:
+            response = self.get_response_by_session(session_id)
         if not response:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
+        already_reserved = bool(response.quota_reserved)
+        if request.enforce_quota and not already_reserved:
+            outcome = reserve_screening_quotas(self.db, response, request.answers)
+            if outcome == "skipped":
+                already_reserved = False
+            elif outcome == "rejected":
+                study_id = response.study_id
+                self._release_respondent_slot(study_id, response.respondent_id)
+                self.db.delete(response)
+                self.db.commit()
+                try:
+                    self._update_study_counters(study_id)
+                except Exception:
+                    self.db.rollback()
+                self.invalidate_analytics_cache(study_id)
+                return {
+                    "success": False,
+                    "quota_full": True,
+                    "message": QUOTA_FULL_MESSAGE,
+                    "redirect_url": quota_full_redirect_url(),
+                }
+
+        answers = list(request.answers)
+        if already_reserved:
+            # Only freeze answers for options that actually have a limit.
+            # Studies with no quotas keep the original save behavior.
+            locked_ids = quota_question_ids(self.db, response.study_id)
+            if locked_ids:
+                answers = [answer for answer in answers if str(answer.question_id) not in locked_ids]
+
         # Add or update classification answers (upsert to prevent duplicates)
-        for answer_data in request.answers:
+        for answer_data in answers:
             # Check if an answer already exists for this question
             existing_answers = self.db.execute(
                 select(ClassificationAnswer).where(
@@ -832,8 +945,13 @@ class StudyResponseService:
             self._check_and_complete_studies(study_id=response.study_id)
 
         self.db.commit()
-        
-        return True
+
+        return {
+            "success": True,
+            "quota_full": False,
+            "message": "Classification answers submitted successfully",
+            "redirect_url": None,
+        }
 
     def submit_product_id(self, session_id: str, product_id: str) -> bool:
         """Update product ID for a study session - optimized for speed."""
@@ -1253,21 +1371,47 @@ class StudyResponseService:
         def _truncate(s: str, max_len: int) -> str:
             return (s or "")[:max_len] if s else ""
 
-        classification_answers = [
-            ClassificationAnswerCreate(
-                question_id=_truncate(v.question_id, 10),
-                question_text=_truncate(v.question_text, 500),
-                answer=_truncate(v.answer, 1000),
-                answer_timestamp=now_utc,
-                time_spent_seconds=0.0,
+        # Same option counter as a real respondent. Studies with no limits keep
+        # the original answer text and do not take the quota lock.
+        has_quotas = study_has_screening_quotas(self.db, study_id)
+        questions_by_id: Dict[str, StudyClassificationQuestion] = {}
+        if has_quotas:
+            question_rows = self.db.execute(
+                select(StudyClassificationQuestion).where(StudyClassificationQuestion.study_id == study_id)
+            ).scalars().all()
+            questions_by_id = {str(question.question_id): question for question in question_rows}
+
+        classification_answers = []
+        for v in (payload.classification_answers or {}).values():
+            question_id = _truncate(v.question_id, 10)
+            answer = _truncate(v.answer, 1000)
+            if has_quotas:
+                question = questions_by_id.get(question_id)
+                if question is not None:
+                    resolved = resolve_screening_option_id(question, v.answer or "", v.answer_index)
+                    if resolved:
+                        answer = resolved
+            classification_answers.append(
+                ClassificationAnswerCreate(
+                    question_id=question_id,
+                    question_text=_truncate(v.question_text, 500),
+                    answer=answer,
+                    answer_timestamp=now_utc,
+                    time_spent_seconds=0.0,
+                )
             )
-            for v in (payload.classification_answers or {}).values()
-        ]
         if classification_answers:
-            self.submit_classification(
+            classification_result = self.submit_classification(
                 session_id,
-                SubmitClassificationRequest(answers=classification_answers),
+                SubmitClassificationRequest(answers=classification_answers, enforce_quota=has_quotas),
             )
+            if classification_result.get("quota_full"):
+                return {
+                    "success": False,
+                    "quota_full": True,
+                    "session_id": session_id,
+                    "message": classification_result.get("message") or QUOTA_FULL_MESSAGE,
+                }
 
         bulk_tasks: List[BulkSubmitTaskItem] = []
         for tr in tasks_with_rating:
@@ -2506,7 +2650,8 @@ class StudyResponseService:
         Retries quickly on unique conflicts for (study_id, respondent_id).
         """
         for attempt in range(max_retries + 1):
-            respondent_id = self._get_next_respondent_id(study_id)
+            freed_id = self._claim_freed_respondent_id(study_id)
+            respondent_id = freed_id if freed_id is not None else self._get_next_respondent_id(study_id)
             payload = payload_builder(respondent_id) or {}
             response = StudyResponse(respondent_id=respondent_id, **payload)
             self.db.add(response)

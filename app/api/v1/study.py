@@ -630,7 +630,10 @@ def simulate_ai_respondents_endpoint(
     Body (optional): max_respondents, is_special_creator, randomize. If is_special_creator=true, AI rates only 1 or 5. If randomize=true, use fallback (random) ratings instead of ChatGPT.
     """
     study = study_service.get_study(db=db, study_id=study_id, owner_id=current_user.id)
-    
+    study_type = str(getattr(study.study_type, "value", study.study_type) or "").lower()
+    if study_type == "video":
+        raise HTTPException(status_code=400, detail="AI synthetic study is not available for a video-based study.")
+
     from app.services.task_service import TaskService
     task_service = TaskService(db)
     if not task_service.has_tasks(study_id):

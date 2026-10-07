@@ -23,7 +23,47 @@ def encode_enabled() -> bool:
     )
 
 
-def register_uploaded_video(db: Session, public_id: str, source_url: str) -> VideoAsset:
+def video_encode_event(asset: VideoAsset) -> Dict[str, Any]:
+    status = asset.status or "processing"
+    playback = asset.hls_url if status == "ready" and asset.hls_url else asset.source_url
+    return {
+        "event": "video_encode",
+        "public_id": asset.public_id,
+        "url": asset.source_url,
+        "status": status,
+        "playback_url": playback,
+        "poster_url": asset.poster_url,
+    }
+
+
+def publish_video_encode(user_id: str, asset: VideoAsset) -> None:
+    """Push encode progress on the same user channel as the global jobs websocket."""
+    if not user_id:
+        return
+    from app.core.redis import publish_user_job_update
+
+    publish_user_job_update(str(user_id), video_encode_event(asset))
+
+
+def list_owner_videos(db: Session, owner_id: str) -> List[Dict[str, Any]]:
+    if not owner_id:
+        return []
+    assets = (
+        db.query(VideoAsset)
+        .filter(VideoAsset.owner_id == str(owner_id))
+        .order_by(VideoAsset.updated_at.desc())
+        .limit(400)
+        .all()
+    )
+    return [video_encode_event(asset) for asset in assets]
+
+
+def register_uploaded_video(
+    db: Session,
+    public_id: str,
+    source_url: str,
+    owner_id: Optional[str] = None,
+) -> VideoAsset:
     container = settings.AZURE_STORAGE_CONTAINER or "studies"
     output_prefix = f"videos-hls/{uuid4().hex}"
     asset = db.get(VideoAsset, public_id)
@@ -31,6 +71,8 @@ def register_uploaded_video(db: Session, public_id: str, source_url: str) -> Vid
         asset = VideoAsset(public_id=public_id)
         db.add(asset)
     asset.source_url = source_url
+    if owner_id:
+        asset.owner_id = str(owner_id)
     asset.output_prefix = output_prefix
     asset.hls_url = _public_url(container, f"{output_prefix}/master.m3u8")
     asset.poster_url = _public_url(container, f"{output_prefix}/poster.jpg")
@@ -44,13 +86,17 @@ def register_uploaded_video(db: Session, public_id: str, source_url: str) -> Vid
     return asset
 
 
-def enqueue_encode(asset: VideoAsset) -> None:
+def enqueue_encode(asset: VideoAsset, user_id: Optional[str] = None) -> None:
     if not encode_enabled():
+        if user_id:
+            publish_video_encode(str(user_id), asset)
         return
     from app.tasks.video_encode import encode_video
 
-    encode_video.delay(asset.public_id)
+    encode_video.delay(asset.public_id, str(user_id) if user_id else None)
     logger.info("Queued video encode for %s", asset.public_id)
+    if user_id:
+        publish_video_encode(str(user_id), asset)
 
 
 def apply_encode_result(
@@ -60,6 +106,7 @@ def apply_encode_result(
     hls_url: Optional[str] = None,
     poster_url: Optional[str] = None,
     error: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> VideoAsset:
     asset = db.get(VideoAsset, public_id)
     if asset is None:
@@ -75,6 +122,9 @@ def apply_encode_result(
         _replace_playback_url(db, asset.source_url, asset.hls_url)
     db.commit()
     db.refresh(asset)
+    owner = user_id or asset.owner_id
+    if owner:
+        publish_video_encode(str(owner), asset)
     return asset
 
 

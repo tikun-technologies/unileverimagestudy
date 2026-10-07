@@ -174,4 +174,8 @@ class Settings(BaseSettings):
     # queue. Leave false until that worker is running.
     VIDEO_ENCODE_ENABLED: bool = False
 
+    # CINT quota-full redirect. Leave empty to show an in-app message instead.
+    # The respondent id is appended as RID by the frontend.
+    CINT_QUOTA_FULL_URL: str | None = None
+
 settings = Settings()

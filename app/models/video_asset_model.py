@@ -10,6 +10,7 @@ class VideoAsset(Base):
     __tablename__ = "video_assets"
 
     public_id = Column(String(1024), primary_key=True)
+    owner_id = Column(String(36), nullable=True, index=True)
     source_url = Column(Text, nullable=False)
     hls_url = Column(Text, nullable=True)
     poster_url = Column(Text, nullable=True)

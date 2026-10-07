@@ -338,11 +338,15 @@ class SubmitClassificationRequest(BaseModel):
     """Request to submit classification answers"""
     answers: List[ClassificationAnswerCreate]
     finalize_response: bool = False
+    # True only on the screening Continue click. Per-option clicks must not reserve seats.
+    enforce_quota: bool = False
 
 class SubmitClassificationResponse(BaseModel):
     """Response after submitting classification"""
     success: bool
     message: str
+    quota_full: bool = False
+    redirect_url: Optional[str] = None
 
 class AbandonStudyRequest(BaseModel):
     """Request to mark study as abandoned"""

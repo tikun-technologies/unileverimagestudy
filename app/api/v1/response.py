@@ -687,10 +687,10 @@ def submit_classification(
     Submit classification answers for a study session.
     """
     service = StudyResponseService(db)
-    success = service.submit_classification(session_id, request)
-    
-    # Invalidate analytics caches
-    if success:
+    result = service.submit_classification(session_id, request)
+
+    # Invalidate analytics caches. A quota rejection has already deleted the session.
+    if result.get("success"):
         try:
             response = service.get_response_detail_by_session(session_id)
             if response and response.study_id:
@@ -698,10 +698,12 @@ def submit_classification(
         except Exception as e:
             import logging
             logging.getLogger(__name__).warning(f"Failed to invalidate cache after classification submission: {e}")
-    
+
     return SubmitClassificationResponse(
-        success=success,
-        message="Classification answers submitted successfully" if success else "Failed to submit answers"
+        success=bool(result.get("success")),
+        quota_full=bool(result.get("quota_full")),
+        message=result.get("message") or "Classification answers submitted successfully",
+        redirect_url=result.get("redirect_url"),
     )
 
 @router.post("/submit-synthetic-respondent", response_model=SubmitSyntheticRespondentResponse)

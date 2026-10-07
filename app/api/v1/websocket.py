@@ -755,7 +755,18 @@ async def websocket_user_jobs(
         await websocket.accept()
         logger.info(f"Global job WebSocket connected for user {user_id_str}")
 
-        await websocket.send_json({"event": "snapshot", "jobs": snapshot})
+        from app.services.video_encode_service import list_owner_videos
+
+        videos: list = []
+        db_videos = next(get_db())
+        try:
+            videos = list_owner_videos(db_videos, user_id_str)
+        except Exception:
+            logger.exception("Could not load video encode snapshot for user %s", user_id_str)
+        finally:
+            db_videos.close()
+
+        await websocket.send_json({"event": "snapshot", "jobs": snapshot, "videos": videos})
 
         ping_interval = 30
         start_time = asyncio.get_event_loop().time()

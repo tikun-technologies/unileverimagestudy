@@ -125,6 +125,8 @@ class AnswerOption(BaseModel):
     id: str = Field(..., max_length=10)  # A, B, C, etc.
     text: str = Field(..., max_length=200)
     order: Optional[int] = None
+    # Blank means the option has no respondent cap.
+    max_respondents: Optional[int] = Field(default=None, ge=1)
 
 
 class ProductKey(BaseModel):
