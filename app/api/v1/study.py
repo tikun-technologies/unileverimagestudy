@@ -31,7 +31,7 @@ from app.schemas.study_schema import (
     StudyLaunchOut,
     ChangeStatusPayload, RegenerateTasksResponse, ValidateTasksResponse, StudyStatus, StudyType,
     GenerateTasksRequest, GenerateTasksResult, StudyPublicMinimal, StudyBasicDetails, StudyBasicDetailsV2, SimulateAIRespondentsRequest,
-    ValidateDesignConstraintsResponse,
+    ValidateDesignConstraintsResponse, TaskGenerationPrecheckResponse,
     StudyCreateMinimal, StudyCreateMinimalResponse, CopyStudyRequest,
     StudySavedDesignCreate, StudySavedDesignOut, StudySavedDesignCompareRequest, StudySavedDesignRenameRequest,
     DesignCategoryOut, DesignCategoryAssignRequest, DesignCategoryAssignResult, DesignCategoryRenameRequest,
@@ -1776,6 +1776,17 @@ def validate_design_constraints_endpoint(
     current_user: User = Depends(get_current_active_user),
 ):
     return _validate_design_constraints_payload(payload)
+
+
+@router.post("/generate-tasks/precheck", response_model=TaskGenerationPrecheckResponse)
+def precheck_generate_tasks_endpoint(
+    payload: GenerateTasksRequest,
+    _current_user: User = Depends(get_current_active_user),
+):
+    """Fast arithmetic check for tasks per respondent. Does not start generation."""
+    from app.services.task_generation_precheck import precheck_task_generation
+
+    return precheck_task_generation(payload.model_dump(mode="json"))
 
 
 @router.post("/generate-tasks", response_model=GenerateTasksResult)

@@ -473,9 +473,9 @@ class StudyResponseService:
         """Ultra-fast start study - minimal DB operations for instant response."""
         from app.core.merged_studies import is_merged_study
 
-        # Single query to get only essential study data
+        # Do not select Study.tasks. That column is the old matrix and is unused here.
         study_row = self.db.execute(
-            select(Study.status, Study.title, Study.study_type, Study.main_question, Study.orientation_text, Study.rating_scale, Study.tasks)
+            select(Study.status, Study.title, Study.study_type, Study.main_question, Study.orientation_text, Study.rating_scale)
             .where(Study.id == request.study_id)
         ).first()
         
@@ -497,9 +497,22 @@ class StudyResponseService:
         if is_merged_study(request.study_id):
             done_by_id = (request.done_by_id or "").strip() or f"done_{_uuid4().hex[:12]}"
 
+        legacy_tasks_cache: Dict[str, Any] = {"loaded": False, "tasks": None}
+
+        def _task_count_for(respondent_id: int) -> int:
+            counted = task_service.count_tasks_for_respondent(request.study_id, respondent_id)
+            if counted is not None:
+                return counted
+            # Older studies keep the matrix on studies.tasks. Load it once.
+            if not legacy_tasks_cache["loaded"]:
+                legacy_tasks_cache["tasks"] = self.db.execute(
+                    select(Study.tasks).where(Study.id == request.study_id)
+                ).scalar()
+                legacy_tasks_cache["loaded"] = True
+            return self._calculate_respondent_task_count(legacy_tasks_cache["tasks"], respondent_id)
+
         def _payload_builder(respondent_id: int) -> Dict[str, Any]:
-            respondent_tasks = task_service.get_respondent_tasks(request.study_id, respondent_id)
-            total_tasks_assigned = len(respondent_tasks)
+            total_tasks_assigned = _task_count_for(respondent_id)
             payload = {
                 "study_id": request.study_id,
                 "session_id": session_id,
@@ -2332,25 +2345,30 @@ class StudyResponseService:
         If study_id is provided, only checks that specific study (optimized path).
         """
         import logging
-        from app.models.study_model import Study
         from app.services.study import change_status_fast
         
         logger = logging.getLogger(__name__)
         
-        # Determine which studies to check
+        # Do not load studies.tasks. That column is the old matrix and is only
+        # read later, and only when this study has no rows in the task table.
         if study_id:
-            # Single study check - much faster
             studies_to_check = self.db.execute(
-                select(Study)
-                .where(Study.id == study_id)
-                .where(Study.status.in_(['active', 'paused', 'draft']))
-            ).scalars().all()
+                text("""
+                    SELECT id, status, creator_id, iped_parameters AS audience_segmentation
+                    FROM studies
+                    WHERE id = CAST(:study_id AS uuid)
+                      AND status IN ('active', 'paused', 'draft')
+                """),
+                {"study_id": str(study_id)},
+            ).all()
         else:
-            # Check all eligible studies
             studies_to_check = self.db.execute(
-                select(Study)
-                .where(Study.status.in_(['active', 'paused', 'draft']))
-            ).scalars().all()
+                text("""
+                    SELECT id, status, creator_id, iped_parameters AS audience_segmentation
+                    FROM studies
+                    WHERE status IN ('active', 'paused', 'draft')
+                """)
+            ).all()
         
         for study in studies_to_check:
             # Get current response counts for this study in a single optimized query
@@ -2376,10 +2394,7 @@ class StudyResponseService:
                 )
             except Exception:
                 expected_respondents = 0
-            generated_pool = self._get_generated_respondent_capacity_for_study(
-                study.id,
-                getattr(study, 'tasks', None),
-            )
+            generated_pool = self._get_generated_respondent_capacity_for_study(study.id)
             
             # Debug logging
             logger.info(f"Study {study.id} completion check:")
@@ -2691,6 +2706,14 @@ class StudyResponseService:
                 return count
         except Exception:
             pass
+
+        if legacy_tasks is None:
+            try:
+                legacy_tasks = self.db.execute(
+                    select(Study.tasks).where(Study.id == study_id)
+                ).scalar()
+            except Exception:
+                legacy_tasks = None
 
         return self._get_generated_respondent_capacity(legacy_tasks)
     

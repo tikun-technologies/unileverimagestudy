@@ -18,6 +18,9 @@ class MockExecuteResult:
     def first(self):
         return self._first_value
 
+    def all(self):
+        return self._scalar_items or []
+
     def scalars(self):
         return SimpleNamespace(all=lambda: self._scalar_items or [])
 
@@ -100,4 +103,21 @@ def test_study_completes_when_generated_pool_is_exhausted():
     assert in_progress.status == 'abandoned'
     assert in_progress.abandonment_reason == 'Study completed - response was in progress'
     assert db.commit.called
+    mock_change_status.assert_called_once_with(db, study.id, study.creator_id, 'completed')
+
+
+def test_legacy_matrix_still_closes_the_study_when_task_table_is_empty():
+    study = _build_study(target=2, pool=2)
+    db = MockDB([
+        MockExecuteResult(scalar_items=[study]),
+        MockExecuteResult(first_value=SimpleNamespace(total=2, completed=2, abandoned=0)),
+        MockExecuteResult(scalar_value=0),
+        MockExecuteResult(scalar_value={"1": [{"task_id": "1_0"}], "2": [{"task_id": "2_0"}]}),
+        MockExecuteResult(scalar_items=[]),
+    ])
+    service = StudyResponseService(db)
+
+    with patch('app.services.study.change_status_fast') as mock_change_status:
+        service._check_and_complete_studies(study_id=study.id)
+
     mock_change_status.assert_called_once_with(db, study.id, study.creator_id, 'completed')

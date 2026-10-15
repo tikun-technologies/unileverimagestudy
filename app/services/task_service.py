@@ -265,6 +265,38 @@ class TaskService:
                 return 1 if tasks else 0
         return 0
     
+    def count_tasks_for_respondent(self, study_id: UUID, respondent_id: int) -> Optional[int]:
+        """Count one respondent's tasks without loading task JSON.
+
+        Returns the count when ``study_task_assignments`` holds this study,
+        including 0 when that respondent has no rows. Returns None when the
+        table is empty or unavailable so the caller can use the legacy matrix.
+        """
+        try:
+            count = self.db.execute(
+                select(func.count())
+                .select_from(StudyTaskAssignment)
+                .where(
+                    StudyTaskAssignment.study_id == study_id,
+                    StudyTaskAssignment.respondent_id == respondent_id,
+                )
+            ).scalar() or 0
+            if count > 0:
+                return int(count)
+
+            any_row = self.db.execute(
+                select(StudyTaskAssignment.id)
+                .where(StudyTaskAssignment.study_id == study_id)
+                .limit(1)
+            ).scalar_one_or_none()
+            if any_row is not None:
+                return 0
+            return None
+        except Exception as e:
+            logger.debug(f"study_task_assignments count failed, using legacy: {e}")
+            self.db.rollback()
+            return None
+
     def has_tasks(self, study_id: UUID) -> bool:
         """Check if study has any tasks (in new table or legacy)."""
         try:

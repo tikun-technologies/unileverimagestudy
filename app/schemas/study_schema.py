@@ -115,7 +115,7 @@ class DesignConstraintElementRef(BaseModel):
 
 class DesignConstraintIn(BaseModel):
     id: Optional[str] = Field(default=None, max_length=100)
-    name: str = Field(..., max_length=255)
+    name: str = Field(..., max_length=2000)
     anchors: List[DesignConstraintElementRef] = Field(default_factory=list)
     blocked: List[DesignConstraintElementRef] = Field(default_factory=list)
     created_at: Optional[int] = None
@@ -583,6 +583,16 @@ class ValidateDesignConstraintsResponse(BaseModel):
     row_universe_rank: int = 0
     required_rank: int = 0
     suggestions: List[str] = []
+
+class TaskGenerationPrecheckResponse(BaseModel):
+    can_generate: bool
+    multiplier: float
+    tasks_per_respondent: int
+    generated_respondents: int
+    total_elements: int
+    reason: str
+    scarce_layer: Optional[str] = None
+    expected_failures: float = 0
 
 class GenerateTasksRequest(BaseModel):
     study_id: Optional[UUID] = None
