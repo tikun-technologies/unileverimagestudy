@@ -13,6 +13,61 @@ from openpyxl.utils import get_column_letter
 
 from app.services.analysis_settings import DEFAULT_ANALYSIS_SETTINGS, normalize_analysis_settings
 
+
+def rating_token(value: Any) -> Any:
+    """One comparable score. Blank and NaN are missing. 5, 5.0, and \"5\" are the same."""
+    if value is None:
+        return None
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in {"nan", "none", "null"}:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return text
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            text = str(value).strip()
+            return text or None
+    try:
+        if number != number:
+            return None
+    except Exception:
+        return None
+    if number.is_integer():
+        return int(number)
+    return number
+
+
+def constant_rater_ids(panelists: List[Any], ratings: List[Any]) -> set:
+    """Respondents with at least two scores, all the same. One score, or a blank-only row, stays."""
+    seen: Dict[Any, set] = {}
+    counts: Dict[Any, int] = {}
+    for panelist, rating in zip(panelists, ratings):
+        if panelist is None:
+            continue
+        try:
+            if panelist != panelist:
+                continue
+        except Exception:
+            pass
+        token = rating_token(rating)
+        if token is None:
+            continue
+        bucket = seen.setdefault(panelist, set())
+        bucket.add(token)
+        counts[panelist] = counts.get(panelist, 0) + 1
+    return {panelist for panelist, total in counts.items() if total >= 2 and len(seen.get(panelist, ())) == 1}
+
+
 class StudyAnalysisService:
     def __init__(self):
         self.rng = np.random.default_rng(123)
@@ -93,6 +148,10 @@ class StudyAnalysisService:
             df = df.sort_values([self.PANEL_COL, self.TASK_COL]).reset_index(drop=True) if not df.empty else df
             if df.empty:
                 raise ValueError("No respondents match the applied filters.")
+
+        df = self._without_constant_raters(df, analysis_options)
+        if df.empty and analysis_options.get("exclude_constant_raters"):
+            raise ValueError("No respondents remain after removing people who rated every task the same.")
 
         # 1. Preprocess Data
         # Handle NA values if not already handled
@@ -375,11 +434,25 @@ class StudyAnalysisService:
             )
             df = df.sort_values([self.PANEL_COL, self.TASK_COL]).reset_index(drop=True) if not df.empty else df
 
+        rows_before_constant = int(len(df))
+        panelists_before_constant = (
+            int(df[self.PANEL_COL].nunique()) if self.PANEL_COL in df.columns and not df.empty else 0
+        )
+        df = self._without_constant_raters(df, analysis_options)
         rows_after = int(len(df))
         panelists_after = int(df[self.PANEL_COL].nunique()) if self.PANEL_COL in df.columns and not df.empty else 0
-
-        if filters_active and df.empty:
-            return self._build_empty_filtered_json_report(
+        excluded_constant_raters = (
+            max(0, panelists_before_constant - panelists_after)
+            if analysis_options.get("exclude_constant_raters")
+            else 0
+        )
+        if df.empty and (filters_active or analysis_options.get("exclude_constant_raters")):
+            empty_reason = (
+                "No respondents remain after removing people who rated every task the same."
+                if rows_before_constant and analysis_options.get("exclude_constant_raters")
+                else "No respondents match the applied filters."
+            )
+            empty_report = self._build_empty_filtered_json_report(
                 study_data=study_data,
                 filters_applied=normalized_filters,
                 filter_meta={
@@ -390,7 +463,11 @@ class StudyAnalysisService:
                 },
                 include_raw_data=include_raw_data,
                 analysis_options=analysis_options,
+                error=empty_reason,
             )
+            if excluded_constant_raters and isinstance(empty_report.get("dashboard_summary"), dict):
+                empty_report["dashboard_summary"]["excludedConstantRaters"] = excluded_constant_raters
+            return empty_report
         # 1. Preprocess Data (same as generate_report)
         elements_json = study_data.get("elements", [])
         categories_json = study_data.get("categories", [])
@@ -582,6 +659,8 @@ class StudyAnalysisService:
         # 5c. Lightweight dashboard stats used by the analytics page overview.
         # This replaces the need to ship full RawData in the optimized endpoint.
         result["dashboard_summary"] = self._build_dashboard_summary(df, categories)
+        if excluded_constant_raters:
+            result["dashboard_summary"]["excludedConstantRaters"] = excluded_constant_raters
 
         if include_raw_data:
             # RawData is useful for full exports/debugging, but it is very large for
@@ -807,6 +886,22 @@ class StudyAnalysisService:
             info_block["Categories"].append(cat_info)
         return info_block
 
+    def _without_constant_raters(self, df: pd.DataFrame, analysis_options: Dict[str, Any]) -> pd.DataFrame:
+        if not analysis_options.get("exclude_constant_raters"):
+            return df
+        if df is None or df.empty:
+            return df
+        if self.PANEL_COL not in df.columns or self.RATING_COL not in df.columns:
+            return df
+        drop_ids = constant_rater_ids(
+            df[self.PANEL_COL].tolist(),
+            df[self.RATING_COL].tolist(),
+        )
+        if not drop_ids:
+            return df
+        kept = df[~df[self.PANEL_COL].isin(drop_ids)].copy()
+        return kept.reset_index(drop=True)
+
     def _build_empty_filtered_json_report(
         self,
         study_data: Dict[str, Any],
@@ -814,6 +909,7 @@ class StudyAnalysisService:
         filter_meta: Dict[str, Any],
         include_raw_data: bool,
         analysis_options: Dict[str, Any],
+        error: str = "No respondents match the applied filters.",
     ) -> Dict[str, Any]:
         categories = study_data.get("categories", [])
         info_block = self._build_information_block(study_data)
@@ -836,7 +932,7 @@ class StudyAnalysisService:
         result: Dict[str, Any] = {
             "analysis_settings": analysis_options,
             "filters_applied": filters_applied,
-            "filter_meta": {**filter_meta, "error": "No respondents match the applied filters."},
+            "filter_meta": {**filter_meta, "error": error},
             "Front Page": {
                 "Title": study_data.get("title", ""),
                 "Main Question": study_data.get("main_question", ""),
@@ -1410,13 +1506,20 @@ class StudyAnalysisService:
             df, age_groups=age_groups, genders=genders, classification_filters=classification_filters
         )
         df_filtered = df_filtered.sort_values([self.PANEL_COL, self.TASK_COL]).reset_index(drop=True)
+        rows_before_constant = len(df_filtered)
+        df_filtered = self._without_constant_raters(df_filtered, analysis_options)
 
         rows_after = len(df_filtered)
-        panelists_after = int(df_filtered[self.PANEL_COL].nunique())
+        panelists_after = int(df_filtered[self.PANEL_COL].nunique()) if not df_filtered.empty else 0
 
         if df_filtered.empty or not element_cols:
+            empty_reason = (
+                "No respondents remain after removing people who rated every task the same."
+                if rows_before_constant and analysis_options.get("exclude_constant_raters") and df_filtered.empty
+                else "No respondents match the applied filters."
+            )
             return self._empty_filtered_report(
-                "No respondents match the applied filters.",
+                empty_reason,
                 filters,
                 rows_before=rows_before,
                 panelists_before=panelists_before,

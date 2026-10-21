@@ -24,6 +24,7 @@ DEFAULT_ANALYSIS_SETTINGS: Dict[str, Any] = {
     "top": {"hundred": [4, 5], "zero": [1, 2, 3]},
     "bottom": {"hundred": [1, 2], "zero": [3, 4, 5]},
     "regression": {"include_intercept": True},
+    "exclude_constant_raters": False,
 }
 
 
@@ -34,6 +35,7 @@ def default_analysis_settings(max_rating: int = 5) -> Dict[str, Any]:
             "top": {"hundred": list(DEFAULT_ANALYSIS_SETTINGS["top"]["hundred"]), "zero": list(DEFAULT_ANALYSIS_SETTINGS["top"]["zero"])},
             "bottom": {"hundred": list(DEFAULT_ANALYSIS_SETTINGS["bottom"]["hundred"]), "zero": list(DEFAULT_ANALYSIS_SETTINGS["bottom"]["zero"])},
             "regression": {"include_intercept": True},
+            "exclude_constant_raters": False,
         }
     ratings = list(range(1, max_rating + 1))
     mid = max(1, max_rating // 2)
@@ -45,6 +47,7 @@ def default_analysis_settings(max_rating: int = 5) -> Dict[str, Any]:
         "top": {"hundred": top_hundred, "zero": top_zero},
         "bottom": {"hundred": bottom_hundred, "zero": bottom_zero},
         "regression": {"include_intercept": True},
+        "exclude_constant_raters": False,
     }
 
 
@@ -112,10 +115,17 @@ def normalize_analysis_settings(
     else:
         include_intercept = bool(include_intercept)
 
+    exclude_constant_raters = raw.get("exclude_constant_raters")
+    if exclude_constant_raters is None:
+        exclude_constant_raters = False
+    else:
+        exclude_constant_raters = bool(exclude_constant_raters)
+
     return {
         "top": {"hundred": top_hundred, "zero": top_zero},
         "bottom": {"hundred": bottom_hundred, "zero": bottom_zero},
         "regression": {"include_intercept": include_intercept},
+        "exclude_constant_raters": exclude_constant_raters,
     }
 
 

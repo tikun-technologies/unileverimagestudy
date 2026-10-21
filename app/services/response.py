@@ -9,7 +9,7 @@ import random
 import pandas as pd
 
 from sqlalchemy.orm import Session, selectinload, load_only
-from sqlalchemy import select, func, desc, and_, or_, text, delete
+from sqlalchemy import select, func, desc, and_, or_, text, delete, tuple_
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from fastapi import HTTPException, status
 
@@ -37,6 +37,183 @@ from app.schemas.response_schema import (
     AbandonStudyRequest, StudyAnalytics, ResponseAnalytics,
     SyntheticRespondentPayload,
 )
+
+
+def _layer_row_needs_fallback(value: Any) -> bool:
+    """True when elements_shown_in_task is empty and the other JSON may hold the answer.
+
+    NaN is not empty: it blocks the fallback, same as ``nan or next_value``.
+    """
+    try:
+        if value != value:
+            return False
+    except Exception:
+        pass
+    return _payload_is_blank(value)
+
+
+def _payload_is_blank(item: Any) -> bool:
+    """True when this task JSON should be skipped for the next source.
+
+    NaN is truthy in Python, so it is not blank: it blocks the fallback the
+    same way ``value or next_value`` does. Values that cannot be tested are
+    treated as blank so one bad cell does not fail the whole export.
+    """
+    if item is None:
+        return True
+    try:
+        if item != item:
+            return False
+    except Exception:
+        pass
+    try:
+        return not bool(item)
+    except Exception:
+        return True
+
+
+def _first_layer_payload(*sources: Any) -> Optional[Dict[str, Any]]:
+    """First usable layer JSON for one task row.
+
+    Same rule as ``elements_shown_in_task or layers_shown_in_task or
+    elements_shown_content or {}``. A truthy non-dict stops the fallback and
+    yields no columns. None means every layer on this row is 0.
+    """
+    for item in sources:
+        if _payload_is_blank(item):
+            continue
+        if isinstance(item, dict):
+            return item
+        return None
+    return None
+
+
+def _layer_value_visible(value: Any) -> int:
+    """1 when this layer image was shown. Matches the old per-cell rule."""
+    if isinstance(value, dict):
+        vis = value.get("visible")
+        if vis is None:
+            vis = bool(value)
+        return 1 if bool(vis) else 0
+    try:
+        return 1 if int(value) != 0 else 0
+    except (TypeError, ValueError):
+        return 1 if bool(value) else 0
+
+
+def _attach_layer_fallback_payloads(db: Session, tasks_df: pd.DataFrame) -> None:
+    """Load the large layer JSON only for tasks whose visibility column is empty."""
+    tasks_df["elements_shown_content"] = None
+    tasks_df["layers_shown_in_task"] = None
+    if tasks_df.empty or "elements_shown_in_task" not in tasks_df.columns:
+        return
+
+    shown = tasks_df["elements_shown_in_task"].tolist()
+    blank_at = [i for i, value in enumerate(shown) if _layer_row_needs_fallback(value)]
+    if not blank_at:
+        return
+
+    content_by_task: Dict[Tuple[str, int], Any] = {}
+    layers_by_task: Dict[Tuple[str, int], Any] = {}
+    blank_rows = tasks_df.iloc[blank_at]
+    pairs = []
+    for response_id, task_index in zip(
+        blank_rows["study_response_id"].tolist(),
+        blank_rows["task_index"].tolist(),
+    ):
+        try:
+            if task_index != task_index:
+                continue
+            pairs.append((response_id, int(task_index)))
+        except (TypeError, ValueError):
+            continue
+    chunk_size = 400
+    for start in range(0, len(pairs), chunk_size):
+        chunk = pairs[start:start + chunk_size]
+        rows = db.execute(
+            select(
+                CompletedTask.study_response_id,
+                CompletedTask.task_index,
+                CompletedTask.elements_shown_content,
+                CompletedTask.layers_shown_in_task,
+            ).where(
+                tuple_(
+                    CompletedTask.study_response_id,
+                    CompletedTask.task_index,
+                ).in_(chunk)
+            )
+        ).all()
+        for row in rows:
+            key = (str(row.study_response_id), int(row.task_index))
+            content_by_task[key] = row.elements_shown_content
+            layers_by_task[key] = row.layers_shown_in_task
+
+    response_ids = tasks_df["study_response_id"].tolist()
+    task_indexes = tasks_df["task_index"].tolist()
+    content_col = []
+    layers_col = []
+    for response_id, task_index in zip(response_ids, task_indexes):
+        try:
+            key = None if task_index != task_index else (str(response_id), int(task_index))
+        except (TypeError, ValueError):
+            key = None
+        content_col.append(content_by_task.get(key) if key else None)
+        layers_col.append(layers_by_task.get(key) if key else None)
+    tasks_df["elements_shown_content"] = content_col
+    tasks_df["layers_shown_in_task"] = layers_col
+
+
+def _fill_layer_visibility_columns(
+    full_df: pd.DataFrame,
+    layer_keys: List[str],
+    layer_key_to_header: Dict[str, str],
+) -> None:
+    """Write one 0/1 column per layer image.
+
+    One pass over the task rows. When two images share a column name, the
+    later image replaces the whole column, same as assigning them in order.
+    """
+    if not layer_keys:
+        return
+
+    winning_key: Dict[str, str] = {}
+    for key in layer_keys:
+        winning_key[layer_key_to_header[key]] = key
+    owned: Dict[str, List[str]] = {}
+    for header, key in winning_key.items():
+        owned.setdefault(key, []).append(header)
+
+    n = len(full_df)
+    columns = {header: [0] * n for header in winning_key}
+    if n == 0:
+        for header, column in columns.items():
+            full_df[header] = pd.Series(column, index=full_df.index, dtype="int64")
+        return
+
+    def _source(name: str) -> List[Any]:
+        if name not in full_df.columns:
+            return [None] * n
+        return full_df[name].tolist()
+
+    shown = _source("elements_shown_in_task")
+    layers = _source("layers_shown_in_task")
+    content = _source("elements_shown_content")
+
+    for i in range(n):
+        payload = _first_layer_payload(shown[i], layers[i], content[i])
+        if not payload:
+            continue
+        for key, value in payload.items():
+            headers = owned.get(key)
+            if not headers:
+                continue
+            bit = _layer_value_visible(value)
+            for header in headers:
+                columns[header][i] = bit
+
+    for header, column in columns.items():
+        full_df[header] = column
+
 
 # ---------- Study Response Service ----------
 
@@ -2947,19 +3124,28 @@ class StudyResponseService:
 
         response_ids = responses_df['id'].tolist()
 
+        is_layer_study = str(study.study_type) == "layer"
         task_cols = [
             CompletedTask.study_response_id,
             CompletedTask.task_index,
             CompletedTask.rating_given,
             CompletedTask.task_duration_seconds,
             CompletedTask.elements_shown_in_task,
-            CompletedTask.elements_shown_content,
-            CompletedTask.layers_shown_in_task,
         ]
+        # Layer visibility lives in elements_shown_in_task. The other two JSON
+        # columns repeat the full image payload and are only needed when that
+        # column is empty.
+        if not is_layer_study:
+            task_cols.extend([
+                CompletedTask.elements_shown_content,
+                CompletedTask.layers_shown_in_task,
+            ])
         if unilever_format or str(study.study_type) in ('hybrid', 'grid', 'text', 'video'):
             task_cols.append(CompletedTask.task_type)
         tasks_query = select(*task_cols).where(CompletedTask.study_response_id.in_(response_ids))
         tasks_df = pd.read_sql(tasks_query, self.db.bind)
+        if is_layer_study:
+            _attach_layer_fallback_payloads(self.db, tasks_df)
 
         # Fetch answers
         answers_query = select(
@@ -3272,52 +3458,8 @@ class StudyResponseService:
                     col_header = f"{layer.name}-{img.name}".replace('_', '-').replace(' ', '-')
                     layer_key_to_header[layer_key] = col_header
                     dynamic_cols.append(col_header)
-            
-            # Debug: print what we're looking for
-            print("Expected layer keys:", layer_keys)
-            if not full_df.empty:
-                sample_data = full_df.iloc[0]['elements_shown_in_task']
-                print("Sample elements_shown_in_task:", sample_data)
-            
-            # Process layer visibility for each layer key
-            for layer_key in layer_keys:
-                col_header = layer_key_to_header[layer_key]
-                
-                def get_layer_visibility(row, key=layer_key):
-                    """Extract visibility for this specific layer key from a task row."""
-                    # Priority: elements_shown_in_task first (where data actually is)
-                    layer_data = (
-                        row.get('elements_shown_in_task') or 
-                        row.get('layers_shown_in_task') or 
-                        row.get('elements_shown_content') or 
-                        {}
-                    )
-                    
-                    if not isinstance(layer_data, dict):
-                        return 0
-                    
-                    # Check if this exact key exists (e.g., "cap_1", "cool_2")
-                    if key in layer_data:
-                        v = layer_data[key]
-                        
-                        if isinstance(v, dict):
-                            # Check the visible flag
-                            vis = v.get("visible")
-                            if vis is None:
-                                # If no explicit visible flag, assume visible if dict has content
-                                vis = True if len(v.keys()) > 0 else False
-                            return 1 if bool(vis) else 0
-                        else:
-                            # Non-dict value, treat as boolean/integer
-                            try:
-                                return 1 if int(v) != 0 else 0
-                            except:
-                                return 1 if bool(v) else 0
-                    
-                    return 0
-                
-                # Apply function to each row using apply on axis=1
-                full_df[col_header] = full_df.apply(get_layer_visibility, axis=1)
+
+            _fill_layer_visibility_columns(full_df, layer_keys, layer_key_to_header)
 
         # 5. Unilever-only columns (no extra queries; study already loaded)
         if unilever_format:

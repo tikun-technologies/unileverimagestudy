@@ -695,6 +695,10 @@ class StudyAnalysisSettingsPayload(BaseModel):
     top: RatingScoringGroup = Field(default_factory=lambda: RatingScoringGroup(hundred=[4, 5], zero=[1, 2, 3]))
     bottom: RatingScoringGroup = Field(default_factory=lambda: RatingScoringGroup(hundred=[1, 2], zero=[3, 4, 5]))
     regression: AnalysisRegressionSettings = Field(default_factory=AnalysisRegressionSettings)
+    exclude_constant_raters: bool = Field(
+        default=False,
+        description="Drop respondents who gave the same score on every rated task",
+    )
 
 
 class StudyAnalysisSettingsResponse(BaseModel):
