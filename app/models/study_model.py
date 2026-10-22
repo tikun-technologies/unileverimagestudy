@@ -407,7 +407,6 @@ class StudySavedDesign(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint('study_id', 'design_type', 'normalized_name', name='uq_study_saved_designs_study_type_name'),
         Index('idx_study_saved_designs_study_created', 'study_id', 'created_at'),
         Index('idx_study_saved_designs_study_type_created', 'study_id', 'design_type', 'created_at'),
         Index('idx_study_saved_designs_study_updated', 'study_id', 'updated_at'),

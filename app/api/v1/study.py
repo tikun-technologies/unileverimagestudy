@@ -11,8 +11,6 @@ from fastapi import APIRouter, Depends, Query, HTTPException, status, Body, Resp
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import select, desc, delete, and_
-from sqlalchemy.exc import IntegrityError
-
 from app.core.analytics_access import AnalyticsAccess, get_analytics_access, require_analytics_owner
 from app.core.dependencies import get_current_active_user
 from app.db.session import get_db
@@ -1314,16 +1312,6 @@ def create_saved_design_endpoint(
     if not normalized_name:
         raise HTTPException(status_code=400, detail="Design name is required")
 
-    existing_id = db.scalar(
-        select(StudySavedDesign.id).where(
-            StudySavedDesign.study_id == study_id,
-            StudySavedDesign.design_type == design_type,
-            StudySavedDesign.normalized_name == normalized_name,
-        )
-    )
-    if existing_id:
-        raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
-
     configuration = payload.configuration.model_dump(exclude_none=True)
     segment = configuration.get("segment") or {}
     selected_elements = configuration.get("selected_elements") or []
@@ -1345,12 +1333,7 @@ def create_saved_design_endpoint(
     )
 
     db.add(design)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
-
+    db.commit()
     db.refresh(design)
     return _saved_design_to_out(design)
 
@@ -1438,23 +1421,9 @@ def rename_saved_design_endpoint(
         raise HTTPException(status_code=404, detail="Saved design not found.")
 
     if design.normalized_name != normalized_name:
-        existing_id = db.scalar(
-            select(StudySavedDesign.id).where(
-                StudySavedDesign.study_id == study_id,
-                StudySavedDesign.design_type == design.design_type,
-                StudySavedDesign.normalized_name == normalized_name,
-                StudySavedDesign.id != design.id,
-            )
-        )
-        if existing_id:
-            raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
         design.name = payload.name
         design.normalized_name = normalized_name
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
+        db.commit()
         db.refresh(design)
 
     return _saved_design_to_out(design)

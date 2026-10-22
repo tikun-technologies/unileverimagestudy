@@ -148,16 +148,6 @@ def _create_saved_design(db: Session, study_id: UUID, user_id: UUID, payload) ->
     if not normalized_name:
         raise HTTPException(status_code=400, detail="Design name is required")
 
-    existing_id = db.scalar(
-        select(StudySavedDesign.id).where(
-            StudySavedDesign.study_id == study_id,
-            StudySavedDesign.design_type == design_type,
-            StudySavedDesign.normalized_name == normalized_name,
-        )
-    )
-    if existing_id:
-        raise HTTPException(status_code=409, detail="A saved design with this name already exists.")
-
     configuration = payload.configuration.model_dump(exclude_none=True)
     segment = configuration.get("segment") or {}
     selected_elements = configuration.get("selected_elements") or []
