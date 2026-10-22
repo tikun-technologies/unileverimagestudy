@@ -17,9 +17,12 @@ from datetime import datetime
 from pathlib import Path
 
 from pptx import Presentation
+from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION
 from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
 from PIL import Image, ImageChops, ImageDraw
 
@@ -54,35 +57,35 @@ TOP_RANKS = (
     "PACK 3 — THIRD HIGHEST LIFT BUILD",
 )
 BOTTOM_RANKS = (
-    "BOTTOM PACK 1 — LOWEST LIFT BUILD",
-    "BOTTOM PACK 2",
-    "BOTTOM PACK 3",
+    "PACK 1 — LOWEST LIFT BUILD",
+    "PACK 2",
+    "PACK 3",
 )
 RESPONSE_RANKS = ("PACK 1", "PACK 2", "PACK 3")
 
 _KIND = {
     "top": {
-        "family": "TOP COMBINATIONS",
-        "prefix": "TOP 3 PACK COMBINATIONS",
-        "chip": "TOP COMBINATION",
+        "family": "COMBINATIONS",
+        "prefix": "PACK COMBINATIONS",
+        "chip": "COMBINATION",
         "ranks": TOP_RANKS,
-        "metric": "Top Down",
+        "metric": "Pack",
         "base_note": "average appeal before any element is added",
     },
     "bottom": {
-        "family": "BOTTOM COMBINATIONS",
-        "prefix": "BOTTOM 3",
-        "chip": "BOTTOM COMBINATION",
+        "family": "COMBINATIONS",
+        "prefix": "PACK COMBINATIONS",
+        "chip": "COMBINATION",
         "ranks": BOTTOM_RANKS,
-        "metric": "Bottom Up",
+        "metric": "Pack",
         "base_note": "average score before any element is added",
     },
     "response": {
-        "family": "RESPONSE TIME",
-        "prefix": "RESPONSE TIME",
-        "chip": "RESPONSE TIME",
+        "family": "COMBINATIONS",
+        "prefix": "PACK COMBINATIONS",
+        "chip": "COMBINATION",
         "ranks": RESPONSE_RANKS,
-        "metric": "Response Time",
+        "metric": "Pack",
         "base_note": "average time before any element is added",
     },
 }
@@ -230,9 +233,9 @@ def build_combination_readout(
     presentation.core_properties.category = study.model_name
 
     sections = (
-        ("top", "Top 3 Performing\nCombinations"),
-        ("bottom", "Bottom 3 Performing\nCombinations"),
-        ("response", "Response Time\nCombinations"),
+        ("top", "Combinations"),
+        ("bottom", "Combinations"),
+        ("response", "Combinations"),
     )
     slides: list[tuple[str, object]] = []
     slides.append(("plain", _cover(presentation, study)))
@@ -244,6 +247,7 @@ def build_combination_readout(
             continue
         slides.append(("plain", _section(presentation, title)))
         for group, builds in blocks:
+            builds = sorted(builds, key=lambda build: -build.total)
             slides.extend(_group_slides(presentation, study, group, builds, kind))
     slides.append(("plain", _thanks(presentation, study)))
 
@@ -856,11 +860,6 @@ def _section(presentation, title: str):
 def _market(presentation, group: Group, kind: str):
     slide = _blank(presentation)
     set_background(slide, BLUSH)
-    _text(
-        slide, _KIND[kind]["metric"],
-        0.9, 1.85, 11.5, 0.4,
-        size=16, bold=True, color=TEAL, align=PP_ALIGN.CENTER,
-    )
     title = _human_category(group.segment) or "Saved combinations"
     size = 26 if len(title) > 42 else 36
     _text(
@@ -884,7 +883,7 @@ def _how_to_read(presentation, study: StudyInfo, groups: list[Group]):
     add_rect(slide, 0.83, 0.68, 12.0, 0.46, CARD, rounded=True, radius=0.08)
     _text(
         slide,
-        "Top builds are created by selecting the strongest option in each element category",
+        "Combinations are created by selecting the strongest option in each element category",
         0.98, 0.74, 11.7, 0.34, size=15, bold=True, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
     )
     add_rect(slide, 0.83, 1.32, 6.05, 5.45, WHITE, rounded=True, radius=0.04, line=RGBColor(0xF0, 0xE4, 0xEA))
@@ -974,40 +973,215 @@ def _swap_example(groups: list[Group]):
     return group, higher, lower, index
 
 def _compare(presentation, study: StudyInfo, group: Group, builds: list[Build], kind: str) -> list:
-    """Which saved combination is ahead, and by how much.
-
-    Two or three combinations sit side by side. Four or more become a ranked
-    list, ten to a slide, so a long category stays readable.
-    """
-    if len(builds) <= 3:
-        return [_compare_stage(presentation, study, group, builds, kind)]
-    ranked = sorted(enumerate(builds), key=lambda item: (-item[1].total, item[0]))
-    page_size = 10
+    """A ranked bar chart with the packs, then build cards. Each card slide holds one or two combinations."""
+    indexed = list(enumerate(builds))
+    if not indexed:
+        return [_compare_stage(presentation, study, group, [], builds, kind, 0, 1)]
     slides = []
-    total = len(ranked)
-    pages = (total + page_size - 1) // page_size
-    for page_index, start in enumerate(range(0, total, page_size)):
-        page = ranked[start:start + page_size]
+    ranked = sorted(indexed, key=lambda item: (-item[1].total, item[0]))
+    board_size = 6
+    board_count = max(1, (len(ranked) + board_size - 1) // board_size)
+    for page_index, start in enumerate(range(0, len(ranked), board_size)):
         slides.append(
-            _compare_list(
-                presentation, study, group, builds, kind, page,
-                start + 1, total, page_index + 1, pages,
+            _score_board(
+                presentation, study, group, ranked[start:start + board_size], builds, kind, page_index, board_count,
             )
+        )
+    page_size = 2
+    page_count = max(1, (len(indexed) + page_size - 1) // page_size)
+    for page_index, start in enumerate(range(0, len(indexed), page_size)):
+        page = indexed[start:start + page_size]
+        slides.append(
+            _compare_stage(presentation, study, group, page, builds, kind, page_index, page_count)
         )
     return slides
 
 
-def _compare_stage(presentation, study: StudyInfo, group: Group, builds: list[Build], kind: str):
+def _compare_stage(
+    presentation, study: StudyInfo, group: Group, page: list[tuple[int, Build]],
+    builds: list[Build], kind: str, page_index: int, page_count: int,
+):
+    """One slide of the pair. `page` is (saved index, combination)."""
     slide = _blank(presentation)
     set_background(slide, WHITE)
     _rail(slide)
-    insight = _compare_insight(builds, kind, _digits(kind))
+    digits = _digits(kind)
     context = _compare_context(group, builds)
-    top = _draw_finding(slide, kind, insight, context)
-    height = max(2.15, 6.78 - top)
-    _stage_cards(slide, study, builds, kind, 0.83, top, 12.20, height)
-    _compare_footer(slide)
+    if page_count > 1 and page:
+        start = page[0][0] + 1
+        end = page[-1][0] + 1
+        if start == end:
+            place = f"Combination {start} of {len(builds)}"
+        else:
+            place = f"Combinations {start}–{end} of {len(builds)}"
+        context = f"{context}. {place}" if context else place
+    _buildup_heading(slide, kind, builds, digits, context)
+    _buildup_cards(slide, study, page, builds, kind, digits)
+    _buildup_key(slide, builds, kind, digits, page_index < page_count - 1)
     return slide
+
+
+_BAR_COLORS = (
+    RGBColor(0x1A, 0x6A, 0x78),
+    RGBColor(0xE0, 0x7A, 0x2F),
+    RGBColor(0x1F, 0x8A, 0x4C),
+    RGBColor(0x6B, 0x3F, 0xA0),
+    RGBColor(0x2F, 0x8F, 0x57),
+    RGBColor(0x7D, 0xC8, 0x6A),
+)
+
+
+def _score_board(
+    presentation, study: StudyInfo, group: Group, page: list[tuple[int, Build]],
+    builds: list[Build], kind: str, page_index: int, page_count: int,
+):
+    """Ranked bars on the left, the same combinations as a pack grid on the right."""
+    slide = _blank(presentation)
+    set_background(slide, WHITE)
+    _rail(slide)
+    digits = _digits(kind)
+    title = _human_category(group.segment) or "Saved combinations"
+    _text(
+        slide, f"KEY FINDINGS: {title.upper()}",
+        0.62, 0.16, 7.7, 0.22, size=11, bold=True, color=NAVY,
+    )
+    heading = _text(slide, title, 0.62, 0.40, 7.7, 0.62, size=26, bold=True, color=NAVY)
+    heading.text_frame.word_wrap = True
+    _tighten(heading)
+    _score_chart(slide, page, digits, 0.42, 1.22, 7.7, 5.15, title)
+    _score_thumbs(slide, study, page, digits, 8.32, 1.22, 4.70, 5.15)
+    places = "three decimals" if digits >= 3 else "one decimal"
+    sample = f"n={study.respondents} {study.country} respondents. " if study.respondents else ""
+    note = f"{sample}{study.model_name} model: estimated total combination lift above baseline. Values rounded to {places}."
+    if page_count > 1:
+        note = f"{note} {page_index + 1} of {page_count}."
+    footer = _text(slide, note, 0.62, 6.95, 7.7, 0.36, size=10, color=GRAY)
+    footer.text_frame.word_wrap = True
+    _tighten(footer)
+    return slide
+
+
+def _score_chart(slide, page: list[tuple[int, Build]], digits: int, x, y, w, h, banner: str) -> None:
+    banner_h = 0.28
+    add_rect(slide, x + 1.35, y, max(2.2, w - 1.55), banner_h, _BUILD_HEADER)
+    label = _text(
+        slide, banner.upper(),
+        x + 1.35, y, max(2.2, w - 1.55), banner_h,
+        size=11, bold=True, color=_BUILD_ROLE, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _tighten(label)
+    if not page:
+        return
+    data = CategoryChartData()
+    data.categories = [_keep_line(_combination_name(build, index), 1.15, 10, lines=2) for index, build in page]
+    data.add_series("Lift", [build.total for _index, build in page])
+    chart_top = y + banner_h + 0.10
+    chart_shape = slide.shapes.add_chart(
+        XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(x), Inches(chart_top), Inches(w), Inches(h - (chart_top - y)), data,
+    )
+    chart = chart_shape.chart
+    chart.has_legend = False
+    chart.has_title = False
+    plot = chart.plots[0]
+    plot.vary_by_categories = True
+    plot.has_data_labels = True
+    plot.gap_width = 50
+    labels = plot.data_labels
+    labels.font.size = Pt(11)
+    labels.font.bold = True
+    labels.font.name = FONT
+    labels.font.color.rgb = NAVY
+    labels.number_format = "0.000" if digits >= 3 else "0.0"
+    labels.position = XL_LABEL_POSITION.OUTSIDE_END
+    series = chart.series[0]
+    for index, point in enumerate(series.points):
+        point.format.fill.solid()
+        point.format.fill.fore_color.rgb = _BAR_COLORS[index % len(_BAR_COLORS)]
+    chart.category_axis.has_major_gridlines = False
+    chart.category_axis.tick_labels.font.size = Pt(10)
+    chart.category_axis.tick_labels.font.name = FONT
+    chart.category_axis.tick_labels.font.color.rgb = NAVY
+    chart.value_axis.has_major_gridlines = True
+    chart.value_axis.has_minor_gridlines = False
+    chart.value_axis.tick_labels.font.size = Pt(10)
+    chart.value_axis.tick_labels.font.name = FONT
+    chart.value_axis.tick_labels.font.color.rgb = GRAY
+    peak = max((build.total for _index, build in page), default=1)
+    _set_axis_bounds(chart.value_axis, 0 if min(build.total for _index, build in page) >= 0 else None, _nice_ceiling(max(peak * 1.18, 1)))
+    chart.value_axis.has_title = True
+    chart.value_axis.axis_title.text_frame.paragraphs[0].text = "Estimated total lift above baseline"
+    for paragraph in chart.value_axis.axis_title.text_frame.paragraphs:
+        for run in paragraph.runs:
+            run.font.size = Pt(11)
+            run.font.color.rgb = GRAY
+            run.font.name = FONT
+    _quiet_chart_frame(chart)
+
+
+def _set_axis_bounds(axis, minimum, maximum) -> None:
+    scaling = axis._element.find(qn("c:scaling"))
+    if scaling is None:
+        return
+    for tag, value in (("c:min", minimum), ("c:max", maximum)):
+        if value is None:
+            continue
+        node = scaling.find(qn(tag))
+        if node is None:
+            node = scaling.makeelement(qn(tag), {})
+            scaling.append(node)
+        node.set("val", str(value))
+
+
+def _quiet_chart_frame(chart) -> None:
+    chart_element = chart._element
+    plot_area = chart_element.find(qn("c:chart")).find(qn("c:plotArea"))
+    sp_pr = plot_area.find(qn("c:spPr"))
+    if sp_pr is None:
+        return
+    for child in list(sp_pr):
+        if child.tag == qn("a:ln"):
+            sp_pr.remove(child)
+
+
+def _score_thumbs(slide, study: StudyInfo, page: list[tuple[int, Build]], digits: int, x, y, w, h) -> None:
+    """Packs in two columns, centered in the card. One combination sits alone."""
+    add_rect(slide, x, y, w, h, WHITE, rounded=True, radius=0.04, line=_BUILD_LINE)
+    if not page:
+        return
+    count = len(page)
+    columns = 1 if count == 1 else 2
+    rows = math.ceil(count / columns)
+    pad_x, pad_y = 0.18, 0.16
+    gap_x, gap_y = 0.16, 0.14
+    inner_w = w - pad_x * 2
+    inner_h = h - pad_y * 2
+    cell_w = (inner_w - gap_x * (columns - 1)) / columns
+    name_h, score_h = 0.42, 0.30
+    row_budget = (inner_h - gap_y * (rows - 1)) / rows
+    image_h = min(cell_w * 1.85, max(0.95, row_budget - name_h - score_h))
+    block_h = rows * (image_h + name_h + score_h) + gap_y * (rows - 1)
+    origin_y = y + pad_y + max(0.0, (inner_h - block_h) / 2)
+    shown = [build for _index, build in page]
+    for offset, (index, build) in enumerate(page):
+        row = offset // columns
+        column = offset % columns
+        row_count = min(columns, count - row * columns)
+        row_w = row_count * cell_w + (row_count - 1) * gap_x
+        origin_x = x + pad_x + (inner_w - row_w) / 2
+        left = origin_x + column * (cell_w + gap_x)
+        top = origin_y + row * (image_h + name_h + score_h + gap_y)
+        _card_visual(slide, study, shown, build, left, top, cell_w, image_h, anchor="bottom")
+        name = _keep_line(_combination_name(build, index), cell_w - 0.06, 12, lines=2, bold=True)
+        name_box = _text(
+            slide, name, left, top + image_h, cell_w, name_h,
+            size=12, bold=True, color=NAVY, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+        )
+        _tighten(name_box)
+        _fill, ink, _bar = _score_tone(build.total, digits)
+        _text(
+            slide, _lift(build.total, digits), left, top + image_h + name_h, cell_w, score_h,
+            size=16, bold=True, color=ink, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+        )
 
 
 def _compare_list(
@@ -1262,6 +1436,404 @@ def _draw_meter(slide, x, y, w, h, value: float, low: float, high: float, fill: 
         return
     add_rect(slide, x, y, max(0.08, w * fraction), h, fill, rounded=True, radius=0.5)
 
+_BUILD_HEADER = RGBColor(0xF7, 0xE4, 0xEC)
+_BUILD_LINE = RGBColor(0xE2, 0xE7, 0xF0)
+_BUILD_BAND = RGBColor(0xFB, 0xF6, 0xF8)
+_BUILD_ROLE = RGBColor(0x8A, 0x45, 0x60)
+_PILL_POS = RGBColor(0x1F, 0xA3, 0x4A)
+_PILL_NEG = RGBColor(0xDC, 0x3D, 0x3D)
+_PILL_ZERO = RGBColor(0x9A, 0xA6, 0xB4)
+_KEY_FILL = RGBColor(0xFC, 0xF0, 0xF4)
+
+
+def _buildup_heading(slide, kind: str, builds: list[Build], digits: int, context: str) -> None:
+    meta = _KIND[kind]
+    _text(
+        slide, f"KEY FINDINGS: {meta['family']}",
+        0.68, 0.16, 12.2, 0.20, size=12, bold=True, color=TEAL,
+    )
+    title = _text(
+        slide, _buildup_title(builds, digits),
+        0.68, 0.36, 12.2, 0.38, size=24, bold=True, color=NAVY,
+    )
+    title.text_frame.word_wrap = True
+    _tighten(title)
+    note = "Each card adds the measured lift from the elements in that combination."
+    if context:
+        note = f"{note} {context}."
+    subtitle = _text(slide, note, 0.68, 0.76, 12.2, 0.40, size=13, color=GRAY)
+    subtitle.text_frame.word_wrap = True
+    _tighten(subtitle)
+
+
+def _buildup_title(builds: list[Build], digits: int) -> str:
+    if len(builds) <= 1:
+        return "The elements in this combination"
+    if len(_leader_indexes(builds, digits)) == len(builds):
+        return "These combinations land on the same total"
+    return "Higher-lift elements make the stronger combination"
+
+
+def _build_role(index: int, builds: list[Build], digits: int) -> str:
+    if len(builds) <= 1:
+        return "SAVED COMBINATION"
+    leaders = _leader_indexes(builds, digits)
+    if len(leaders) == len(builds):
+        return "TIED BUILD"
+    if len(builds) == 2:
+        return "HIGHER-LIFT BUILD" if index in leaders else "ALTERNATIVE BUILD"
+    if index in leaders and len(leaders) == 1:
+        return "HIGHER-LIFT BUILD"
+    if index in leaders:
+        return "TIED FOR HIGHEST"
+    cutoff = _tie_cutoff(digits)
+    place = 1 + len({other.total for other in builds if other.total > builds[index].total + cutoff})
+    return {2: "SECOND BUILD", 3: "THIRD BUILD"}.get(place, f"BUILD {place}")
+
+
+def _category_label(element: Element) -> str:
+    return _human_category(element.category)
+
+
+def _choice_label(element: Element) -> str:
+    return _readable_name(element.label or element.name)
+
+
+def _varied_categories(builds: list[Build]) -> bool:
+    names = {_category_label(element) for build in builds for element in build.elements}
+    names.discard("")
+    return len(names) > 1
+
+
+def _grid_slots(count: int) -> tuple[float, list[float]]:
+    """One card is centered and wide. Two share the row. Three use equal columns."""
+    left, right = 0.56, 0.26
+    width = SLIDE_W - left - right
+    if count <= 1:
+        card_w = min(7.15, width)
+        return card_w, [left + (width - card_w) / 2]
+    if count == 2:
+        gap = 0.18
+        card_w = (width - gap) / 2
+        return card_w, [left, left + card_w + gap]
+    gap = 0.12
+    card_w = (width - gap * 2) / 3
+    return card_w, [left + index * (card_w + gap) for index in range(count)]
+
+
+def _buildup_cards(
+    slide, study: StudyInfo, page: list[tuple[int, Build]], builds: list[Build], kind: str, digits: int,
+) -> None:
+    card_w, origins = _grid_slots(len(page))
+    top, height = 1.22, 5.28
+    shown = [build for _, build in page]
+    show_category = _varied_categories(shown)
+    for origin, (index, build) in zip(origins, page):
+        _buildup_card(
+            slide, study, shown, builds, build, index, kind, digits,
+            origin, top, card_w, height, show_category,
+        )
+
+
+def _buildup_card(
+    slide, study, shown, builds, build, index, kind, digits, x, y, w, h, show_category: bool,
+) -> None:
+    add_rect(slide, x, y, w, h, WHITE, rounded=True, radius=0.04, line=_BUILD_LINE)
+    pad = 0.10
+    inner_x = x + pad
+    inner_w = w - pad * 2
+    header_h = 0.58 if w >= 4.4 else 0.52
+    add_rect(slide, inner_x, y + 0.10, inner_w, header_h, _BUILD_HEADER, rounded=True, radius=0.12)
+    role = _text(
+        slide, _build_role(index, builds, digits),
+        inner_x, y + 0.12, inner_w, 0.20,
+        size=10 if w < 4.4 else 11, bold=True, color=_BUILD_ROLE,
+        align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _tighten(role)
+    name_size = 13 if w >= 4.4 else 12
+    name = _keep_line(_combination_name(build, index), inner_w - 0.12, name_size, lines=1, bold=True)
+    name_box = _text(
+        slide, name,
+        inner_x + 0.06, y + 0.32, inner_w - 0.12, header_h - 0.26,
+        size=name_size, bold=True, color=NAVY,
+        align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _tighten(name_box)
+
+    cursor = y + 0.10 + header_h + 0.06
+    base = _base_for(study, kind)
+    if base is not None:
+        cursor = _buildup_base(slide, kind, digits, base, inner_x, cursor, inner_w)
+        cursor += 0.04
+
+    formula_h = 0.34
+    panel_top = cursor
+    panel_bottom = y + h - 0.08 - formula_h
+    panel_h = max(1.2, panel_bottom - panel_top)
+    _buildup_panel(
+        slide, study, shown, build, digits, show_category,
+        inner_x, panel_top, inner_w, panel_h, base is not None, w,
+    )
+    _buildup_formula(slide, build, builds, inner_x, panel_top + panel_h + 0.02, inner_w, formula_h - 0.02)
+
+
+def _buildup_base(slide, kind: str, digits: int, base: float, x, y, w) -> float:
+    row_h = 0.40
+    if kind == "response":
+        label, figure, note = "Base time", f"{base:.2f}", "starting point"
+    elif kind == "bottom":
+        label, figure, note = "Base score", f"{int(round(base))}%", "starting point"
+    else:
+        note = "starting point (overall)" if w >= 5.2 else "starting point"
+        label, figure = "Base appeal", f"{int(round(base))}%"
+    label_w = 1.20 if w >= 5.2 else 0.98
+    figure_w = 0.72 if w >= 5.2 else 0.58
+    _text(slide, label, x + 0.06, y, label_w, row_h, size=12, color=GRAY, anchor=MSO_ANCHOR.MIDDLE)
+    _text(
+        slide, figure, x + 0.06 + label_w, y, figure_w, row_h,
+        size=18 if w >= 4.6 else 15, bold=True, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _text(
+        slide, note, x + 0.10 + label_w + figure_w, y, max(0.4, w - label_w - figure_w - 0.16), row_h,
+        size=11, color=GRAY, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    return y + row_h
+
+
+def _buildup_panel(
+    slide, study, builds, build, digits, show_category, x, y, w, h, has_base: bool, card_w: float,
+) -> None:
+    add_rect(slide, x, y, w, h, WHITE, rounded=True, radius=0.03, line=_BUILD_LINE)
+    band_h = 0.50 if card_w >= 4.6 else 0.44
+    rows_top = y + 0.04
+    rows_h = max(0.4, h - band_h - 0.06)
+    elements = sorted(build.elements, key=lambda element: element.lift, reverse=True)
+    count = max(len(elements), 1)
+    row_h = rows_h / count
+    visual_w = 0.0 if study.visual == "text" else (2.35 if card_w >= 5.6 else 1.28)
+    visual_w = min(visual_w, w * 0.42)
+    rows_w = w - visual_w - (0.08 if visual_w else 0.0)
+    if elements:
+        for index, element in enumerate(elements):
+            _buildup_row(
+                slide, element, digits, show_category,
+                x + 0.08, rows_top + index * row_h, rows_w - 0.10, row_h,
+                draw_line=index > 0,
+            )
+    else:
+        _text(
+            slide, "No elements in this combination",
+            x + 0.10, rows_top, rows_w - 0.16, rows_h,
+            size=12, color=GRAY, anchor=MSO_ANCHOR.MIDDLE,
+        )
+    if visual_w:
+        _card_visual(
+            slide, study, builds, build,
+            x + rows_w, rows_top, visual_w - 0.06, rows_h,
+            anchor="middle",
+        )
+    band_y = y + h - band_h
+    add_rect(slide, x + 0.04, band_y, w - 0.08, band_h - 0.04, _BUILD_BAND, rounded=True, radius=0.08)
+    total_label = "TOTAL LIFT OVER BASE" if has_base and card_w >= 5.2 else "TOTAL LIFT"
+    _text(
+        slide, total_label,
+        x + 0.14, band_y, w * 0.52, band_h - 0.04,
+        size=10 if card_w < 4.6 else 11, bold=True, color=GRAY, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _fill, ink, _bar = _score_tone(build.total, digits)
+    _text(
+        slide, _lift(build.total, digits),
+        x + w * 0.54, band_y, w * 0.42 - 0.10, band_h - 0.04,
+        size=22 if card_w >= 5.2 else 16, bold=True, color=ink,
+        align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE,
+    )
+
+
+def _buildup_row(slide, element: Element, digits: int, show_category: bool, x, y, w, h, draw_line: bool) -> None:
+    if draw_line:
+        add_rect(slide, x, y, w, 0.01, RGBColor(0xF0, 0xE6, 0xEA))
+    # A three-up card is too narrow for category, score, and name on one line.
+    if show_category and w < 3.15 and h >= 0.40:
+        pill_w = 0.64 if digits < 3 else 0.78
+        top_h = min(0.26, h * 0.46)
+        cat_w = max(0.6, w - pill_w - 0.06)
+        category = _keep_line(_category_label(element), cat_w, 10, lines=1)
+        box = _text(slide, category, x, y, cat_w, top_h, size=10, color=GRAY, anchor=MSO_ANCHOR.MIDDLE)
+        _tighten(box)
+        _lift_pill(slide, element.lift, digits, x + cat_w, y + max(0, (top_h - 0.22) / 2), pill_w, min(0.22, top_h))
+        label = _keep_line(_choice_label(element), w, 11, lines=1)
+        box = _text(
+            slide, label, x, y + top_h, w, h - top_h,
+            size=11, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+        )
+        _tighten(box)
+        return
+    pill_w = 0.62 if digits < 3 else 0.78
+    if w >= 3.3:
+        pill_w = 0.78 if digits < 3 else 0.96
+    cat_w = 0.0
+    if show_category:
+        cat_w = 0.78 if w < 2.9 else min(1.45 if w >= 3.3 else 1.05, w * 0.38)
+    label_w = max(0.45, w - cat_w - pill_w - 0.08)
+    size = 12 if h >= 0.36 else 10
+    if show_category:
+        category = _keep_line(_category_label(element), cat_w - 0.04, size - 1, lines=1)
+        box = _text(
+            slide, category, x, y, cat_w, h,
+            size=size - 1, color=GRAY, anchor=MSO_ANCHOR.MIDDLE,
+        )
+        _tighten(box)
+    pill_x = x + cat_w
+    pill_h = min(0.28, max(0.18, h - 0.08))
+    pill_y = y + (h - pill_h) / 2
+    _lift_pill(slide, element.lift, digits, pill_x, pill_y, pill_w, pill_h)
+    label = _keep_line(_choice_label(element), label_w - 0.06, size, lines=2 if h >= 0.46 else 1)
+    box = _text(
+        slide, label, pill_x + pill_w + 0.08, y, label_w, h,
+        size=size, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _tighten(box)
+
+
+def _lift_pill(slide, value: float, digits: int, x, y, w, h) -> None:
+    cutoff = _tie_cutoff(digits)
+    if value > cutoff:
+        fill = _PILL_POS
+    elif value < -cutoff:
+        fill = _PILL_NEG
+    else:
+        fill = _PILL_ZERO
+    add_rect(slide, x, y, w, h, fill, rounded=True, radius=0.35)
+    box = _text(
+        slide, _lift(value, digits), x, y, w, h,
+        size=11 if h >= 0.24 else 9, bold=True, color=WHITE,
+        align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+    )
+    _tighten(box)
+
+
+def _buildup_formula(slide, build: Build, builds: list[Build], x, y, w, h) -> None:
+    elements = sorted(build.elements, key=lambda element: element.lift, reverse=True)
+    labels = [_choice_label(element) for element in elements]
+    if not labels:
+        return
+    other_names: set[str] = set()
+    if len(builds) == 2:
+        other = next(item for item in builds if item is not build)
+        other_names = {element.name for element in other.elements}
+    differs = [element.name not in other_names for element in elements] if other_names or len(builds) == 2 else [False] * len(labels)
+    if len(builds) != 2:
+        differs = [False] * len(labels)
+    limit = max(18, int(w * 72 / (11 * 0.52)))
+    shown: list[tuple[str, bool]] = []
+    used = 0
+    for label, differ in zip(labels, differs):
+        piece = label
+        extra = len(piece) + (3 if shown else 0)
+        if used + extra > limit:
+            room = limit - used - (3 if shown else 0)
+            if room >= 4:
+                shown.append((piece[: room - 1].rstrip() + "…", differ))
+            elif shown:
+                text, flag = shown[-1]
+                shown[-1] = (text[: max(1, len(text) - 1)].rstrip() + "…", flag)
+            break
+        shown.append((piece, differ))
+        used += extra
+    box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    frame = box.text_frame
+    frame.word_wrap = False
+    frame.auto_size = None
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    frame.margin_left = Emu(0)
+    frame.margin_right = Emu(0)
+    frame.margin_top = Emu(0)
+    frame.margin_bottom = Emu(0)
+    paragraph = frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.CENTER
+    paragraph.space_before = Pt(0)
+    paragraph.space_after = Pt(0)
+    for index, (label, differ) in enumerate(shown):
+        if index:
+            plus = paragraph.add_run()
+            plus.text = " + "
+            plus.font.size = Pt(11)
+            plus.font.bold = False
+            plus.font.color.rgb = GRAY
+            plus.font.name = FONT
+        run = paragraph.add_run()
+        run.text = label
+        run.font.size = Pt(11)
+        run.font.bold = differ
+        run.font.underline = differ
+        run.font.color.rgb = NAVY
+        run.font.name = FONT
+
+
+def _keep_line(text: str, width_in: float, size: float, lines: int = 1, bold: bool = False) -> str:
+    """Fit text on a few lines. A hyphen stays inside the word."""
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw or width_in <= 0.2 or lines < 1:
+        return ""
+    factor = 0.62 if bold else 0.54
+    per = max(6, int(width_in * 72 / (size * factor)))
+    words = raw.split(" ")
+    rows: list[str] = []
+    current = ""
+    leftover = False
+    for word in words:
+        piece = word if len(word) <= per else word[: max(1, per - 1)].rstrip("-") + "…"
+        trial = piece if not current else f"{current} {piece}"
+        if len(trial) <= per:
+            current = trial
+            continue
+        if len(rows) >= lines - 1:
+            leftover = True
+            break
+        if current:
+            rows.append(current)
+        current = piece
+    if current and len(rows) < lines:
+        rows.append(current)
+    if leftover and rows:
+        rows[-1] = rows[-1][: max(1, per - 1)].rstrip() + "…"
+    return "\n".join(rows[:lines])
+
+
+def _buildup_key(slide, builds: list[Build], kind: str, digits: int, more: bool = False) -> None:
+    x, y, w, h = 0.62, 6.62, SLIDE_W - 0.62 - 0.32, 0.46
+    add_rect(slide, x, y, w, h, _KEY_FILL, rounded=True, radius=0.1)
+    insight = _compare_insight(builds, kind, digits)
+    tail = "More combinations are on the next slide." if more else "The next slides open each combination."
+    body = f"{insight} {tail}"
+    box = slide.shapes.add_textbox(Inches(x + 0.16), Inches(y), Inches(w - 0.32), Inches(h))
+    frame = box.text_frame
+    frame.word_wrap = True
+    frame.auto_size = None
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
+    frame.margin_left = Emu(0)
+    frame.margin_right = Emu(0)
+    frame.margin_top = Emu(0)
+    frame.margin_bottom = Emu(0)
+    paragraph = frame.paragraphs[0]
+    paragraph.alignment = PP_ALIGN.LEFT
+    paragraph.space_before = Pt(0)
+    paragraph.space_after = Pt(0)
+    lead = paragraph.add_run()
+    lead.text = "Key read: "
+    lead.font.size = Pt(13)
+    lead.font.bold = True
+    lead.font.color.rgb = NAVY
+    lead.font.name = FONT
+    rest = paragraph.add_run()
+    rest.text = body
+    rest.font.size = Pt(13)
+    rest.font.bold = False
+    rest.font.color.rgb = NAVY
+    rest.font.name = FONT
+
+
 def _stage_cards(slide, study, builds, kind, x, y, w, h) -> None:
     count = len(builds)
     gutter = 0.72 if count == 2 else 0.0
@@ -1401,7 +1973,7 @@ def _card_visual(slide, study: StudyInfo, builds: list[Build], build: Build, x, 
     if study.visual == "grid":
         _grid_thumb_row(slide, build, x, y, w, h)
         return
-    image = _render(study, build)
+    image = _clear_pack_mat(_render(study, build))
     if image is None:
         labels = " · ".join(element.label for element in build.elements[:5]) or build.name
         note = _text(
@@ -1720,15 +2292,20 @@ def _ramp(magnitude: float, stops: tuple) -> tuple[tuple[int, int, int], tuple[i
     return stops[0][1], stops[0][2]
 
 
-# A small plus stays pale. Around +17 is a bright green. The high 70s and 80s share the deepest green.
+# Nearby scores stay apart. A small lift stays pale, the teens turn bright, and the totals keep going darker.
 _POS_STOPS = (
-    (0.0, (0xE7, 0xF6, 0xED), (0x1D, 0x6B, 0x3C)),
-    (6.0, (0x9A, 0xD8, 0xB0), (0x14, 0x5C, 0x32)),
-    (14.0, (0x46, 0xB8, 0x6E), (0xFF, 0xFF, 0xFF)),
-    (24.0, (0x22, 0x9A, 0x50), (0xFF, 0xFF, 0xFF)),
-    (45.0, (0x18, 0x84, 0x40), (0xFF, 0xFF, 0xFF)),
-    (70.0, (0x12, 0x68, 0x32), (0xFF, 0xFF, 0xFF)),
+    (0.0, (0xF3, 0xFB, 0xF6), (0x1D, 0x6B, 0x3C)),
+    (3.0, (0xC6, 0xED, 0xD4), (0x14, 0x5C, 0x32)),
+    (7.0, (0x7D, 0xD4, 0x9A), (0x0E, 0x4E, 0x2A)),
+    (12.0, (0x3E, 0xC0, 0x72), (0xFF, 0xFF, 0xFF)),
+    (18.0, (0x1C, 0x9A, 0x4E), (0xFF, 0xFF, 0xFF)),
+    (26.0, (0x12, 0x7A, 0x3C), (0xFF, 0xFF, 0xFF)),
+    (40.0, (0x0E, 0x64, 0x32), (0xFF, 0xFF, 0xFF)),
+    (70.0, (0x0C, 0x50, 0x28), (0xFF, 0xFF, 0xFF)),
+    (100.0, (0x08, 0x3C, 0x1E), (0xFF, 0xFF, 0xFF)),
+    (130.0, (0x05, 0x2C, 0x16), (0xFF, 0xFF, 0xFF)),
 )
+_ROW_BAND = RGBColor(0xF4, 0xF7, 0xFB)
 _NEG_STOPS = (
     (0.0, (0xF8, 0xE4, 0xE0), (0x9C, 0x2A, 0x22)),
     (6.0, (0xF0, 0xB4, 0xAA), (0x9C, 0x2A, 0x22)),
@@ -1788,7 +2365,6 @@ def _pack(presentation, study: StudyInfo, group: Group, build: Build, headline: 
     slide = _blank(presentation)
     set_background(slide, _CANVAS)
 
-    meta = _KIND[kind]
     digits = _digits(kind)
     sample = study.respondents if study.respondents > 0 else 0
     title = _text(slide, _prefix(kind, study.visual).title(), 0.46, 0.22, 6.3, 0.46, size=28, bold=True, color=NAVY)
@@ -1797,7 +2373,7 @@ def _pack(presentation, study: StudyInfo, group: Group, build: Build, headline: 
     columns = max(columns, 1)
     board_w, side_x, side_w = _detail_frame(columns)
     _text(slide, headline, 0.48, 0.86, board_w - 0.2, 0.24, size=12, bold=True, color=_MUTED)
-    pill = f"{meta['metric']} View"
+    pill = "Pack view"
     pill_w = min(2.3, max(1.45, 0.36 + len(pill) * 0.075))
     pill_x = 0.46 + board_w - pill_w
     add_rect(slide, pill_x, 0.42, pill_w, 0.34, WHITE, rounded=True, radius=0.5, line=RGBColor(0xD5, 0xDE, 0xEA))
@@ -1863,32 +2439,28 @@ def _detail_board(slide, study: StudyInfo, build: Build, digits: int, sample: in
     cell_w = score_w - 0.08
     sample_header = _measure_header("Full sample", "", cell_w)
     measured = [_measure_header(*_heading_parts(segment), cell_w) for segment in segments]
-    overall_h = 0.58
-    bottom_gap = 0.16
-    count = max(len(build.elements), 1)
+    overall_h = 0.46
+    bottom_gap = 0.08
+    elements = sorted(build.elements, key=lambda element: element.lift, reverse=True)
+    count = max(len(elements), 1)
     needed = max((item[6] for item in (sample_header, *measured)), default=0.58)
-    header_h = min(needed, h - 0.10 - overall_h - bottom_gap - count * 0.42)
+    header_h = min(needed, h - 0.08 - overall_h - bottom_gap - count * 0.36)
     header_h = max(0.50, header_h)
-    row_h = (h - 0.10 - header_h - overall_h - bottom_gap) / count
-    head_y = y + 0.06
+    row_h = (h - 0.08 - header_h - overall_h - bottom_gap) / count
+    head_y = y + 0.04
     _detail_header(
         slide, study, segments, sample_header, measured, sample,
-        x + 0.08, head_y, name_w, score_w, header_h - 0.02,
+        x + 0.06, head_y, name_w, score_w, header_h - 0.02,
     )
     body = head_y + header_h
-    rule = RGBColor(0xE4, 0xEA, 0xF2)
-    add_rect(slide, x + 0.16, body - 0.01, name_w - 0.22, 0.01, rule)
-    for index, element in enumerate(build.elements):
-        row_y = body + index * row_h
+    for index, element in enumerate(elements):
         _detail_row(
             slide, element, segments, digits,
-            x + 0.08, row_y, name_w, score_w, row_h,
+            x + 0.06, body + index * row_h, name_w, score_w, row_h, index,
         )
-        if index < len(build.elements) - 1:
-            add_rect(slide, x + 0.16, row_y + row_h - 0.005, name_w - 0.22, 0.01, rule)
     _detail_overall(
         slide, build, segments, digits, sample,
-        x + 0.08, y + h - overall_h - bottom_gap, name_w, score_w, overall_h,
+        x + 0.06, y + h - overall_h - bottom_gap, name_w, score_w, overall_h,
     )
 
 
@@ -1912,7 +2484,7 @@ def _detail_header(slide, study, segments, sample_header, measured, sample, x, y
 
 def _header_score(slide, x, y, w, h, fitted, count, fill, ink, icon: str) -> None:
     title, subtitle, title_size, sub_size, _title_h, _sub_h, _block = fitted
-    add_rect(slide, x, y, w, h, fill, rounded=True, radius=0.06)
+    add_rect(slide, x, y, w, h, fill)
     count_h = 0.16 if count else 0.0
     icon_box = min(0.24, w * 0.32, max(0.14, h - count_h - 0.30))
     _place_picture(
@@ -1956,18 +2528,20 @@ def _header_score(slide, x, y, w, h, fitted, count, fill, ink, icon: str) -> Non
         _tighten(count_label)
 
 
-def _detail_row(slide, element: Element, segments, digits, x, y, name_w, score_w, row_h) -> None:
+def _detail_row(slide, element: Element, segments, digits, x, y, name_w, score_w, row_h, index: int) -> None:
+    if index % 2 == 1:
+        add_rect(slide, x, y, name_w - 0.02, row_h, _ROW_BAND)
     thumb = 0.0
     if element.image_path and Path(element.image_path).exists() and row_h > 0.24:
         # Stay inside the row, and leave the rest of the column for the name.
-        thumb = min(row_h - 0.08, 0.40, max(0.18, name_w * 0.22))
+        thumb = min(row_h - 0.06, 0.40, max(0.18, name_w * 0.22))
         thumb = min(thumb, max(0.18, name_w - 1.15))
         _place_picture(
             slide, _element_thumb(Path(element.image_path)),
             x + 0.04, y + (row_h - thumb) / 2, thumb, thumb,
         )
-    text_x = x + (0.04 + thumb + 0.12 if thumb else 0.08)
-    text_w = max(0.7, name_w - (text_x - x) - 0.06)
+    text_x = x + (0.04 + thumb + 0.08 if thumb else 0.06)
+    text_w = max(0.7, name_w - (text_x - x) - 0.04)
     lines = 1 if row_h < 0.46 else 2
     shown = _clip_lines(element.label, text_w, size=12, lines=lines, readable=True)
     name = _text(
@@ -1975,46 +2549,50 @@ def _detail_row(slide, element: Element, segments, digits, x, y, name_w, score_w
         size=12, bold=True, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
     )
     _tighten(name)
-    score_size = 12 if score_w < 1.15 else 14
-    _heat_cell(slide, element.lift, digits, x + name_w, y + 0.05, score_w - 0.08, row_h - 0.10, size=score_size)
-    for index, segment in enumerate(segments):
+    score_size = 12 if score_w < 1.15 else 13
+    pad_x, pad_y = 0.015, 0.012
+    _heat_cell(
+        slide, element.lift, digits,
+        x + name_w + pad_x, y + pad_y, score_w - pad_x * 2, row_h - pad_y * 2, size=score_size,
+    )
+    for segment_index, segment in enumerate(segments):
         value = float(element.segment_lifts.get(segment.key, 0.0))
         _heat_cell(
             slide, value, digits,
-            x + name_w + (index + 1) * score_w, y + 0.05, score_w - 0.08, row_h - 0.10, size=score_size,
+            x + name_w + (segment_index + 1) * score_w + pad_x, y + pad_y,
+            score_w - pad_x * 2, row_h - pad_y * 2, size=score_size,
         )
 
 
 def _detail_overall(slide, build: Build, segments, digits, sample, x, y, name_w, score_w, row_h) -> None:
-    span = name_w + score_w * (len(segments) + 1) - 0.10
-    add_rect(slide, x + 0.04, y + 0.02, span, 0.012, RGBColor(0xE3, 0xE9, 0xF2))
-    box_top = y + 0.10
-    box_h = max(0.34, row_h - 0.14)
-    add_rect(slide, x + 0.02, box_top, name_w - 0.14, box_h, _SAMPLE_FILL, rounded=True, radius=0.28)
-    mark = min(0.26, box_h - 0.08)
+    add_rect(slide, x, y, name_w - 0.02, row_h, _SAMPLE_FILL)
+    mark = min(0.22, row_h - 0.10)
     _place_picture(
         slide, _preset_icon("sigma", (0x1E, 0x4E, 0x89)),
-        x + 0.10, box_top + (box_h - mark) / 2, mark, mark,
+        x + 0.08, y + (row_h - mark) / 2, mark, mark,
     )
     label = "Overall" if not sample else f"Overall  (n={sample})"
     _text(
-        slide, label, x + 0.16 + mark, box_top, name_w - mark - 0.36, box_h,
+        slide, label, x + 0.12 + mark, y, name_w - mark - 0.22, row_h,
         size=12 if name_w < 2.3 else 13, bold=True, color=_SAMPLE_INK, anchor=MSO_ANCHOR.MIDDLE,
     )
-    score_size = 12 if score_w < 1.15 else 13
-    score_top = box_top + 0.04
-    score_h = box_h - 0.08
-    _heat_cell(slide, build.total, digits, x + name_w, score_top, score_w - 0.10, score_h, size=score_size)
+    score_size = 12 if score_w < 1.15 else 14
+    pad_x, pad_y = 0.015, 0.012
+    _heat_cell(
+        slide, build.total, digits,
+        x + name_w + pad_x, y + pad_y, score_w - pad_x * 2, row_h - pad_y * 2, size=score_size,
+    )
     for index, segment in enumerate(segments):
         _heat_cell(
             slide, _segment_total(build, segment.key), digits,
-            x + name_w + (index + 1) * score_w, score_top, score_w - 0.10, score_h, size=score_size,
+            x + name_w + (index + 1) * score_w + pad_x, y + pad_y,
+            score_w - pad_x * 2, row_h - pad_y * 2, size=score_size,
         )
 
 
 def _heat_cell(slide, value: float, digits: int, x, y, w, h, size: float = 12) -> None:
     fill, ink = _heat(value, digits)
-    add_rect(slide, x, y, w, h, fill, rounded=True, radius=0.08)
+    add_rect(slide, x, y, w, h, fill)
     label = _text(
         slide, _lift(value, digits),
         x, y, w, h,
@@ -2042,7 +2620,7 @@ def _detail_side(slide, study: StudyInfo, build: Build, digits: int, x, y, w, h)
     cursor = card_y + 0.40
     for value, name, detail in points:
         fill, _ink = _heat(value, digits)
-        add_rect(slide, x, cursor + 0.06, 0.07, row_h - 0.18, fill, rounded=True, radius=0.5)
+        add_rect(slide, x, cursor + 0.06, 0.07, row_h - 0.18, fill)
         title = _text(
             slide, _clip_lines(name, w - 0.28, size=13, lines=1, readable=True),
             x + 0.18, cursor, w - 0.18, 0.28,
@@ -2062,9 +2640,9 @@ def _rank_headline(kind: str, index: int, visual: str) -> str:
     noun = "STATEMENT" if visual == "text" else "SET"
     if kind == "bottom":
         ranks = (
-            f"BOTTOM {noun} 1 — LOWEST LIFT",
-            f"BOTTOM {noun} 2",
-            f"BOTTOM {noun} 3",
+            f"{noun} 1 — LOWEST LIFT",
+            f"{noun} 2",
+            f"{noun} 3",
         )
     elif kind == "response":
         ranks = (f"{noun} 1", f"{noun} 2", f"{noun} 3")
@@ -2080,9 +2658,9 @@ def _rank_headline(kind: str, index: int, visual: str) -> str:
 
 def _prefix(kind: str, visual: str) -> str:
     if visual == "text":
-        return {"top": "TOP 3 STATEMENTS", "bottom": "BOTTOM 3 STATEMENTS", "response": "RESPONSE TIME"}[kind]
+        return {"top": "STATEMENTS", "bottom": "STATEMENTS", "response": "STATEMENTS"}[kind]
     if visual == "grid":
-        return {"top": "TOP 3 IMAGE SETS", "bottom": "BOTTOM 3 IMAGE SETS", "response": "RESPONSE TIME"}[kind]
+        return {"top": "IMAGE SETS", "bottom": "IMAGE SETS", "response": "IMAGE SETS"}[kind]
     return _KIND[kind]["prefix"]
 
 def _grid_thumb_row(slide, build: Build, x, y, w, h):
@@ -2168,7 +2746,7 @@ def _clear_pack_mat(path: Path | None) -> Path | None:
     if path is None or not Path(path).exists():
         return path
     source = Path(path)
-    dest = source.with_name(f"{source.stem}-clear.png")
+    dest = source.with_name(f"{source.stem}-clear3.png")
     try:
         if dest.exists() and dest.stat().st_mtime >= source.stat().st_mtime:
             return dest
@@ -2181,7 +2759,9 @@ def _clear_pack_mat(path: Path | None) -> Path | None:
         for point in seeds:
             red, green, blue, alpha = image.getpixel(point)
             if alpha < 20 or (red >= 242 and green >= 242 and blue >= 242):
-                ImageDraw.floodfill(image, point, (255, 255, 255, 0), thresh=16)
+                # Stay under the bottle's own white. A wider threshold eats the wrapper.
+                ImageDraw.floodfill(image, point, (255, 255, 255, 0), thresh=12)
+        _drop_edge_hairline(image)
         box = image.getchannel("A").getbbox()
         if box:
             image = image.crop(box)
@@ -2189,6 +2769,44 @@ def _clear_pack_mat(path: Path | None) -> Path | None:
         return dest
     except Exception:
         return source
+
+
+def _drop_edge_hairline(image: Image.Image) -> None:
+    """Remove a one-pixel gray stroke on the bright side. The shaded side stays.
+
+    The bottle art draws a hard gray pixel where the wrapper is white, and a
+    soft shadow on the other side. Clearing every light edge pixel would shave
+    the white wrapper. This only drops a pixel when the bottle just inside it
+    is already white.
+    """
+    pixels = image.load()
+    width, height = image.size
+    clear: list[tuple[int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            red, green, blue, alpha = pixels[x, y]
+            if alpha < 16:
+                continue
+            if min(red, green, blue) < 176 or max(red, green, blue) > 236:
+                continue
+            if max(red, green, blue) - min(red, green, blue) > 14:
+                continue
+            inward = None
+            if x > 0 and pixels[x - 1, y][3] < 16 and x + 1 < width:
+                inward = pixels[x + 1, y]
+            elif x + 1 < width and pixels[x + 1, y][3] < 16 and x > 0:
+                inward = pixels[x - 1, y]
+            elif y > 0 and pixels[x, y - 1][3] < 16 and y + 1 < height:
+                inward = pixels[x, y + 1]
+            elif y + 1 < height and pixels[x, y + 1][3] < 16 and y > 0:
+                inward = pixels[x, y - 1]
+            if inward is None or inward[3] < 16:
+                continue
+            if min(inward[0], inward[1], inward[2]) < 236:
+                continue
+            clear.append((x, y))
+    for x, y in clear:
+        pixels[x, y] = (255, 255, 255, 0)
 
 
 def _content_box(image: Image.Image) -> tuple[int, int, int, int] | None:
@@ -2250,7 +2868,16 @@ def _place_picture(slide, path: Path | None, x, y, max_w, max_h) -> None:
     width, height = contain_size(file_aspect(path), max_w, max_h)
     left = x + max(0, (max_w - width) / 2)
     top = y + max(0, (max_h - height) / 2)
-    slide.shapes.add_picture(str(path), Inches(left), Inches(top), Inches(width), Inches(height))
+    picture = slide.shapes.add_picture(str(path), Inches(left), Inches(top), Inches(width), Inches(height))
+    picture.line.fill.background()
+    element = picture._element
+    frame = element.spPr
+    border = frame.find(qn("a:ln"))
+    if border is not None:
+        frame.remove(border)
+    style = element.find(qn("p:style"))
+    if style is not None:
+        element.remove(style)
 
 def _place_fit(slide, path: Path, x, y, max_w, max_h) -> None:
     _place_picture(slide, path, x, y, max_w, max_h)
