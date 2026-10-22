@@ -11,9 +11,18 @@ from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
-from app.services.reportgen.charts import add_lift_chart, wrap_label
-from app.services.reportgen.composite import PACK_ASPECT, composite_pack, element_preview, gallery_frame
-from app.services.reportgen.study import Study, category_story, cover_headline, insight_cards, legal_picks, load_study, strongest_silos
+from app.services.reportgen.charts import add_grouped_lift_chart, add_lift_chart, wrap_label
+from app.services.reportgen.composite import PACK_ASPECT, composite_pack, contain_size, element_preview, file_aspect, gallery_frame
+from app.services.reportgen.study import (
+    Study,
+    category_story,
+    classification_story,
+    cover_headline,
+    insight_cards,
+    legal_picks,
+    load_study,
+    strongest_silos,
+)
 from app.services.reportgen.theme import (
     BLUSH,
     BLUSH_CARD,
@@ -30,7 +39,9 @@ from app.services.reportgen.theme import (
     add_footer,
     add_rect,
     add_text,
+    apply_leading,
     bar_color,
+    fitted_size,
     fmt_lift,
     fmt_pct,
     lift_color,
@@ -52,6 +63,7 @@ def build_report(
     cache_dir: str | Path | None = None,
     prepared_by: str | None = None,
 ) -> Path:
+    _FOOTER_NOTES.clear()
     study = load_study(
         json_path,
         cache_dir=cache_dir,
@@ -83,13 +95,18 @@ def build_report(
     slides.append(("divider", _divider(presentation, "Key Findings")))
     slides.append(("content", _insights(presentation, study)))
     slides.append(("content", _base_appeal(presentation, study)))
-    slides.append(("content", _roadmap(presentation, study)))
-    for category in study.categories:
-        for slide in _category_slides(presentation, study, category):
-            slides.append(("content", slide))
+    slides.append(("divider", _divider(presentation, "Combination Winners")))
     slides.append(("content", _build(presentation, study)))
     slides.append(("content", _build_low(presentation, study)))
     slides.append(("content", _build_compare(presentation, study)))
+    slides.append(("divider", _divider(presentation, "Category Winners")))
+    slides.append(("content", _roadmap(presentation, study)))
+    for slide in _category_winner_slides(presentation, study):
+        slides.append(("content", slide))
+    slides.append(("divider", _divider(presentation, "Element Winners")))
+    for category in study.categories:
+        for slide in _category_slides(presentation, study, category):
+            slides.append(("content", slide))
     slides.append(("divider", _divider(presentation, "Appendix")))
     slides.append(("content", _appendix_intro(presentation, study)))
     for slide in _lift_tables(presentation, study):
@@ -102,7 +119,7 @@ def build_report(
     total = len(slides)
     for index, (kind, slide) in enumerate(slides, start=1):
         if kind == "content":
-            add_footer(slide, _footer_note(study), index, total)
+            add_footer(slide, _FOOTER_NOTES.get(id(slide)) or _footer_note(study), index, total)
 
     presentation.save(str(destination))
     return destination
@@ -110,6 +127,9 @@ def build_report(
 
 def _blank(presentation):
     return presentation.slides.add_slide(presentation.slide_layouts[6])
+
+
+_FOOTER_NOTES: dict[int, str] = {}
 
 
 def _footer_note(study: Study) -> str:
@@ -128,6 +148,14 @@ def _visual(study: Study) -> str:
     if kind == "text":
         return "text"
     return "layer"
+
+
+_PREPARED_BY_DEFAULT = "J Brown Fitterman | jbrown@mindgenomicsassociates.com"
+
+
+def _prepared_by_line(study: Study) -> str:
+    credit = (study.prepared_by or "").strip() or _PREPARED_BY_DEFAULT
+    return f"Prepared by: {credit}"
 
 
 def _cover_marks(slide, study: Study) -> str:
@@ -149,11 +177,6 @@ def _cover_marks(slide, study: Study) -> str:
     return f"{study.title} Appeal Report"
 
 
-def _prepared_by_line(study: Study) -> str:
-    credit = (study.prepared_by or "").strip()
-    return f"Prepared by: {credit}" if credit else "Prepared by:"
-
-
 def _cover(presentation, study: Study):
     """Same cover as the Rexona x MGA appeal report: marks left, title block right."""
     slide = _blank(presentation)
@@ -169,19 +192,20 @@ def _cover(presentation, study: Study):
     add_text(
         slide,
         headline,
-        4.600, 1.90, 8.481, headline_height,
+        4.600, 1.975, 8.481, headline_height,
         size=headline_size, bold=True, color=NAVY,
     )
+    when = study.launched_label or ""
     add_text(
         slide,
-        report_name,
-        4.600, 4.244, 8.4, 0.37,
+        f"{report_name}  |  {when}".strip(" |"),
+        4.600, 4.244, 7.2, 0.37,
         size=16, color=NAVY,
     )
     add_text(
         slide,
         _prepared_by_line(study),
-        4.600, 4.628, 8.4, 0.37,
+        4.600, 4.628, 7.64, 0.37,
         size=16, color=NAVY,
     )
     add_text(slide, "Mind Genomics Associates, Inc", 4.600, 5.012, 4.2, 0.37, size=16, color=NAVY)
@@ -263,6 +287,56 @@ def _flush(box):
     return box
 
 
+def _draw_fitted(
+    slide,
+    text,
+    x,
+    y,
+    w,
+    max_h,
+    size,
+    min_size,
+    color,
+    bold=False,
+    max_lines=2,
+    align=PP_ALIGN.LEFT,
+    anchor=MSO_ANCHOR.TOP,
+    one_line_floor: float | None = None,
+) -> float:
+    """Draw text inside a box, shrinking the font until the heading stays in bounds.
+
+    Returns the height actually used, so the next line can start below it.
+    """
+    chosen, height = fitted_size(
+        text, w, max_h, size, min_size, bold=bold, max_lines=max_lines, one_line_floor=one_line_floor,
+    )
+    if height <= 0:
+        return 0.0
+    box = add_text(
+        slide, text, x, y, w, height,
+        size=chosen, bold=bold, color=color, align=align, anchor=anchor,
+    )
+    _flush(box)
+    apply_leading(box, chosen)
+    return height
+
+
+def _heading_block(slide, eyebrow, headline, detail, x, y, w, headline_size=26, detail_size=14) -> float:
+    """Eyebrow, heading, and subheading stacked so a wrap never paints over the line below."""
+    _draw_fitted(slide, eyebrow, x, y, w, 0.22, size=12, min_size=9, color=TEAL, bold=True, max_lines=1)
+    head_y = y + 0.24
+    head_h = _draw_fitted(
+        slide, headline, x, head_y, w, 0.80,
+        size=headline_size, min_size=15, color=NAVY, bold=True, max_lines=2, one_line_floor=18,
+    )
+    detail_y = head_y + max(head_h, 0.30) + 0.08
+    detail_h = _draw_fitted(
+        slide, detail, x, detail_y, w, 0.52,
+        size=detail_size, min_size=11, color=GRAY, max_lines=2, one_line_floor=12,
+    )
+    return detail_y + max(detail_h, 0.22)
+
+
 def _method(presentation, study: Study):
     """Same method slide as the main report: five numbered rows under a short intro."""
     ink = RGBColor(0x17, 0x22, 0x38)
@@ -292,7 +366,7 @@ def _method(presentation, study: Study):
         ("01", "We slice the design into unique elements", f"Each element is one design choice — {silos}."),
         ("02", f"Each element has {variation} possible variations", "Like the small choices a designer would make between the options in a silo."),
         ("03", seen[0], seen[1]),
-        ("04", "Respondents rate each set", "The same rating scale is used on every set. The variation does the work."),
+        ("04", "They rate each one", "The same rating scale is used on every task. The variation does the work."),
         ("05", "We learn what drives the rating", "The model separates the baseline from the movement each element creates, on its own."),
     ]
     row_h, gap = 0.88, 0.08
@@ -396,10 +470,10 @@ def _deliverables(presentation, study: Study):
         else f"The {study.model_name} intercept. The pack’s starting appeal before a single element is added."
     )
     cards = [
-        ("Per-element scores", "How much each variation moves the appeal rating, on its own, above or below the baseline."),
+        ("Combination winners", "The strongest option in each group, shown together, against a weaker combination of the same groups."),
+        ("Category winners", "The winning element in every category, so the same read works one category at a time."),
+        ("Element winners", "Every element inside its category, with the score used in the charts."),
         ("Base appeal", base_body),
-        ("Build-up scenarios", "The strongest option in each group, shown together, against a weaker combination of the same groups."),
-        ("Full lift summary", "Every element, in every group, with the same score used in the charts."),
     ]
     for index, (title, body) in enumerate(cards):
         left = 0.62 + (index % 2) * 6.3
@@ -488,7 +562,7 @@ def _shape_label(shape, text, size, color, bold=False, wrap=True, align=PP_ALIGN
     frame.clear()
     frame.word_wrap = wrap
     frame.auto_size = None
-    frame.anchor = MSO_ANCHOR.MIDDLE
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
     inset = Inches(0.08) if wrap else Emu(0)
     frame.margin_left = inset
     frame.margin_right = inset
@@ -517,7 +591,7 @@ def _insights(presentation, study: Study):
     add_text(slide, "Where appeal moves", 0.62, 0.72, 12, 0.48, size=30, bold=True, color=NAVY)
     add_text(
         slide,
-        "The strongest movement comes from the silos and elements below. Detail charts for every silo follow.",
+        "The read starts with the winning combination, then the winner in each category, then every element in that category.",
         0.62, 1.25, 12, 0.35, size=15, color=GRAY,
     )
     for index, (title, body) in enumerate(insight_cards(study)):
@@ -579,7 +653,7 @@ def _roadmap(presentation, study: Study):
     set_background(slide, WHITE)
     add_rect(slide, 0, 0, 0.42, SLIDE_H, pink)
 
-    _flush(add_text(slide, "KEY FINDINGS", 0.78, 0.36, 6.4, 0.24, size=12, bold=True, color=ink))
+    _flush(add_text(slide, "CATEGORY WINNERS", 0.78, 0.36, 6.4, 0.24, size=12, bold=True, color=ink))
     _flush(add_text(
         slide,
         f"Appeal moves most clearly\nin {areas} design areas",
@@ -647,15 +721,154 @@ def _name_list(names) -> str:
     return ", ".join(items[:-1]) + f", and {items[-1]}"
 
 
+def _category_winner_slides(presentation, study: Study):
+    """The winning element in every category, strongest category first.
+
+    One classification question is shown on the same card. Several questions
+    stay on the element slides, where each question already has its own chart.
+    """
+    ranked = sorted(study.categories, key=lambda category: category.best.lift, reverse=True)
+    question = study.classifications[0] if len(study.classifications) == 1 else None
+    if _visual(study) == "text":
+        per_page = 5
+    elif question is not None:
+        per_page = 4
+    else:
+        per_page = 5
+    in_pack = {element.name for element in _pack_picks(study, "best")}
+    pages = _pages(ranked, per_page)
+    return [
+        _category_winner_slide(presentation, study, page, index, len(pages), question, in_pack)
+        for index, page in enumerate(pages, start=1)
+    ]
+
+
+def _category_winner_slide(presentation, study, categories, page: int, pages: int, question, in_pack: set[str]):
+    slide = _blank(presentation)
+    set_background(slide, WHITE)
+    _eyebrow(slide, f"CATEGORY WINNERS{_page_mark(page, pages)}")
+    add_text(slide, "The winning element in each category", 0.48, 0.52, 12.3, 0.4, size=26, bold=True, color=NAVY)
+    if question is not None:
+        detail = f"Ranked by the total sample. The notes are the winners for “{question.text.rstrip('?')}”."
+    elif len(study.classifications) > 1:
+        detail = "Ranked by coefficient. Group cuts for each category are in Element Winners."
+    else:
+        detail = "Ranked by coefficient. The mark notes a winner that is not on the highest-sum pack."
+    add_text(slide, detail, 0.48, 0.98, 12.3, 0.32, size=14, color=GRAY)
+
+    top, bottom, gap = 1.46, 6.82, 0.1
+    count = max(len(categories), 1)
+    row_h = (bottom - top - gap * (count - 1)) / count
+    for index, category in enumerate(categories):
+        _winner_card(
+            slide, study, category, top + index * (row_h + gap), row_h, question, in_pack,
+        )
+    return slide
+
+
+def _winner_card(slide, study, category, top, height, question, in_pack: set[str]):
+    """One category: a steady image well, the winner, and the group notes."""
+    x, width = 0.42, 12.5
+    card = RGBColor(0xFB, 0xF6, 0xF8)
+    add_rect(slide, x, top, width, height, card, rounded=True, radius=0.1)
+    winner = category.best
+    visual = _visual(study) != "text"
+    text_x = x + 0.28
+    if visual:
+        well = min(height - 0.24, 1.08)
+        well_x = x + 0.14
+        well_y = top + (height - well) / 2
+        add_rect(slide, well_x, well_y, well, well, WHITE, rounded=True, radius=0.08)
+        art = _element_on_pack(study, winner) or _raw_image(winner)
+        if art:
+            inset = 0.08
+            _place_fit(slide, art, well_x + inset, well_y + inset, well - inset * 2, well - inset * 2)
+        text_x = well_x + well + 0.22
+
+    score_w = 1.2
+    text_w = x + width - score_w - 0.2 - text_x
+    off_pack = bool(study.blocked) and winner.name not in in_pack
+    picks = _segment_winners(category, question) if question is not None else []
+    agree = len({best.label for _segment, best, _score in picks}) == 1 if picks else False
+
+    label_w = text_w - (1.55 if off_pack else 0)
+    label_y = top + 0.14 if picks else top + (height - 0.62) / 2
+    _flush(add_text(
+        slide, category.label.upper(), text_x, label_y, label_w, 0.24,
+        size=11, bold=True, color=TEAL, anchor=MSO_ANCHOR.MIDDLE,
+    ))
+    if off_pack:
+        pill_w, pill_h = 1.38, 0.26
+        pill_x = text_x + text_w - pill_w
+        add_rect(slide, pill_x, label_y, pill_w, pill_h, RGBColor(0xFD, 0xF0, 0xF3), rounded=True, radius=0.08)
+        _flush(add_text(
+            slide, "Off the pack", pill_x, label_y, pill_w, pill_h,
+            size=10, bold=True, color=ROSE, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+        ))
+    _flush(add_text(
+        slide, winner.label, text_x, label_y + 0.28, text_w, 0.36 if picks else 0.34,
+        size=16 if _visual(study) == "text" else 18, bold=True, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+    ))
+    if picks and agree:
+        who = "Both groups agree" if len(picks) == 2 else "Every group agrees"
+        _flush(add_text(
+            slide, who, text_x, top + height - 0.4, text_w, 0.24,
+            size=12, color=GRAY, anchor=MSO_ANCHOR.MIDDLE,
+        ))
+    elif picks:
+        _winner_chips(slide, picks, text_x, top + height - 0.46, text_w, 0.32)
+    _flush(add_text(
+        slide, fmt_lift(winner.lift), x + width - score_w - 0.12, top, score_w, height,
+        size=22, bold=True, color=lift_color(winner.lift), align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE,
+    ))
+
+
+def _segment_winners(category, question):
+    picks = []
+    for segment in question.segments:
+        best = max(
+            category.elements,
+            key=lambda element, segment=segment: float(element.segment_lifts.get(segment.key, element.lift)),
+        )
+        raw = best.segment_lifts.get(segment.key)
+        score = float(raw) if raw is not None else best.lift
+        picks.append((segment, best, score))
+    return picks
+
+
+def _winner_chips(slide, picks, x, y, width, height):
+    """One note per group when the groups do not share a winner."""
+    count = len(picks)
+    gap = 0.08
+    chip_w = (width - gap * (count - 1)) / count
+    for index, (segment, best, score) in enumerate(picks):
+        left = x + index * (chip_w + gap)
+        add_rect(slide, left, y, chip_w, height, WHITE, rounded=True, radius=0.06)
+        _flush(add_text(
+            slide, f"{segment.label}   ·   {best.label}   {fmt_lift(score)}",
+            left + 0.1, y, chip_w - 0.16, height,
+            size=11, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+        ))
+
+
 # Nine rows keep a wrapped name clear of the next bar. The gallery is 3×3.
 _FINDINGS_PER_PAGE = 9
-_SUMMARY_PER_PAGE = 9
+# Four grouped rows match the classification readout: a 2×2 gallery and bars with air.
+_GROUPED_PER_PAGE = 4
 _ASSET_PER_PAGE = 10
 _ASSET_PER_ROW = 5
 
 
 def _pages(items, size: int):
     return [items[index:index + size] for index in range(0, len(items), size)] or [[]]
+
+
+def _grouped_pages(items):
+    """Pages of four. A leftover single row is pulled back so a page is never one bar."""
+    pages = _pages(items, _GROUPED_PER_PAGE)
+    if len(pages) > 1 and len(pages[-1]) == 1:
+        pages[-1].insert(0, pages[-2].pop())
+    return pages
 
 
 def _page_mark(index: int, count: int) -> str:
@@ -665,47 +878,129 @@ def _page_mark(index: int, count: int) -> str:
 
 
 def _category_slides(presentation, study: Study, category):
-    """One findings slide per page when the silo is longer than the chart can hold."""
+    """One findings slide per page when the silo is longer than the chart can hold.
+
+    Each classification question gets its own chart and legend. Questions are
+    different cuts, so their answers are never mixed on one legend.
+    """
     if _visual(study) == "text":
         return _text_category_slides(presentation, study, category)
-    ordered = sorted(category.elements, key=lambda element: element.lift, reverse=True)
-    pages = _pages(ordered, _FINDINGS_PER_PAGE)
-    return [
-        _category_slide(presentation, study, category, page, index, len(pages))
-        for index, page in enumerate(pages, start=1)
-    ]
+    questions = list(study.classifications) or [None]
+    slides = []
+    for question in questions:
+        if question is None:
+            ordered = sorted(category.elements, key=lambda element: element.lift, reverse=True)
+        else:
+            ordered = sorted(
+                category.elements,
+                key=lambda element: max(
+                    (element.segment_lifts.get(segment.key, element.lift) for segment in question.segments),
+                    default=element.lift,
+                ),
+                reverse=True,
+            )
+        pages = _pages(ordered, _FINDINGS_PER_PAGE) if question is None else _grouped_pages(ordered)
+        slides.extend(
+            _category_slide(presentation, study, category, page, index, len(pages), question)
+            for index, page in enumerate(pages, start=1)
+        )
+    return slides
 
 
-def _category_slide(presentation, study: Study, category, elements, page: int, pages: int):
+def _category_slide(presentation, study: Study, category, elements, page: int, pages: int, question=None):
     """Chart on the left, element artwork on the right, as in the main report."""
     slide = _blank(presentation)
     set_background(slide, WHITE)
-    headline, detail, key = category_story(category)
-    _flush(add_text(
-        slide, f"KEY FINDINGS: {_kicker(category.label)}{_page_mark(page, pages)}",
-        0.72, 0.28, 7.5, 0.24, size=12, bold=True, color=TEAL,
-    ))
-    _flush(add_text(slide, headline, 0.72, 0.50, 7.5, 0.86, size=22, bold=True, color=NAVY))
-    _flush(add_text(slide, detail, 0.72, 1.40, 7.5, 0.50, size=14, color=GRAY))
+    if question is None:
+        headline, detail, key = category_story(category)
+        stacked = _heading_block(
+            slide,
+            f"ELEMENT WINNERS: {_kicker(category.label)}{_page_mark(page, pages)}",
+            headline,
+            detail,
+            0.72, 0.26, 7.5,
+            headline_size=24,
+        )
+        banner_y = stacked + 0.10
+        banner = add_rect(slide, 0.85, banner_y, 6.9, 0.28, RGBColor(0xF4, 0xE0, 0xE7))
+        _shape_label(banner, f"{category.label.upper()} PREFERENCES", 11, NAVY, bold=True, wrap=False)
+        chart_y = banner_y + 0.34
+        add_lift_chart(slide, elements, 0.46, chart_y, 7.72, max(2.2, 5.98 - chart_y))
+        _finding_gallery(slide, study, category, elements, 8.48, 0.28, 4.42, 5.68)
+        note = add_rect(slide, 0.72, 6.08, 12.15, 0.68, RGBColor(0xFC, 0xF4, 0xF8), rounded=True, radius=0.1)
+        _shape_label(note, key, 12, NAVY, align=PP_ALIGN.LEFT)
+        return slide
 
-    banner = RGBColor(0xF4, 0xE0, 0xE7)
-    bar = add_rect(slide, 0.85, 1.94, 6.9, 0.28, banner)
-    _shape_label(bar, f"{category.label.upper()} PREFERENCES", 11, NAVY, bold=True, wrap=False)
-    add_lift_chart(slide, elements, 0.46, 2.26, 7.72, 3.70)
-    _finding_gallery(slide, study, category, elements, 8.48, 0.28, 4.42, 5.68)
-
-    note = add_rect(slide, 0.72, 6.18, 12.15, 0.58, RGBColor(0xFC, 0xF4, 0xF8), rounded=True, radius=0.1)
-    _shape_label(note, key, 13, NAVY, align=PP_ALIGN.LEFT)
+    headline, detail, key = classification_story(category, question)
+    question_mark = f"  ·  {question.text}" if len(study.classifications) > 1 else ""
+    # One grid for the chart column and the gallery, so the legend, card, and key bar share edges.
+    left = 0.55
+    gallery_w = 4.42
+    gap = 0.20
+    chart_w = SLIDE_W - left - gap - gallery_w - 0.46
+    gallery_x = left + chart_w + gap
+    column_bottom = 6.06
+    stacked = _heading_block(
+        slide,
+        f"ELEMENT WINNERS: {_kicker(category.label)}{question_mark}{_page_mark(page, pages)}",
+        headline,
+        detail,
+        left, 0.24, chart_w,
+    )
+    banner_y = stacked + 0.08
+    banner = add_rect(slide, left, banner_y, chart_w, 0.28, RGBColor(0xF7, 0xE6, 0xEC))
+    _shape_label(banner, category.label.upper(), 11, NAVY, bold=True, wrap=False)
+    chart_y = banner_y + 0.34
+    add_grouped_lift_chart(slide, elements, question.segments, left, chart_y, chart_w, column_bottom - chart_y)
+    _finding_gallery(
+        slide, study, category, elements, gallery_x, 0.26, gallery_w, column_bottom - 0.26, question,
+    )
+    key_h = 0.74 if len(key) > 180 else 0.58
+    note = add_rect(
+        slide, left, 6.16, gallery_x + gallery_w - left, key_h,
+        RGBColor(0xFB, 0xF4, 0xF7), rounded=True, radius=0.12,
+    )
+    _shape_label(note, key, 12 if len(key) > 180 else 13, NAVY, align=PP_ALIGN.LEFT)
+    _FOOTER_NOTES[id(slide)] = _classification_footer(question)
     return slide
 
 
-def _finding_gallery(slide, study, category, elements, x, y, w, h):
+def _classification_footer(question) -> str:
+    """Sample sizes for the legend, plus the meaning of the starred gallery score."""
+    parts = [
+        f"{segment.label} basesize = {segment.base_size}" if segment.base_size else segment.label
+        for segment in question.segments
+    ]
+    groups = "; ".join(parts)
+    note = f"{groups}. Top-2 scores rounded to whole points. *Average of the groups in the legend."
+    if len(note) > 150:
+        note = "Top-2 scores rounded to whole points. *Average of the groups in the legend."
+    return note
+
+
+def _group_score(element, question):
+    """Gallery number. With a classification cut this is the average of the groups."""
+    if question is None:
+        return fmt_lift(element.lift), lift_color(element.lift)
+    values = [element.segment_lifts.get(segment.key) for segment in question.segments]
+    values = [float(value) for value in values if value is not None]
+    if not values:
+        return fmt_lift(element.lift), lift_color(element.lift)
+    # The readout rounds the group average to a whole point, same as the bars.
+    average = int(round(sum(values) / len(values)))
+    return fmt_lift(average) + "*", lift_color(average)
+
+
+def _finding_gallery(slide, study, category, elements, x, y, w, h, question=None):
     """Element artwork, name, and score in the card beside the chart."""
-    edge = RGBColor(0xDD, 0xE4, 0xEC)
-    add_rect(slide, x, y, w, h, WHITE, rounded=True, radius=0.04, line=edge)
+    edge = RGBColor(0xE3, 0xE8, 0xEE)
+    add_rect(slide, x, y, w, h, WHITE, rounded=True, radius=0.08 if question is not None else 0.04, line=edge)
     arts = _gallery_art(study, category, elements)
+    if question is not None:
+        _caption_gallery(slide, elements, arts, x, y, w, h, question)
+        return
     if len(elements) <= 3:
-        _gallery_rows(slide, elements, arts, x, y, w, h)
+        _gallery_rows(slide, elements, arts, x, y, w, h, question)
         return
     count = len(elements)
     columns = 2 if count <= 6 else 3
@@ -736,13 +1031,61 @@ def _finding_gallery(slide, study, category, elements, x, y, w, h):
             size=name_size, color=NAVY, align=PP_ALIGN.CENTER,
         ))
         name_box.text_frame.word_wrap = name_lines > 1
+        score, score_color = _group_score(element, question)
         _flush(add_text(
-            slide, fmt_lift(element.lift), left, name_top + name_h, cell_w, score_h,
-            size=14, bold=True, color=lift_color(element.lift), align=PP_ALIGN.CENTER,
+            slide, score, left, name_top + name_h, cell_w, score_h,
+            size=14, bold=True, color=score_color, align=PP_ALIGN.CENTER,
         ))
 
 
-def _gallery_rows(slide, elements, arts, x, y, w, h):
+def _caption_gallery(slide, elements, arts, x, y, w, h, question):
+    """Image, then the name, then the score. A row shares one tile height and one baseline."""
+    count = max(len(elements), 1)
+    columns = 1 if count in (1, 3) else 2
+    rows = (count + columns - 1) // columns
+    pad_x, pad_y = 0.20, 0.18
+    gap_x, gap_y = 0.18, 0.16
+    cell_w = (w - pad_x * 2 - gap_x * (columns - 1)) / columns
+    cell_h = (h - pad_y * 2 - gap_y * (rows - 1)) / rows
+    long_name = any(len(element.label) > 18 for element in elements)
+    name_h = 0.40 if long_name else 0.24
+    score_h = 0.26
+    caption = name_h + score_h + 0.06
+    image_cap = max(0.7, cell_h - caption - 0.08)
+    fitted = [
+        _fit_size(art, cell_w - 0.08, image_cap) if art else (0.0, 0.0)
+        for art in arts
+    ]
+    tile_h = max((height for _width, height in fitted), default=image_cap)
+    tile_h = min(tile_h, image_cap)
+    block_h = tile_h + caption
+    name_size = 13 if columns == 1 else 12
+    for index, element in enumerate(elements):
+        row = index // columns
+        column = index % columns
+        left = x + pad_x + column * (cell_w + gap_x)
+        top = y + pad_y + row * (cell_h + gap_y)
+        origin = top + max(0, (cell_h - block_h) / 2)
+        art = arts[index]
+        if art:
+            _img_w, img_h = fitted[index]
+            image_top = origin + max(0, (tile_h - img_h) / 2)
+            _draw_art(slide, art, left, image_top, cell_w, img_h)
+        name_top = origin + tile_h + 0.06
+        name_box = _flush(add_text(
+            slide, wrap_label(element.label, cell_w, name_size, max_lines=2),
+            left, name_top, cell_w, name_h,
+            size=name_size, color=NAVY, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE,
+        ))
+        name_box.text_frame.word_wrap = long_name
+        score, score_color = _group_score(element, question)
+        _flush(add_text(
+            slide, score, left, name_top + name_h, cell_w, score_h,
+            size=15, bold=True, color=score_color, align=PP_ALIGN.CENTER,
+        ))
+
+
+def _gallery_rows(slide, elements, arts, x, y, w, h, question=None):
     """Large tiles down the card, for silos with only a few elements."""
     count = max(len(elements), 1)
     pad_x, pad_y = 0.2, 0.22
@@ -766,9 +1109,10 @@ def _gallery_rows(slide, elements, arts, x, y, w, h):
             slide, element.label, text_x, text_mid - 0.34, text_w, 0.28,
             size=14, color=NAVY, anchor=MSO_ANCHOR.BOTTOM,
         ))
+        score, score_color = _group_score(element, question)
         _flush(add_text(
-            slide, fmt_lift(element.lift), text_x, text_mid - 0.02, text_w, 0.30,
-            size=18, bold=True, color=lift_color(element.lift),
+            slide, score, text_x, text_mid - 0.02, text_w, 0.30,
+            size=18, bold=True, color=score_color,
         ))
 
 
@@ -780,12 +1124,16 @@ def _gallery_art(study, category, elements):
         return [_raw_image(element) for element in elements]
     paths = [element.image_path for element in category.elements if element.image_path]
     frame = gallery_frame(paths)
+    sample = next((path for path in paths if path.exists()), None)
+    aspect = file_aspect(sample) if sample else None
     arts = []
     for element in elements:
         if frame is not None and element.image_path and element.image_path.exists():
-            destination = element.image_path.parent.parent / "previews_gallery" / f"{element.code}.png"
+            destination = element.image_path.parent.parent / "previews_gallery_fit" / f"{element.code}.png"
             background = study.background_path if study.background_path and study.background_path.exists() else None
-            arts.append(element_preview(background, element.image_path, destination, width=1200, frame=frame))
+            arts.append(element_preview(
+                background, element.image_path, destination, width=1200, frame=frame, aspect=aspect,
+            ))
         else:
             arts.append(_element_thumb(study, element))
     return arts
@@ -850,7 +1198,7 @@ def _text_category_slide(presentation, study: Study, category, elements, page: i
     best = max(category.elements, key=lambda element: element.lift)
     worst = min(category.elements, key=lambda element: element.lift)
     _flush(add_text(
-        slide, f"KEY FINDINGS: {_kicker(category.label)}{_page_mark(page, pages)}",
+        slide, f"ELEMENT WINNERS: {_kicker(category.label)}{_page_mark(page, pages)}",
         0.72, 0.28, 12.0, 0.24, size=12, bold=True, color=TEAL,
     ))
     _flush(add_text(
@@ -1003,7 +1351,7 @@ def _element_on_pack(study: Study, element) -> Path | None:
     """The whole study background, with this one element on top. Nothing cropped."""
     if element.image_path is None or not element.image_path.exists():
         return study.background_path if study.background_path and study.background_path.exists() else None
-    destination = element.image_path.parent.parent / "previews_full" / f"{element.code}.png"
+    destination = element.image_path.parent.parent / "previews_full_fit" / f"{element.code}.png"
     background = study.background_path if study.background_path and study.background_path.exists() else None
     return element_preview(background, element.image_path, destination, width=900, full=True)
 
@@ -1017,7 +1365,7 @@ def _element_picture(study: Study, element, tight: bool) -> Path | None:
     if element.image_path is None or not element.image_path.exists():
         return study.background_path if study.background_path and study.background_path.exists() else None
     folder = "previews_tight" if tight else "previews"
-    destination = element.image_path.parent.parent / folder / f"{element.code}.png"
+    destination = element.image_path.parent.parent / f"{folder}_fit" / f"{element.code}.png"
     background = study.background_path if study.background_path and study.background_path.exists() else None
     return element_preview(background, element.image_path, destination, width=1000, tight=tight)
 
@@ -1078,30 +1426,27 @@ def _build(presentation, study: Study):
     if mode == "grid":
         return _grid_combination_slide(
             presentation, study, picks,
-            "KEY FINDINGS: WINNING IMAGES",
+            "COMBINATION WINNERS",
             "Highest-lift images, side by side",
             "One image from each set — the strongest in that set. The images are not stacked.",
         )
     if mode == "text":
         return _text_combination_slide(
             presentation, study, picks,
-            "KEY FINDINGS: WINNING STATEMENTS",
+            "COMBINATION WINNERS",
             "Highest-lift statements",
             "The strongest statement in each group, written in full.",
         )
     if study.blocked:
-        detail = (
-            "One element from every silo — the strongest mix the pairing rules allow. "
-            "The same message is not used twice. The background sits underneath."
-        )
+        detail = "The highest coefficient sum that still obeys the pairing rules. A stronger element is left off when the elements it blocks add up to more."
     else:
         detail = "One element from every silo — the strongest in that silo — composited in layer order. The background sits underneath."
     return _combination_slide(
         presentation,
         study,
         picks,
-        "KEY FINDINGS: COMBINED PACK",
-        "Highest-lift layers, stacked into one pack",
+        "COMBINATION WINNERS",
+        "Highest coefficient sum, stacked into one pack",
         detail,
     )
 
@@ -1112,27 +1457,27 @@ def _build_low(presentation, study: Study):
     if mode == "grid":
         return _grid_combination_slide(
             presentation, study, picks,
-            "KEY FINDINGS: WEAKER IMAGES",
+            "COMBINATION WINNERS",
             "Lowest-lift images, side by side",
             "One image from each set — the weakest in that set. The images are not stacked.",
         )
     if mode == "text":
         return _text_combination_slide(
             presentation, study, picks,
-            "KEY FINDINGS: WEAKER STATEMENTS",
+            "COMBINATION WINNERS",
             "Lowest-lift statements",
             "The weakest statement in each group, written in full.",
         )
     if study.blocked:
-        detail = "The same silos and stacking order, using the weakest mix the pairing rules allow. The same message is not used twice."
+        detail = "The lowest coefficient sum that still fills every silo it can, with no blocked pair on the pack."
     else:
         detail = "The same silos and the same stacking order, using each silo’s weakest element."
     return _combination_slide(
         presentation,
         study,
         picks,
-        "KEY FINDINGS: COMBINED PACK",
-        "Lowest-lift layers, stacked into one pack",
+        "COMBINATION WINNERS",
+        "Lowest coefficient sum, stacked into one pack",
         detail,
     )
 
@@ -1144,8 +1489,8 @@ def _build_compare(presentation, study: Study):
     low = _pack_picks(study, "worst")
     slide = _blank(presentation)
     set_background(slide, WHITE)
-    _eyebrow(slide, "KEY FINDINGS: BUILD COMPARISON")
-    add_text(slide, "The higher-lift build against the lower-lift build", 0.48, 0.40, 12.3, 0.36, size=24, bold=True, color=NAVY)
+    _eyebrow(slide, "COMBINATION WINNERS")
+    add_text(slide, "The higher-lift build against the lower-lift build", 0.55, 0.58, 12.2, 0.40, size=24, bold=True, color=NAVY)
     high_total = sum(element.lift for element in high)
     low_total = sum(element.lift for element in low)
     gap = high_total - low_total
@@ -1164,7 +1509,7 @@ def _build_compare(presentation, study: Study):
     else:
         summary = f"The higher-lift build leads by {fmt_lift(gap)} points. This model has no intercept, so the totals are the element lifts."
     if study.blocked:
-        summary += " Pairing rules keep the same message from appearing twice."
+        summary += " Both totals are the highest and lowest sums that still obey the pairing rules."
     add_rect(slide, 0.42, 6.08, 12.49, 0.52, RGBColor(0xFC, 0xF4, 0xF8), rounded=True, radius=0.08)
     _flush(add_text(
         slide, summary, 0.62, 6.08, 12.1, 0.52,
@@ -1182,10 +1527,11 @@ def _compare_card(slide, study, categories, picks, x, y, w, h, title, accent, he
     _flush(add_text(slide, title, x + 0.16, y + 0.12, w - 0.32, 0.22, size=11, bold=True, color=accent))
     if _visual(study) == "layer":
         image = _render_pack(study, picks)
-        pack_h = 0.92
-        pack_w = pack_h * PACK_ASPECT
+        pack_w, pack_h = contain_size(file_aspect(image) if image else PACK_ASPECT, 1.15, 0.92)
         if image:
-            slide.shapes.add_picture(str(image), Inches(x + 0.16), Inches(y + 0.38), height=Inches(pack_h))
+            slide.shapes.add_picture(
+                str(image), Inches(x + 0.16), Inches(y + 0.38), Inches(pack_w), Inches(pack_h),
+            )
         score_x = x + 0.16 + pack_w + 0.22
         score_w = w - (score_x - x) - 0.16
         _flush(add_text(
@@ -1207,17 +1553,18 @@ def _compare_card(slide, study, categories, picks, x, y, w, h, title, accent, he
         ))
     list_top = y + header_h + 0.06
     mode = _visual(study)
+    rows = _pick_rows(study, picks)
     if mode == "text":
-        _text_compare_rows(slide, categories, picks, x, list_top, w, y + h - 0.08)
+        _text_compare_rows(slide, rows, x, list_top, w, y + h - 0.08)
         return
-    row_h = (y + h - 0.08 - list_top) / max(len(picks), 1)
+    row_h = (y + h - 0.08 - list_top) / max(len(rows), 1)
     rule = RGBColor(0xF0, 0xE6, 0xEA)
     thumb = min(row_h - 0.08, 0.72) if mode == "grid" else 0.0
     silo_w = 1.28
     score_col = 0.72
     name_x = x + 0.16 + silo_w + (thumb + 0.08 if thumb else 0)
     name_w = w - (name_x - x) - score_col - 0.16
-    for index, (category, element) in enumerate(zip(categories, picks)):
+    for index, (category, element) in enumerate(rows):
         top = list_top + index * row_h
         if index:
             add_rect(slide, x + 0.14, top, w - 0.28, 0.01, rule)
@@ -1240,13 +1587,24 @@ def _compare_card(slide, study, categories, picks, x, y, w, h, title, accent, he
         ))
 
 
-def _text_compare_rows(slide, categories, picks, x, top, w, bottom):
+def _pick_rows(study: Study, picks) -> list[tuple]:
+    """Category and element, in layer order. A silo left off the pack is not listed."""
+    rows = []
+    for category in _ordered_categories(study):
+        for element in picks:
+            if element in category.elements:
+                rows.append((category, element))
+                break
+    return rows
+
+
+def _text_compare_rows(slide, rows, x, top, w, bottom):
     """Group name on its own line, full statement beside the score. Rows are not stretched."""
     cursor = top
     score_w = 0.72
     statement_w = w - 0.36 - score_w
     size = 12
-    for index, (category, element) in enumerate(zip(categories, picks)):
+    for index, (category, element) in enumerate(rows):
         text_h = max(0.36, _row_height(element.label, statement_w, size))
         block = 0.22 + text_h
         if cursor + block > bottom:
@@ -1278,28 +1636,31 @@ def _combination_slide(presentation, study, picks, eyebrow, headline, detail):
     slide = _blank(presentation)
     set_background(slide, WHITE)
     _eyebrow(slide, eyebrow)
-    add_text(slide, headline, 0.55, 0.55, 12.2, 0.4, size=24, bold=True, color=NAVY)
-    add_text(slide, detail, 0.55, 1.0, 12.2, 0.36, size=14, color=GRAY)
+    add_text(slide, headline, 0.48, 0.52, 12.3, 0.38, size=26, bold=True, color=NAVY)
+    add_text(slide, detail, 0.48, 0.96, 12.3, 0.46, size=14, color=GRAY)
 
-    image = _render_pack(study, picks)
-    pack_h = 4.55
-    if image:
-        slide.shapes.add_picture(str(image), Inches(0.5), Inches(1.5), height=Inches(pack_h))
-    pack_w = pack_h * PACK_ASPECT
-
-    list_x = 0.72 + pack_w
-    list_w = 12.7 - list_x
-    _layer_list(slide, study, picks, list_x, 1.5, list_w, 4.7)
+    stage_x, stage_y, stage_w, stage_h = 0.42, 1.56, 4.42, 5.12
+    add_rect(slide, stage_x, stage_y, stage_w, stage_h, RGBColor(0xFB, 0xF4, 0xF7), rounded=True, radius=0.12)
     total = sum(element.lift for element in picks)
-    if study.base_appeal is None:
-        pack_line = f"Layer lift {fmt_lift(total)}"
-    else:
-        pack_line = f"Base {fmt_pct(study.base_appeal)}    ·    layer lift {fmt_lift(total)}"
-    add_text(
-        slide,
-        pack_line,
-        0.55, 6.28, 12.2, 0.4, size=14, bold=True, color=NAVY,
-    )
+    image = _render_pack(study, picks)
+    pack_w, pack_h = contain_size(file_aspect(image) if image else PACK_ASPECT, stage_w - 0.7, stage_h - 1.55)
+    if image:
+        left = stage_x + (stage_w - pack_w) / 2
+        top = stage_y + 0.22 + max(0, (stage_h - 1.45 - pack_h) / 2)
+        slide.shapes.add_picture(str(image), Inches(left), Inches(top), Inches(pack_w), Inches(pack_h))
+    score_y = stage_y + stage_h - 1.05
+    add_rect(slide, stage_x + 0.28, score_y, stage_w - 0.56, 0.78, WHITE, rounded=True, radius=0.1)
+    _flush(add_text(
+        slide, fmt_lift(total), stage_x + 0.42, score_y, stage_w - 0.84, 0.46,
+        size=26, bold=True, color=lift_color(total), align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.BOTTOM,
+    ))
+    caption = "coefficient sum" if study.base_appeal is None else f"coefficient sum  ·  base {fmt_pct(study.base_appeal)}"
+    _flush(add_text(
+        slide, caption, stage_x + 0.42, score_y + 0.42, stage_w - 0.84, 0.28,
+        size=11, color=GRAY, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.TOP,
+    ))
+
+    _layer_list(slide, study, picks, 5.08, stage_y, 7.82, stage_h)
     return slide
 
 
@@ -1311,7 +1672,6 @@ def _grid_combination_slide(presentation, study, picks, eyebrow, headline, detai
     add_text(slide, headline, 0.55, 0.52, 12.2, 0.4, size=24, bold=True, color=NAVY)
     add_text(slide, detail, 0.55, 0.96, 12.2, 0.36, size=14, color=GRAY)
 
-    categories = _ordered_categories(study)
     count = max(len(picks), 1)
     gap = 0.22
     usable = 12.2
@@ -1320,7 +1680,7 @@ def _grid_combination_slide(presentation, study, picks, eyebrow, headline, detai
     box_h = 3.35
     for index, element in enumerate(picks):
         left = 0.55 + index * (col_w + gap)
-        category = categories[index] if index < len(categories) else None
+        category = next((item for item in study.categories if element in item.elements), None)
         art = _raw_image(element)
         if art:
             _place_fit(slide, art, left, box_top, col_w, box_h)
@@ -1350,13 +1710,12 @@ def _text_combination_slide(presentation, study, picks, eyebrow, headline, detai
     _eyebrow(slide, eyebrow)
     add_text(slide, headline, 0.55, 0.50, 12.2, 0.38, size=24, bold=True, color=NAVY)
     add_text(slide, detail, 0.55, 0.92, 12.2, 0.30, size=14, color=GRAY)
-    categories = _ordered_categories(study)
     cursor = 1.40
     score_w = 0.95
     statement_w = 8.35
     size = 15
-    for index, element in enumerate(picks):
-        silo = categories[index].label if index < len(categories) else ""
+    for element in picks:
+        silo = next((category.label for category in study.categories if element in category.elements), "")
         row_h = max(0.64, _row_height(element.label, statement_w, size))
         add_rect(slide, 0.55, cursor, 12.2, row_h, RGBColor(0xFB, 0xF6, 0xF8), rounded=True, radius=0.06)
         _flush(add_text(
@@ -1388,11 +1747,11 @@ def _text_combination_slide(presentation, study, picks, eyebrow, headline, detai
 def _pack_column(slide, study, picks, x, title, accent):
     add_text(slide, title, x, 1.5, 5.8, 0.28, size=12, bold=True, color=accent)
     image = _render_pack(study, picks)
-    pack_h = 3.05
-    pack_w = pack_h * PACK_ASPECT
+    pack_w, pack_h = contain_size(file_aspect(image) if image else PACK_ASPECT, 4.6, 3.05)
     left = x + (5.6 - pack_w) / 2
+    top = 1.86 + (3.05 - pack_h) / 2
     if image:
-        slide.shapes.add_picture(str(image), Inches(left), Inches(1.86), height=Inches(pack_h))
+        slide.shapes.add_picture(str(image), Inches(left), Inches(top), Inches(pack_w), Inches(pack_h))
     total = sum(element.lift for element in picks)
     if study.base_appeal is None:
         pack_line = "Layer lift, no separate base"
@@ -1411,53 +1770,59 @@ def _pack_column(slide, study, picks, x, title, accent):
 
 
 def _layer_list(slide, study, picks, x, y, w, h):
+    """One chip per layer: category, element, and a bar against the strongest coefficient."""
     count = max(len(picks), 1)
-    row_h = h / count
-    thumb_h = min(row_h * 0.86, 0.42)
-    thumb_w = thumb_h * PACK_ASPECT
+    gap = 0.05
+    row_h = (h - gap * max(0, count - 1)) / count
+    peak = max((abs(element.lift) for element in picks), default=1.0) or 1.0
+    score_w = 0.82
+    text_w = w - score_w - 0.28
+    two_line = row_h >= 0.48
     for index, element in enumerate(picks):
-        top = y + index * row_h
+        top = y + index * (row_h + gap)
         silo = next((category.label for category in study.categories if element in category.elements), "")
-        add_text(slide, f"{index + 1:02d}", x, top, 0.38, row_h, size=10, bold=True, color=TEAL, anchor=MSO_ANCHOR.MIDDLE)
-        art = _element_art(study, element)
-        picture_top = top + (row_h - thumb_h) / 2
-        if art:
-            _place_fit(slide, art, x + 0.38, picture_top, thumb_w, thumb_h)
-        add_text(
-            slide,
-            f"{silo}   ·   {element.label}",
-            x + 0.52 + thumb_w,
-            top,
-            w - thumb_w - 1.7,
-            row_h,
-            size=11 if row_h < 0.4 else 12,
-            color=NAVY,
-            anchor=MSO_ANCHOR.MIDDLE,
-        )
-        add_text(
-            slide,
-            fmt_lift(element.lift),
-            x + w - 0.85,
-            top,
-            0.8,
-            row_h,
-            size=12,
-            bold=True,
-            color=lift_color(element.lift),
-            align=PP_ALIGN.RIGHT,
-            anchor=MSO_ANCHOR.MIDDLE,
-        )
+        add_rect(slide, x, top, w, row_h, RGBColor(0xFB, 0xF6, 0xF8), rounded=True, radius=0.06)
+        if two_line:
+            _flush(add_text(
+                slide, f"{index + 1:02d}    {silo.upper()}", x + 0.16, top + 0.02, text_w, 0.18,
+                size=10, bold=True, color=TEAL, anchor=MSO_ANCHOR.MIDDLE,
+            ))
+            _flush(add_text(
+                slide, element.label, x + 0.16, top + 0.19, text_w, 0.2,
+                size=13, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+            ))
+            track_w = text_w
+            track_y = top + row_h - 0.07
+            add_rect(slide, x + 0.16, track_y, track_w, 0.028, RGBColor(0xF0, 0xE4, 0xEA))
+            add_rect(
+                slide, x + 0.16, track_y, max(0.06, track_w * min(1.0, abs(element.lift) / peak)), 0.028,
+                lift_color(element.lift),
+            )
+        else:
+            _flush(add_text(
+                slide, f"{index + 1:02d}    {silo}   ·   {element.label}", x + 0.14, top, text_w, row_h,
+                size=12, color=NAVY, anchor=MSO_ANCHOR.MIDDLE,
+            ))
+        _flush(add_text(
+            slide, fmt_lift(element.lift), x + w - score_w - 0.1, top, score_w, row_h,
+            size=15 if two_line else 13, bold=True, color=lift_color(element.lift),
+            align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE,
+        ))
 
 
 def _appendix_intro(presentation, study: Study):
     slide = _blank(presentation)
     set_background(slide, WHITE)
     _eyebrow(slide, "APPENDIX  ·  FULL ELEMENT LIFT SUMMARY")
-    add_text(slide, "Every element, same model", 0.62, 0.72, 12, 0.5, size=30, bold=True, color=NAVY)
+    add_text(slide, "Every element, one silo per page", 0.62, 0.72, 12, 0.5, size=30, bold=True, color=NAVY)
+    group_line = ""
+    if study.classifications:
+        labels = ", ".join(segment.label for segment in study.classifications[0].segments)
+        group_line = f" Overall is the full sample. The other columns are {labels}."
     add_text(
         slide,
         f"Scores are {study.model_name} coefficients ({study.rating_bands}), rounded the same way as the charts. "
-        "Green is lift above the baseline. Red is lift below it. A star means the coefficient cleared the study threshold.",
+        f"Green is lift above the baseline. Red is lift below it.{group_line}",
         0.62, 1.35, 12, 0.7, size=16, color=GRAY,
     )
     add_rect(slide, 0.62, 2.3, 3.8, 1.5, BLUSH_CARD, rounded=True)
@@ -1473,55 +1838,146 @@ def _appendix_intro(presentation, study: Study):
     add_rect(slide, 8.68, 2.3, 3.95, 1.5, BLUSH_CARD, rounded=True)
     add_text(slide, str(study.element_count), 8.9, 2.45, 3.5, 0.7, size=32, bold=True, color=NAVY)
     add_text(slide, "Elements scored", 8.9, 3.2, 3.5, 0.35, size=14, color=GRAY)
+    _FOOTER_NOTES[id(slide)] = _appendix_footer(study)
     return slide
+
+
+def _appendix_question(study: Study):
+    """The classification cut shown beside Overall. Findings slides carry any further cuts."""
+    if not study.classifications:
+        return None
+    return study.classifications[0]
+
+
+def _appendix_footer(study: Study) -> str:
+    """One line under the appendix tables. Edit this sentence to change that line."""
+    question = _appendix_question(study)
+    if question and any(segment.base_size for segment in question.segments):
+        sample = "; ".join(
+            f"n={segment.base_size} {segment.label}" if segment.base_size else segment.label
+            for segment in question.segments
+        )
+    else:
+        sample = f"n={study.respondents or study.base_size} respondents"
+    fractional = False
+    for category in study.categories:
+        for element in category.elements:
+            values = [element.lift]
+            if question:
+                values.extend(float(element.segment_lifts.get(segment.key, 0.0)) for segment in question.segments)
+            if any(abs(float(value) - round(float(value))) >= 0.05 for value in values):
+                fractional = True
+                break
+        if fractional:
+            break
+    places = "one decimal" if fractional else "whole points"
+    return (
+        f"{sample}. {study.model_name} model: element lifts show movement above or below the model baseline. "
+        f"Values rounded to {places}."
+    )
 
 
 def _lift_tables(presentation, study: Study):
-    """Same bar chart as the findings slides. Long silos continue on the next slide."""
+    """One silo per page, as a score table. A very long silo continues on the next page."""
     if _visual(study) == "text":
         return _text_summary_slides(presentation, study)
     slides = []
-    pairable = []
-    banner = RGBColor(0xF4, 0xE0, 0xE7)
     for category in study.categories:
         ordered = sorted(category.elements, key=lambda element: element.lift, reverse=True)
-        pages = _pages(ordered, _SUMMARY_PER_PAGE)
-        if len(pages) > 1:
-            for index, page in enumerate(pages, start=1):
-                slides.append(_lift_slide(presentation, study, [(category, page, index, len(pages))], banner))
-        else:
-            pairable.append((category, ordered, 1, 1))
-    for index in range(0, len(pairable), 2):
-        slides.append(_lift_slide(presentation, study, pairable[index:index + 2], banner))
+        pages = _pages(ordered, 12)
+        for index, page in enumerate(pages, start=1):
+            slides.append(_appendix_table_slide(presentation, study, category, page, index, len(pages)))
     return slides
 
 
-def _lift_slide(presentation, study, panels, banner):
+def _appendix_table_slide(presentation, study, category, elements, page: int, pages: int):
+    """Element, overall lift, and classification columns. Matches the appendix readout."""
     slide = _blank(presentation)
     set_background(slide, WHITE)
+    question = _appendix_question(study)
+    _headline, detail, _key = classification_story(category, question) if question else category_story(category)
     _eyebrow(slide, "FULL ELEMENT LIFT SUMMARY")
-    titles = "   ·   ".join(
-        f"{category.label}{_page_mark(page, pages)}" for category, _elements, page, pages in panels
+    title = f"{category.label} — Element Lift Summary{_page_mark(page, pages)}"
+    title_h = _draw_fitted(
+        slide, title, 0.62, 0.56, 12.1, 0.72,
+        size=28, min_size=18, color=NAVY, bold=True, max_lines=2, one_line_floor=20,
     )
-    add_text(slide, titles, 0.48, 0.52, 12.3, 0.40, size=28, bold=True, color=NAVY)
-    if len(panels) == 2:
-        slots = [(0.22, 6.15), (6.95, 6.15)]
-    else:
-        slots = [(0.55, 8.6)]
-    for (category, elements, _page, _pages), (left, width) in zip(panels, slots):
-        bar = add_rect(slide, left, 1.12, width, 0.30, banner)
-        _shape_label(bar, f"{category.label.upper()} PREFERENCES", 12, NAVY, bold=True, wrap=False)
-        arts = _gallery_art(study, category, elements)
-        pictures = {
-            element.code: path
-            for element, path in zip(elements, arts)
-            if path
-        }
-        add_lift_chart(
-            slide, elements, left, 1.48, width, 4.95,
-            name_w=1.85 if len(panels) == 2 else 2.4, pictures=pictures,
-        )
+    detail_y = 0.56 + title_h + 0.08
+    detail_h = _draw_fitted(
+        slide, detail, 0.62, detail_y, 12.1, 0.48,
+        size=15, min_size=11, color=GRAY, max_lines=2, one_line_floor=12,
+    )
+    banner_y = detail_y + detail_h + 0.16
+    banner = add_rect(slide, 0.62, banner_y, 12.1, 0.32, RGBColor(0xF7, 0xE6, 0xEC))
+    _shape_label(banner, category.label.upper(), 12, NAVY, bold=True, wrap=False)
+    _draw_score_table(slide, elements, question, 0.62, banner_y + 0.32, 12.1)
+    _FOOTER_NOTES[id(slide)] = _appendix_footer(study)
     return slide
+
+
+def _draw_score_table(slide, elements, question, x, y, w) -> None:
+    """Open table: name on the left, overall and each group centered, green above and red below."""
+    segments = list(question.segments) if question else []
+    if len(segments) > 5:
+        segments = []
+    count = 1 + len(segments)
+    score_w = 1.55 if count <= 3 else (1.28 if count <= 5 else 1.05)
+    element_w = w - score_w * count
+    if element_w < 4.4:
+        score_w = max(0.95, (w - 4.4) / count)
+        element_w = w - score_w * count
+    columns = [("Element", element_w, PP_ALIGN.LEFT, None)]
+    columns.append(("Overall", score_w, PP_ALIGN.CENTER, "overall"))
+    for segment in segments:
+        columns.append((segment.label, score_w, PP_ALIGN.CENTER, segment))
+
+    header_h = 0.36
+    count = max(len(elements), 1)
+    room = (6.80 - y - header_h) / count
+    preferred = 0.46 if count <= 6 else (0.42 if count <= 9 else 0.36)
+    row_h = min(preferred, max(room, 0.30))
+    cursor = x
+    rule = RGBColor(0xE7, 0xD5, 0xDE)
+    hairline = RGBColor(0xF3, 0xEA, 0xEE)
+    for label, width, align, _kind in columns:
+        pad = 0.02 if align == PP_ALIGN.CENTER else 0.0
+        size, _height = fitted_size(label, width - 0.1, header_h, 12, minimum=9, bold=True, max_lines=1)
+        box = add_text(
+            slide, label, cursor + pad, y, width - pad * 2, header_h,
+            size=size, bold=True, color=NAVY, align=align, anchor=MSO_ANCHOR.MIDDLE,
+        )
+        _flush(box)
+        apply_leading(box, size)
+        cursor += width
+    add_rect(slide, x, y + header_h, w, 0.012, rule)
+
+    for index, element in enumerate(elements):
+        top = y + header_h + index * row_h
+        cursor = x
+        values = [("name", element.label)]
+        values.append(("overall", element.lift))
+        for segment in segments:
+            values.append(("segment", element.segment_lifts.get(segment.key)))
+        for (_label, width, align, kind), (kind_name, value) in zip(columns, values):
+            if kind_name == "name":
+                size, _height = fitted_size(str(value), width - 0.12, row_h - 0.04, 14, minimum=11, max_lines=2)
+                box = add_text(
+                    slide, value, cursor, top, width - 0.08, row_h,
+                    size=size, color=NAVY, align=PP_ALIGN.LEFT, anchor=MSO_ANCHOR.MIDDLE,
+                )
+                _flush(box)
+                apply_leading(box, size)
+            else:
+                number = fmt_lift(value)
+                color = GRAY if value is None else lift_color(float(value))
+                box = add_text(
+                    slide, number, cursor, top, width, row_h,
+                    size=14, bold=(kind == "overall"), color=color, align=align, anchor=MSO_ANCHOR.MIDDLE,
+                )
+                _flush(box)
+                apply_leading(box, 14)
+            cursor += width
+        add_rect(slide, x, top + row_h - 0.008, w, 0.008, hairline)
 
 
 def _asset_slides(presentation, study: Study):
@@ -1554,28 +2010,40 @@ def _asset_slides(presentation, study: Study):
 
 
 def _place_asset_rows(slide, study, rows, top: float):
-    """Every element uses the same frame. A slide holds at most two rows."""
-    height = 1.96
-    width = height * PACK_ASPECT
-    gap = 0.22
+    """Each asset keeps its own aspect. A slide holds at most two rows."""
+    gap = 0.18
     label_h = 0.46
     row_gap = 0.16
-    row_count = max(len(rows), 1)
-    block_h = row_count * (height + label_h) + (row_count - 1) * row_gap
+    max_h = 2.15
+    max_row_w = 12.1
+    prepared = []
+    for row in rows:
+        items = []
+        for element in row:
+            art = _element_on_pack(study, element)
+            aspect = file_aspect(art) if art else 1.0
+            items.append((element, art, aspect))
+        prepared.append(items)
+    row_heights = []
+    for items in prepared:
+        if not items:
+            row_heights.append(max_h)
+            continue
+        aspect_sum = sum(aspect for _element, _art, aspect in items)
+        gaps = gap * (len(items) - 1)
+        height = min(max_h, (max_row_w - gaps) / aspect_sum if aspect_sum else max_h)
+        row_heights.append(max(height, 0.4))
+    block_h = sum(height + label_h for height in row_heights) + row_gap * max(len(prepared) - 1, 0)
     available_h = 6.7 - top
     origin = top + max(0, (available_h - block_h) / 2)
-    for row_index, row in enumerate(rows):
-        count = len(row)
-        total_w = count * width + (count - 1) * gap
-        left0 = 0.62 + (12.1 - total_w) / 2
-        y = origin + row_index * (height + label_h + row_gap)
-        for index, element in enumerate(row):
-            left = left0 + index * (width + gap)
-            art = _element_on_pack(study, element)
+    y = origin
+    for items, height in zip(prepared, row_heights):
+        widths = [height * aspect for _element, _art, aspect in items]
+        total_w = sum(widths) + gap * max(len(items) - 1, 0)
+        left = 0.62 + max(0, (max_row_w - total_w) / 2)
+        for (element, art, _aspect), width in zip(items, widths):
             if art:
-                slide.shapes.add_picture(
-                    str(art), Inches(left), Inches(y), Inches(width), Inches(height)
-                )
+                _place_fit(slide, art, left, y, width, height)
             else:
                 add_text(slide, element.code, left, y, width, height, size=14, bold=True, color=NAVY, align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
             label_box = add_text(
@@ -1584,6 +2052,8 @@ def _place_asset_rows(slide, study, rows, top: float):
                 size=10, color=NAVY, align=PP_ALIGN.CENTER,
             )
             label_box.text_frame.word_wrap = False
+            left += width + gap
+        y += height + label_h + row_gap
 
 
 def _text_summary_slides(presentation, study: Study):
@@ -1710,15 +2180,16 @@ def _thanks(presentation, study: Study):
         "We look forward to discussing the full report and next steps.",
         4.600, 2.82, 7.2, 0.40, size=16, color=NAVY,
     )
+    when = study.launched_label or ""
     add_text(
         slide,
-        report_name,
-        4.600, 4.244, 8.4, 0.37, size=16, color=NAVY,
+        f"{report_name}  |  {when}".strip(" |"),
+        4.600, 4.244, 7.2, 0.37, size=16, color=NAVY,
     )
     add_text(
         slide,
         _prepared_by_line(study),
-        4.600, 4.628, 8.4, 0.37, size=16, color=NAVY,
+        4.600, 4.628, 7.64, 0.37, size=16, color=NAVY,
     )
     add_text(slide, "Mind Genomics Associates, Inc", 4.600, 5.012, 4.2, 0.37, size=16, color=NAVY)
     add_text(slide, study.title, 4.600, 5.711, 8.4, 0.55, size=20, color=NAVY)

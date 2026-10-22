@@ -13,7 +13,22 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
-from app.services.reportgen.theme import FONT, GRAY, NAVY, add_rect, add_text, bar_color, fmt_lift, lift_color
+from app.services.reportgen.theme import FONT, GRAY, GREEN, NAVY, ROSE, TEAL, add_rect, add_text, bar_color, fmt_lift, lift_color
+
+# One color per classification answer. The first two match the users / non-users readout.
+SERIES_COLORS = (
+    RGBColor(0x1A, 0x23, 0x32),
+    TEAL,
+    RGBColor(0xC4, 0x5C, 0x26),
+    RGBColor(0x1D, 0x4E, 0x89),
+    RGBColor(0x6B, 0x4C, 0x7A),
+    GREEN,
+    ROSE,
+)
+
+
+def series_color(index: int) -> RGBColor:
+    return SERIES_COLORS[index % len(SERIES_COLORS)]
 
 # Room kept clear of the bar tip so the score never sits on the bar or the name.
 _LABEL_ROOM = 0.62
@@ -76,6 +91,171 @@ def add_lift_chart(slide, elements, x, y, w, h, name_w: float = 2.05, pictures=N
                 size=size, bold=False, color=NAVY, align=PP_ALIGN.RIGHT,
             )
     return None
+
+
+def add_grouped_lift_chart(slide, elements, segments, x, y, w, h, name_w: float = 1.82):
+    """One row per element, one bar per classification answer, legend under the axis.
+
+    ``segments`` is a list of objects with ``key``, ``label``, and ``base_size``.
+    Each element exposes ``segment_lifts[key]``. The legend is centered on the
+    plot, on the same baseline, so the swatches line up with the axis.
+    """
+    ordered = list(elements)
+    if not ordered or not segments:
+        return None
+
+    axis_band = 0.40
+    gutter = 0.58
+    legend_rows = _legend_rows(segments, w)
+    legend_h = 0.24 * len(legend_rows)
+    plot_x = x + name_w
+    plot_w = max(w - name_w - gutter, 2.2)
+    plot_y = y
+    plot_h = max(h - axis_band - legend_h, 1.2)
+    values = [
+        float(element.segment_lifts.get(segment.key, 0.0))
+        for element in ordered
+        for segment in segments
+    ]
+    axis_min, axis_max = _tight_bounds(values)
+    span = axis_max - axis_min or 1
+
+    def at(value: float) -> float:
+        return plot_x + (value - axis_min) / span * plot_w
+
+    grid = RGBColor(0xE4, 0xE8, 0xED)
+    axis_ink = RGBColor(0xC5, 0xCD, 0xD6)
+    for tick, gx in _ticks(axis_min, axis_max, plot_x, plot_w):
+        if abs(tick) > 1e-6:
+            add_rect(slide, gx, plot_y, 0.01, plot_h, grid)
+        label_left = gx - 0.32
+        _fit_text(
+            slide, _tick_label(tick), label_left, plot_y + plot_h + 0.02, 0.64, 0.20,
+            size=10, bold=False, color=GRAY, align=PP_ALIGN.CENTER,
+        )
+    zero = at(0)
+    add_rect(slide, zero, plot_y, 0.012, plot_h, axis_ink)
+    add_rect(slide, plot_x, plot_y + plot_h, plot_w, 0.012, axis_ink)
+
+    count = len(segments)
+    row_h = plot_h / len(ordered)
+    bar_gap = 0.045
+    bar_h = min(0.17, max(0.09, (row_h * 0.56 - bar_gap * (count - 1)) / count))
+    stack_h = count * bar_h + (count - 1) * bar_gap
+    score_size = 12 if bar_h >= 0.14 else 10
+    for index, element in enumerate(ordered):
+        row_top = plot_y + index * row_h
+        origin = row_top + max(0, (row_h - stack_h) / 2)
+        size = _name_size(element.label)
+        label = wrap_label(element.label, name_w - 0.16, size)
+        lines = max(1, label.count("\n") + 1)
+        text_h = max(stack_h, lines * (size / 72) * 1.25)
+        text_top = origin + (stack_h - text_h) / 2
+        text_top = min(max(text_top, row_top), row_top + row_h - text_h)
+        _fit_text(
+            slide, label, x, text_top, name_w - 0.12, text_h,
+            size=size, bold=False, color=NAVY, align=PP_ALIGN.RIGHT,
+        )
+        for series_index, segment in enumerate(segments):
+            value = float(element.segment_lifts.get(segment.key, 0.0))
+            bar_top = origin + series_index * (bar_h + bar_gap)
+            end = at(value)
+            left = min(zero, end)
+            width = max(abs(end - zero), 0.03)
+            color = series_color(series_index)
+            add_rect(slide, left, bar_top, width, bar_h, color)
+            _series_score(
+                slide, value, end, bar_top, bar_h, plot_x, x + w, color, score_size,
+            )
+    _draw_legend_rows(slide, legend_rows, plot_x + plot_w / 2, x, x + w, y + h - legend_h)
+    return None
+
+
+def _legend_rows(segments, width: float) -> list[list[tuple[int, str, float, float]]]:
+    """Pack legend items onto as few centered rows as will fit under the chart."""
+    size = 10 if len(segments) > 2 else 11
+    swatch = 0.11
+    text_gap = 0.08
+    item_gap = 0.28 if len(segments) > 2 else 0.38
+    limit = max(width - 0.04, 2.0)
+    items = []
+    for index, segment in enumerate(segments):
+        label = f"{segment.label} (basesize = {segment.base_size})" if segment.base_size else segment.label
+        text_w = max(0.8, len(label) * (size / 72) * 0.56)
+        text_w = min(text_w, limit - swatch - text_gap)
+        items.append((index, label, text_w, swatch + text_gap + text_w, size))
+    rows: list[list] = []
+    current: list = []
+    used = 0.0
+    for item in items:
+        need = item[3] if not current else item_gap + item[3]
+        if current and used + need > limit:
+            rows.append(current)
+            current = [item]
+            used = item[3]
+        else:
+            current.append(item)
+            used += need
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _draw_legend_rows(slide, rows, center, min_x, max_x, y) -> None:
+    """Swatches and names, one baseline per row, each row centered under the plot."""
+    swatch = 0.11
+    row_h = 0.24
+    text_gap = 0.08
+    item_gap = 0.28 if sum(len(row) for row in rows) > 2 else 0.38
+    ink = RGBColor(0x2C, 0x3A, 0x4A)
+    span = max_x - min_x
+    for row_index, row in enumerate(rows):
+        total = sum(item[3] for item in row) + item_gap * max(len(row) - 1, 0)
+        left = center - total / 2
+        if left < min_x:
+            left = min_x
+        if left + total > max_x:
+            left = max(min_x, max_x - total)
+        # A row wider than the chart starts at the left edge instead of running off both sides.
+        if total > span:
+            left = min_x
+        cursor = left
+        row_y = y + row_index * row_h
+        for index, label, text_w, width, size in row:
+            add_rect(slide, cursor, row_y + (row_h - swatch) / 2, swatch, swatch, series_color(index))
+            _fit_text(
+                slide, label, cursor + swatch + text_gap, row_y, text_w, row_h,
+                size=size, bold=False, color=ink, align=PP_ALIGN.LEFT,
+            )
+            cursor += width + item_gap
+
+
+def _series_score(slide, lift, end, top, height, plot_left, plot_right, color, size: int = 12) -> None:
+    label_w = 0.50
+    gap = 0.06
+    if lift < 0:
+        left = end - gap - label_w
+        align = PP_ALIGN.RIGHT
+    else:
+        left = end + gap
+        align = PP_ALIGN.LEFT
+    left = min(max(left, plot_left), plot_right - label_w)
+    _fit_text(
+        slide, fmt_lift(lift), left, top, label_w, height,
+        size=size, bold=True, color=color, align=align,
+    )
+
+
+def _tight_bounds(values) -> tuple[float, float]:
+    """Axis that ends on the next clean tick past the data. Scores sit in the gutter."""
+    lo = min(min(values), 0.0)
+    hi = max(max(values), 0.0)
+    step = _nice_step(max(hi - lo, 2) / 2.4)
+    axis_min = 0.0 if lo >= 0 else math.floor(lo / step) * step
+    axis_max = 0.0 if hi <= 0 else math.ceil(max(hi, step) / step) * step
+    if axis_max <= axis_min:
+        axis_max = axis_min + step
+    return axis_min, axis_max
 
 
 def add_column_chart(slide, pairs: list[tuple[str, float]], x, y, w, h, series_name: str = "Count"):
@@ -155,6 +335,7 @@ def _fit_text(slide, text, x, y, w, h, size, bold, color, align) -> None:
     )
     frame = box.text_frame
     frame.word_wrap = False
+    frame.vertical_anchor = MSO_ANCHOR.MIDDLE
     frame.margin_left = Inches(0)
     frame.margin_right = Inches(0)
     frame.margin_top = Inches(0)

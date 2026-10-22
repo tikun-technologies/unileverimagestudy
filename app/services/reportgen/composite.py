@@ -10,26 +10,21 @@ from PIL import Image
 PACK_ASPECT = 2480 / 3508
 
 
-def _save_opaque(canvas: "Image.Image", destination: Path) -> None:
-    """Write an opaque composite as JPEG.
-
-    The previous PNG + ``optimize=True`` path was the single largest cost in a
-    build (multi-pass zlib on every preview) and produced ~30 MB decks. These
-    composites are always flattened onto a white background, so JPEG is visually
-    equivalent for pack photography while encoding ~10x faster and cutting the
-    file to a fraction of the size. python-pptx and PIL both detect the format
-    from the bytes, so keeping the ``.png`` destination name is harmless.
-    """
-    rgb = canvas.convert("RGB")
-    rgb.save(destination, format="JPEG", quality=88, optimize=False, progressive=False)
-
-
-def composite_pack(layer_paths: list[Path], destination: Path, width: int = 900, aspect: float = PACK_ASPECT) -> Path | None:
+def composite_pack(
+    layer_paths: list[Path],
+    destination: Path,
+    width: int = 900,
+    aspect: float | None = None,
+    frame: tuple[float, float, float, float] | None = None,
+) -> Path | None:
+    """Stack layers at their own aspect ratio. Nothing is stretched to fit the frame."""
     canvas = _stack(layer_paths, width, aspect)
     if canvas is None:
         return None
+    if frame is not None:
+        canvas = _crop_fraction(canvas, frame)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    _save_opaque(canvas, destination)
+    canvas.convert("RGB").save(destination, format="PNG", optimize=True)
     return destination
 
 
@@ -41,6 +36,7 @@ def element_preview(
     tight: bool = False,
     frame: tuple[float, float, float, float] | None = None,
     full: bool = False,
+    aspect: float | None = None,
 ) -> Path | None:
     """Background stays underneath the element.
 
@@ -56,7 +52,7 @@ def element_preview(
     stamp = max(path.stat().st_mtime for path in layers)
     if destination.exists() and destination.stat().st_size > 0 and destination.stat().st_mtime >= stamp:
         return destination
-    canvas = _stack(layers, width)
+    canvas = _stack(layers, width, aspect)
     if canvas is None:
         return None
     if full:
@@ -64,11 +60,9 @@ def element_preview(
     elif frame is not None:
         canvas = _crop_fraction(canvas, frame)
     elif element_path and element_path.exists():
-        element = Image.open(element_path).convert("RGBA")
-        if element.size != canvas.size:
-            element = element.resize(canvas.size, Image.Resampling.LANCZOS)
+        element = _contain(Image.open(element_path).convert("RGBA"), canvas.size)
         canvas = _focus_crop(canvas, element, tight=tight)
-    _save_opaque(canvas, destination)
+    canvas.convert("RGB").save(destination, format="PNG", optimize=True)
     return destination
 
 
@@ -88,7 +82,7 @@ def gallery_frame(element_paths: list[Path]) -> tuple[float, float, float, float
         with Image.open(path) as image:
             alpha = image.convert("RGBA")
             if alpha.size != (width, height):
-                alpha = alpha.resize((width, height), Image.Resampling.LANCZOS)
+                alpha = _contain(alpha, (width, height))
             box = alpha.getchannel("A").getbbox()
         if box:
             boxes.append(box)
@@ -134,17 +128,81 @@ def gallery_frame(element_paths: list[Path]) -> tuple[float, float, float, float
     return _window_fractions((max(0, left), max(0, top), right, bottom), width, height, pad_x=0, pad_y=0)
 
 
-def _stack(layer_paths: list[Path], width: int, aspect: float = PACK_ASPECT) -> Image.Image | None:
+def pack_window(background: Path | None) -> tuple[float, float, float, float] | None:
+    """One crop for the whole study: the bottle, not the empty canvas around it.
+
+    Every element uses this window, so the pack keeps a single aspect ratio.
+    """
+    if background is None or not background.exists():
+        return None
+    with Image.open(background) as image:
+        rgba = image.convert("RGBA")
+        box = rgba.getchannel("A").getbbox()
+        width, height = rgba.size
+    if not box or width <= 0 or height <= 0:
+        return None
+    ink_w = box[2] - box[0]
+    ink_h = box[3] - box[1]
+    pad_x = max(2.0, ink_w * 0.04)
+    pad_y = max(2.0, ink_h * 0.02)
+    return _window_fractions(box, width, height, pad_x, pad_y)
+
+
+def file_aspect(path: Path) -> float:
+    """Width / height of a file. Falls back to the legacy pack frame when the file cannot be read."""
+    try:
+        with Image.open(path) as image:
+            if image.height:
+                return image.width / image.height
+    except OSError:
+        pass
+    return PACK_ASPECT
+
+
+def contain_size(aspect: float, max_w: float, max_h: float) -> tuple[float, float]:
+    """Largest size that fits in the box without stretching."""
+    if aspect <= 0 or max_w <= 0 or max_h <= 0:
+        return max(max_w, 0.01), max(max_h, 0.01)
+    width = max_h * aspect
+    height = max_h
+    if width > max_w:
+        width = max_w
+        height = width / aspect
+    return width, height
+
+
+def _contain(layer: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Scale uniformly and center. Width and height always change by the same factor."""
+    target_w, target_h = size
+    source_w, source_h = layer.size
+    plate = Image.new("RGBA", size, (0, 0, 0, 0))
+    if source_w <= 0 or source_h <= 0 or target_w <= 0 or target_h <= 0:
+        return plate
+    scale = min(target_w / source_w, target_h / source_h)
+    fitted_w = min(target_w, max(1, round(source_w * scale)))
+    fitted_h = min(target_h, max(1, round(source_h * scale)))
+    resized = layer if (fitted_w, fitted_h) == layer.size else layer.resize((fitted_w, fitted_h), Image.Resampling.LANCZOS)
+    plate.paste(resized, ((target_w - fitted_w) // 2, (target_h - fitted_h) // 2), resized)
+    return plate
+
+
+def _stack(layer_paths: list[Path], width: int, aspect: float | None = None) -> Image.Image | None:
+    """Stack layers on one canvas.
+
+    The canvas uses the artwork's own aspect unless the caller passes one.
+    Each layer is fitted inside that canvas. A square bottle stays square;
+    it is not pulled into a 9:16 frame.
+    """
     paths = [path for path in layer_paths if path and path.exists()]
     if not paths:
         return None
+    if aspect is None or aspect <= 0:
+        aspect = file_aspect(paths[0])
     height = max(1, round(width / aspect))
     size = (width, height)
     canvas = Image.new("RGBA", size, (255, 255, 255, 255))
     for path in paths:
-        layer = Image.open(path).convert("RGBA")
-        if layer.size != size:
-            layer = layer.resize(size, Image.Resampling.LANCZOS)
+        layer = _contain(Image.open(path).convert("RGBA"), size)
         canvas = Image.alpha_composite(canvas, layer)
     return canvas
 

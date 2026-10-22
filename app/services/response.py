@@ -8,7 +8,7 @@ import time
 import random
 import pandas as pd
 
-from sqlalchemy.orm import Session, selectinload, load_only
+from sqlalchemy.orm import Session, defer, selectinload, load_only
 from sqlalchemy import select, func, desc, and_, or_, text, delete, tuple_
 from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from fastapi import HTTPException, status
@@ -161,6 +161,58 @@ def _attach_layer_fallback_payloads(db: Session, tasks_df: pd.DataFrame) -> None
         layers_col.append(layers_by_task.get(key) if key else None)
     tasks_df["elements_shown_content"] = content_col
     tasks_df["layers_shown_in_task"] = layers_col
+
+
+def _attach_grid_content(db: Session, tasks_df: pd.DataFrame) -> None:
+    """Load element content only when planned tasks are missing.
+
+    The common path matches names from the task table and never reads this
+    column. It repeats image payloads, so pulling it for every row is the
+    slow part in front of a regression that itself finishes in a few seconds.
+    """
+    tasks_df["elements_shown_content"] = None
+    if tasks_df.empty or "study_response_id" not in tasks_df.columns:
+        return
+    pairs = []
+    for response_id, task_index in zip(
+        tasks_df["study_response_id"].tolist(),
+        tasks_df["task_index"].tolist(),
+    ):
+        try:
+            if task_index != task_index:
+                continue
+            pairs.append((response_id, int(task_index)))
+        except (TypeError, ValueError):
+            continue
+    content_by_task: Dict[Tuple[str, int], Any] = {}
+    chunk_size = 400
+    for start in range(0, len(pairs), chunk_size):
+        chunk = pairs[start:start + chunk_size]
+        rows = db.execute(
+            select(
+                CompletedTask.study_response_id,
+                CompletedTask.task_index,
+                CompletedTask.elements_shown_content,
+            ).where(
+                tuple_(
+                    CompletedTask.study_response_id,
+                    CompletedTask.task_index,
+                ).in_(chunk)
+            )
+        ).all()
+        for row in rows:
+            content_by_task[(str(row.study_response_id), int(row.task_index))] = row.elements_shown_content
+    content_col = []
+    for response_id, task_index in zip(
+        tasks_df["study_response_id"].tolist(),
+        tasks_df["task_index"].tolist(),
+    ):
+        try:
+            key = None if task_index != task_index else (str(response_id), int(task_index))
+        except (TypeError, ValueError):
+            key = None
+        content_col.append(content_by_task.get(key) if key else None)
+    tasks_df["elements_shown_content"] = content_col
 
 
 def _fill_layer_visibility_columns(
@@ -3070,7 +3122,13 @@ class StudyResponseService:
         Product ID, product key columns, and Task type. No extra DB round-trips.
         """
         # 1. Fetch Data (Bulk)
-        study = self.db.get(Study, study_id)
+        started = time.perf_counter()
+        # tasks is the generated matrix and can be many megabytes. The task
+        # table is the source used below; loading this column delays analysis
+        # long after the regression itself has finished.
+        study = self.db.execute(
+            select(Study).where(Study.id == study_id).options(defer(Study.tasks))
+        ).scalar_one_or_none()
         if not study:
             raise HTTPException(status_code=404, detail="Study not found")
         from app.core.merged_studies import is_merged_study
@@ -3132,14 +3190,8 @@ class StudyResponseService:
             CompletedTask.task_duration_seconds,
             CompletedTask.elements_shown_in_task,
         ]
-        # Layer visibility lives in elements_shown_in_task. The other two JSON
-        # columns repeat the full image payload and are only needed when that
-        # column is empty.
-        if not is_layer_study:
-            task_cols.extend([
-                CompletedTask.elements_shown_content,
-                CompletedTask.layers_shown_in_task,
-            ])
+        # Layer visibility lives in elements_shown_in_task. The content JSON
+        # repeats image payloads and is loaded later only for rows that need it.
         if unilever_format or str(study.study_type) in ('hybrid', 'grid', 'text', 'video'):
             task_cols.append(CompletedTask.task_type)
         tasks_query = select(*task_cols).where(CompletedTask.study_response_id.in_(response_ids))
@@ -3391,6 +3443,8 @@ class StudyResponseService:
 
             else:
                 # --- FALLBACK: index-based matching (when Study.tasks is unavailable) ---
+                if "elements_shown_content" not in full_df.columns:
+                    _attach_grid_content(self.db, full_df)
                 grid_defs = []
                 for cat in cats:
                     elems = elems_by_cat.get(cat.id, [])
@@ -3550,6 +3604,7 @@ class StudyResponseService:
                     
         # Select and rename
         export_df = full_df[final_cols].rename(columns=export_rename)
+        print(f"analysis dataframe {study_id}: {time.perf_counter() - started:.2f}s rows={len(export_df)}")
         return export_df
         # # 6. Yield CSV
         # # Yield header first? to_csv(index=False) includes header.

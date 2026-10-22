@@ -4,7 +4,7 @@ The function accepts the analysis export as a dict, JSON text, bytes, or a
 file path, and returns the PowerPoint bytes plus a download filename. It does
 not import FastAPI.
 
-    from reportgen.default_report import DefaultReportError, create_default_report
+    from app.services.reportgen.default_report import DefaultReportError, create_default_report
 
     report = create_default_report(analysis_json, study=study_json)
     # report.content, report.filename, report.media_type

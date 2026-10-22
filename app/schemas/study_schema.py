@@ -272,10 +272,41 @@ class SavedDesignInputInsightRow(BaseModel):
     value: float
 
 
+class SavedDesignComparisonSegment(BaseModel):
+    key: str
+    label: str
+    base_size: int = 0
+
+
+class SavedDesignComparisonGroup(BaseModel):
+    source: Literal["gender", "age", "classification"]
+    question: Optional[str] = None
+    title: str = ""
+    segments: List[SavedDesignComparisonSegment] = Field(default_factory=list)
+
+
+class SavedDesignComparison(BaseModel):
+    """Legend points saved with a combination.
+
+    Each selected answer is one legend series. Answers from more than one
+    question are kept together in ``segments`` and grouped in ``groups``.
+    ``audience`` is a filter already applied to the analysis, so it is named
+    on the slide and is not drawn as another series.
+    """
+
+    source: Literal["overall", "gender", "age", "classification", "multiple"] = "overall"
+    question: Optional[str] = None
+    metric: Optional[str] = None
+    segments: List[SavedDesignComparisonSegment] = Field(default_factory=list)
+    groups: List[SavedDesignComparisonGroup] = Field(default_factory=list)
+    audience: Optional[Dict[str, Any]] = None
+
+
 class SavedDesignConfiguration(BaseModel):
     metric: DesignMetric
     study_type: StudyType
     segment: Optional[SavedDesignSegment] = None
+    comparison: Optional[SavedDesignComparison] = None
     selected_by_category: Dict[str, str] = Field(default_factory=dict)
     selected_elements: List[Dict[str, Any]] = Field(default_factory=list)
     input_insights: Optional[Dict[DesignMetric, List[SavedDesignInputInsightRow]]] = None

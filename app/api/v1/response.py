@@ -223,6 +223,22 @@ def _sanitize_analysis_json(obj: Any) -> Any:
     return obj
 
 
+def _cached_page_analysis(
+    db: Session,
+    study_obj: Study,
+    filters_dict: Optional[Dict[str, Any]],
+    unilever_format: bool,
+) -> Optional[Dict[str, Any]]:
+    options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
+    cached = _recall_page_analysis(
+        study_obj.id,
+        unilever_format,
+        filters_dict if filters_are_active(filters_dict) else None,
+        options,
+    )
+    return cached if isinstance(cached, dict) and cached else None
+
+
 def _generate_study_analysis_json(
     db: Session,
     study_obj: Study,
@@ -235,6 +251,7 @@ def _generate_study_analysis_json(
     study_data = _build_study_data_dict(study_obj)
     analysis_options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
     analysis_service = StudyAnalysisService()
+    started = time.perf_counter()
     json_report = analysis_service.generate_json_report(
         df,
         study_data,
@@ -243,6 +260,7 @@ def _generate_study_analysis_json(
         filters=filters_dict if filters_are_active(filters_dict) else None,
     )
     report = _sanitize_analysis_json(json_report)
+    print(f"analysis regression {study_obj.id}: {time.perf_counter() - started:.2f}s")
     # The analytics page loads this once. Keep the lean copy so Export PPT
     # can reuse it instead of running the regression again.
     if not include_raw_data and isinstance(report, dict) and report:
@@ -356,11 +374,22 @@ def _build_analytics_session(
     study_obj = access.study
     study_id = study_obj.id
     active = _session_filters_for_access(db, access)
+    viewer_email = analysis_viewer_email(db, access)
+    unilever_format = is_unilever_domain(viewer_email or "")
+    cached = _cached_page_analysis(db, study_obj, active, unilever_format)
+    if cached is not None:
+        print(f"analysis session {study_id}: cache hit")
+        return {
+            "study_id": str(study_id),
+            "active_filters": active,
+            "has_active_filter": filters_are_active(active),
+            "analysis": cached,
+        }
     df, unilever_format = _load_study_dataframe_for_analysis(
         db,
         study_id,
         access.user,
-        viewer_email=analysis_viewer_email(db, access),
+        viewer_email=viewer_email,
     )
     analysis = _generate_study_analysis_json(
         db,
@@ -1845,29 +1874,35 @@ def save_study_active_filter(
     study_id = study_obj.id
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
     saved = _save_session_filters_for_access(db, access, filters_dict)
-
-    df, unilever_format = _load_study_dataframe_for_analysis(
-        db,
-        study_id,
-        access.user,
-        viewer_email=analysis_viewer_email(db, access),
-    )
-    try:
-        analysis = _generate_study_analysis_json(
+    viewer_email = analysis_viewer_email(db, access)
+    unilever_format = is_unilever_domain(viewer_email or "")
+    cached = _cached_page_analysis(db, study_obj, saved, unilever_format)
+    if cached is not None:
+        print(f"analysis filter {study_id}: cache hit")
+        analysis = cached
+    else:
+        df, unilever_format = _load_study_dataframe_for_analysis(
             db,
-            study_obj,
-            df,
-            include_raw_data=False,
-            filters_dict=saved,
-            unilever_format=unilever_format,
+            study_id,
+            access.user,
+            viewer_email=viewer_email,
         )
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate analysis for active filter: {str(e)}",
-        )
+        try:
+            analysis = _generate_study_analysis_json(
+                db,
+                study_obj,
+                df,
+                include_raw_data=False,
+                filters_dict=saved,
+                unilever_format=unilever_format,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate analysis for active filter: {str(e)}",
+            )
 
     updated_at = None
     if access.share:
