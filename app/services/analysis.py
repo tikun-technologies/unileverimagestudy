@@ -246,26 +246,17 @@ class StudyAnalysisService:
         
         # Also exclude "session_id" etc if present
         classification_cols = []
+        question_meta_map = {}
         # Heuristic: Columns between Age and Task? Or just use study_data
         # Using study_data is safer
         class_qs = study_data.get("classification_questions", [])
         for q in class_qs:
             q_text = q.get("question_text")
+            if q_text:
+                question_meta_map[q_text] = q
             if q_text and q_text in df.columns:
                 classification_cols.append(q_text)
 
-        selected_classification_filters = normalized_filters.get("classification_filters") or {}
-        if filters_active and selected_classification_filters:
-            selected_questions = set(selected_classification_filters.keys())
-            unselected_classification_cols = [
-                col for col in classification_cols if col not in selected_questions
-            ]
-            if unselected_classification_cols:
-                df = df.drop(columns=unselected_classification_cols, errors="ignore")
-            classification_cols = [
-                col for col in classification_cols if col in selected_questions
-            ]
-                
         # 4. Run Analysis
         # 4a. Panel-level Regressions
         coef_table_T = self._run_panel_regressions(df, element_cols, "TOP", analysis_options)
@@ -291,9 +282,9 @@ class StudyAnalysisService:
         age_groups_B = self._build_age_groups(coef_table_B, df, element_cols)
         age_groups_R = self._build_age_groups(coef_table_R, df, element_cols)
         
-        class_groups_T = self._build_class_groups(coef_table_T, df, element_cols, classification_cols)
-        class_groups_B = self._build_class_groups(coef_table_B, df, element_cols, classification_cols)
-        class_groups_R = self._build_class_groups(coef_table_R, df, element_cols, classification_cols)
+        class_groups_T = self._build_class_groups(coef_table_T, df, element_cols, classification_cols, question_meta_map)
+        class_groups_B = self._build_class_groups(coef_table_B, df, element_cols, classification_cols, question_meta_map)
+        class_groups_R = self._build_class_groups(coef_table_R, df, element_cols, classification_cols, question_meta_map)
         
         # 4c. Pooled Regressions (Intercepts)
         intercepts_T = self._run_pooled_regression(df, element_cols, "TOP", analysis_options)
@@ -533,9 +524,12 @@ class StudyAnalysisService:
         known_cols.update(element_cols)
         
         classification_cols = []
+        question_meta_map = {}
         class_qs = study_data.get("classification_questions", [])
         for q in class_qs:
             q_text = q.get("question_text")
+            if q_text:
+                question_meta_map[q_text] = q
             if q_text and q_text in df.columns:
                 classification_cols.append(q_text)
                 
@@ -558,9 +552,9 @@ class StudyAnalysisService:
         age_groups_B = self._build_age_groups(coef_table_B, df, element_cols)
         age_groups_R = self._build_age_groups(coef_table_R, df, element_cols)
         
-        class_groups_T = self._build_class_groups(coef_table_T, df, element_cols, classification_cols)
-        class_groups_B = self._build_class_groups(coef_table_B, df, element_cols, classification_cols)
-        class_groups_R = self._build_class_groups(coef_table_R, df, element_cols, classification_cols)
+        class_groups_T = self._build_class_groups(coef_table_T, df, element_cols, classification_cols, question_meta_map)
+        class_groups_B = self._build_class_groups(coef_table_B, df, element_cols, classification_cols, question_meta_map)
+        class_groups_R = self._build_class_groups(coef_table_R, df, element_cols, classification_cols, question_meta_map)
         
         intercepts_T = self._run_pooled_regression(df, element_cols, "TOP", analysis_options)
         intercepts_B = self._run_pooled_regression(df, element_cols, "BOTTOM", analysis_options)
@@ -605,7 +599,16 @@ class StudyAnalysisService:
             "Study Type": study_data.get("study_type", ""),
             "Study Background": study_data.get("background", ""),
             "Aspect Ratio": study_data.get("aspect_ratio"),
-            "Categories": []
+            "Categories": [],
+            "Classification Questions": [
+                {
+                    "question_id": q.get("question_id"),
+                    "question_text": q.get("question_text"),
+                    "optional_classification_question": bool(q.get("optional_classification_question", False)),
+                }
+                for q in (study_data.get("classification_questions") or [])
+                if q.get("question_text")
+            ],
         }
         
         categories = study_data.get("categories", [])
@@ -846,6 +849,15 @@ class StudyAnalysisService:
             "Study Background": study_data.get("background", ""),
             "Aspect Ratio": study_data.get("aspect_ratio"),
             "Categories": [],
+            "Classification Questions": [
+                {
+                    "question_id": q.get("question_id"),
+                    "question_text": q.get("question_text"),
+                    "optional_classification_question": bool(q.get("optional_classification_question", False)),
+                }
+                for q in (study_data.get("classification_questions") or [])
+                if q.get("question_text")
+            ],
         }
         categories = study_data.get("categories", [])
         elements = study_data.get("elements", [])
@@ -1014,8 +1026,9 @@ class StudyAnalysisService:
         round_vals: bool,
     ) -> None:
         """
-        When classification_filters is set, only filtered question(s) and their
-        selected answer option(s) keep data. All other questions and options are zeroed.
+        When classification_filters is set, filtered question(s) only keep their
+        selected answer option(s). Other questions keep their distribution on the
+        filtered cohort so Prelim/Post breakdowns remain available.
         """
         if not section or not classification_filters:
             return
@@ -1029,17 +1042,7 @@ class StudyAnalysisService:
                 continue
 
             segments = q_data.setdefault("segments", {})
-            key_prefix = f"{q_text}::"
-
             if q_text not in filtered_questions:
-                for ans in list(segments.keys()):
-                    segments[ans] = {"base_size": 0}
-                for cat in section.get("categories") or []:
-                    for el in cat.get("elements") or []:
-                        values = el.get("values") or {}
-                        for key in list(values.keys()):
-                            if key.startswith(key_prefix):
-                                self._zero_classification_element_value(values, key, zero_val)
                 continue
 
             allowed = set(classification_filters[q_text])
@@ -1063,7 +1066,7 @@ class StudyAnalysisService:
         section: Optional[Dict[str, Any]],
         classification_filters: Dict[str, List[str]],
     ) -> None:
-        """Zero classification segments in Combined sheets except filtered Q/options."""
+        """Zero unselected options of filtered classification questions in Combined sheets."""
         if not section or not classification_filters:
             return
 
@@ -1073,18 +1076,16 @@ class StudyAnalysisService:
         for q_text, q_info in class_block.items():
             if not isinstance(q_info, dict):
                 continue
-            answers = q_info.setdefault("answers", {})
             if q_text not in filtered_questions:
-                for ans in list(answers.keys()):
+                continue
+            answers = q_info.setdefault("answers", {})
+            allowed = set(classification_filters[q_text])
+            for ans in list(answers.keys()):
+                if ans not in allowed:
                     answers[ans] = {"base_size": 0}
-            else:
-                allowed = set(classification_filters[q_text])
-                for ans in list(answers.keys()):
-                    if ans not in allowed:
-                        answers[ans] = {"base_size": 0}
-                for ans in allowed:
-                    if ans not in answers:
-                        answers[ans] = {"base_size": 0}
+            for ans in allowed:
+                if ans not in answers:
+                    answers[ans] = {"base_size": 0}
 
         for cat in section.get("categories") or []:
             for el in cat.get("elements") or []:
@@ -1097,11 +1098,9 @@ class StudyAnalysisService:
                     if len(parts) != 3:
                         continue
                     _, q_text, ans = parts
-                    should_zero = (
-                        q_text not in filtered_questions
-                        or ans not in set(classification_filters.get(q_text) or [])
-                    )
-                    if should_zero:
+                    if q_text not in filtered_questions:
+                        continue
+                    if ans not in set(classification_filters.get(q_text) or []):
                         values[key] = 0
                         above[key] = False
 
@@ -1796,6 +1795,7 @@ class StudyAnalysisService:
         for q_col, info in groups.items():
             question_data = {
                 "question_text": info["question_text"],
+                "optional_classification_question": bool(info.get("optional_classification_question", False)),
                 "segments": {}
             }
             
@@ -1871,6 +1871,7 @@ class StudyAnalysisService:
         for q_col, info in c_groups.items():
             result["segments"]["Classification"][info["question_text"]] = {
                 "base_size": 0,
+                "optional_classification_question": bool(info.get("optional_classification_question", False)),
                 "answers": {}
             }
             for ans in info["answer_labels"]:
@@ -2156,7 +2157,8 @@ class StudyAnalysisService:
                 }
         return groups
 
-    def _build_class_groups(self, coef_table, df, element_cols, class_cols):
+    def _build_class_groups(self, coef_table, df, element_cols, class_cols, question_meta_map=None):
+        question_meta_map = question_meta_map or {}
         groups = {}
         for col_name in class_cols:
             if col_name not in df.columns: 
@@ -2193,8 +2195,10 @@ class StudyAnalysisService:
                     answer_labels.append(opt)
             
             if segs:
+                q_meta = question_meta_map.get(col_name) or {}
                 groups[col_name] = {
                     "question_text": col_name,
+                    "optional_classification_question": bool(q_meta.get("optional_classification_question", False)),
                     "answer_labels": sorted(answer_labels, key=str),
                     "segments": segs
                 }

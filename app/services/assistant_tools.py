@@ -121,7 +121,7 @@ def _analysis_cache_key(
     # a setting silently keeps serving numbers computed under the old one until
     # the TTL happens to expire.
     payload = json.dumps(
-        {"filters": filters or {}, "analysis_options": analysis_options or {}},
+        {"v": 2, "filters": filters or {}, "analysis_options": analysis_options or {}},
         sort_keys=True,
         default=str,
     )
