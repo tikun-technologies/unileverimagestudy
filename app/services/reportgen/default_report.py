@@ -49,6 +49,7 @@ def create_default_report(
     study_type: str | None = None,
     cache_dir: str | Path | None = None,
     prepared_by: str | None = None,
+    progress=None,
 ) -> DefaultReport:
     """Build the default appeal deck and return it as bytes.
 
@@ -75,6 +76,7 @@ def create_default_report(
                 study_type=study_type or _study_type(payload),
                 cache_dir=cache_dir,
                 prepared_by=prepared_by,
+                progress=progress,
             )
             content = built.read_bytes()
     except DefaultReportError:

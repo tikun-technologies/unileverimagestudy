@@ -101,6 +101,15 @@ class LayerVisibilityColumnsTest(unittest.TestCase):
         _fill_layer_visibility_columns(frame, ["Layer_1"], {"Layer_1": "Layer-A"})
         self.assertEqual(frame["Layer-A"].tolist(), [0, 0])
 
+    def test_compact_shown_keys_and_legacy_values_keep_the_same_columns(self):
+        frame = pd.DataFrame({"_layer_visibility": [
+            ["Layer_1"], ["Layer_2"], [],
+            {"Layer_1": "0", "Layer_2": {"visible": True}},
+        ]})
+        _fill_layer_visibility_columns(frame, ["Layer_1", "Layer_2"], {"Layer_1": "A", "Layer_2": "B"})
+        self.assertEqual(frame["A"].tolist(), [1, 0, 0, 0])
+        self.assertEqual(frame["B"].tolist(), [0, 1, 0, 1])
+
     def test_fallback_only_when_visibility_json_is_empty(self):
         self.assertFalse(_layer_row_needs_fallback({"Bottle_1": 1}))
         self.assertFalse(_layer_row_needs_fallback(float("nan")))

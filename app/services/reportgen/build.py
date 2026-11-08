@@ -12,7 +12,7 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Emu, Inches, Pt
 
 from app.services.reportgen.charts import add_grouped_lift_chart, add_lift_chart, wrap_label
-from app.services.reportgen.composite import PACK_ASPECT, composite_pack, contain_size, element_preview, file_aspect, gallery_frame
+from app.services.reportgen.composite import PACK_ASPECT, composite_pack, contain_size, element_preview, file_aspect, gallery_frame, image_render_cache
 from app.services.reportgen.study import (
     Study,
     category_story,
@@ -54,6 +54,7 @@ TRACK = RGBColor(0xF4, 0xF0, 0xF2)
 RGB_AXIS = NAVY
 
 
+@image_render_cache
 def build_report(
     json_path: str | Path,
     output_path: str | Path,
@@ -62,6 +63,7 @@ def build_report(
     study_type: str | None = None,
     cache_dir: str | Path | None = None,
     prepared_by: str | None = None,
+    progress=None,
 ) -> Path:
     _FOOTER_NOTES.clear()
     study = load_study(
@@ -77,6 +79,7 @@ def build_report(
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     presentation = Presentation()
+    presentation._report_progress = progress
     presentation.slide_width = Inches(SLIDE_W)
     presentation.slide_height = Inches(SLIDE_H)
     presentation.core_properties.title = study.title
@@ -121,11 +124,16 @@ def build_report(
         if kind == "content":
             add_footer(slide, _FOOTER_NOTES.get(id(slide)) or _footer_note(study), index, total)
 
+    if progress:
+        progress(f"Saving {total} slides…")
     presentation.save(str(destination))
     return destination
 
 
 def _blank(presentation):
+    progress = getattr(presentation, "_report_progress", None)
+    if progress:
+        progress(f"Creating slide {len(presentation.slides) + 1}…")
     return presentation.slides.add_slide(presentation.slide_layouts[6])
 
 

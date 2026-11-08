@@ -250,9 +250,18 @@ def _fill_layer_visibility_columns(
     shown = _source("elements_shown_in_task")
     layers = _source("layers_shown_in_task")
     content = _source("elements_shown_content")
+    compact = _source("_layer_visibility") if "_layer_visibility" in full_df.columns else None
 
     for i in range(n):
-        payload = _first_layer_payload(shown[i], layers[i], content[i])
+        if compact is not None:
+            payload = compact[i]
+            if isinstance(payload, list):
+                for key in payload:
+                    for header in owned.get(key, []):
+                        columns[header][i] = 1
+                continue
+        else:
+            payload = _first_layer_payload(shown[i], layers[i], content[i])
         if not payload:
             continue
         for key, value in payload.items():
@@ -3127,7 +3136,10 @@ class StudyResponseService:
         # table is the source used below; loading this column delays analysis
         # long after the regression itself has finished.
         study = self.db.execute(
-            select(Study).where(Study.id == study_id).options(defer(Study.tasks))
+            select(Study).where(Study.id == study_id).options(
+                load_only(Study.id, Study.study_type, Study.product_id, Study.product_keys),
+                noload("*"),
+            )
         ).scalar_one_or_none()
         if not study:
             raise HTTPException(status_code=404, detail="Study not found")
@@ -3183,21 +3195,29 @@ class StudyResponseService:
         response_ids = responses_df['id'].tolist()
 
         is_layer_study = str(study.study_type) == "layer"
+        if is_layer_study:
+            from app.services.layer_visibility import layer_visibility_expression
+
+            shown = layer_visibility_expression(
+                CompletedTask.elements_shown_in_task,
+                CompletedTask.layers_shown_in_task,
+                CompletedTask.elements_shown_content,
+            ).label("_layer_visibility")
+        else:
+            shown = CompletedTask.elements_shown_in_task
         task_cols = [
             CompletedTask.study_response_id,
             CompletedTask.task_index,
             CompletedTask.rating_given,
             CompletedTask.task_duration_seconds,
-            CompletedTask.elements_shown_in_task,
+            shown,
         ]
-        # Layer visibility lives in elements_shown_in_task. The content JSON
-        # repeats image payloads and is loaded later only for rows that need it.
+        # Layer queries resolve fallbacks and project visibility in PostgreSQL;
+        # image/rendering metadata never needs to cross the database connection.
         if unilever_format or str(study.study_type) in ('hybrid', 'grid', 'text', 'video'):
             task_cols.append(CompletedTask.task_type)
         tasks_query = select(*task_cols).where(CompletedTask.study_response_id.in_(response_ids))
         tasks_df = pd.read_sql(tasks_query, self.db.bind)
-        if is_layer_study:
-            _attach_layer_fallback_payloads(self.db, tasks_df)
 
         # Fetch answers
         answers_query = select(
@@ -3499,7 +3519,11 @@ class StudyResponseService:
                 select(StudyLayer)
                 .where(StudyLayer.study_id == study_id)
                 .order_by(StudyLayer.order)
-                .options(selectinload(StudyLayer.images))
+                .options(
+                    load_only(StudyLayer.name, StudyLayer.order),
+                    noload("*"),
+                    selectinload(StudyLayer.images).options(load_only(LayerImage.name), noload("*")),
+                )
             ).scalars().all()
             layer_key_to_header = {}
             layer_keys = []

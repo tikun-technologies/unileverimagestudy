@@ -111,18 +111,23 @@ def _authorize_study_access(db: Session, study_id: UUID, user_id: UUID) -> Study
 
 
 def _build_study_data_dict(study_obj: Study) -> Dict[str, Any]:
+    config = study_obj.audience_segmentation if isinstance(study_obj.audience_segmentation, dict) else {}
+    launched_at = study_obj.created_at.isoformat() if study_obj.created_at else ""
     study_data = {
+        "id": str(study_obj.id),
         "title": study_obj.title,
         "study_type": study_obj.study_type,
         "main_question": getattr(study_obj, "main_question", None) or "",
         "background": getattr(study_obj, "background_image_url", None) or "",
         "language": study_obj.language,
-        "launched_at": study_obj.created_at.isoformat() if study_obj.created_at else "",
-        "aspect_ratio": (
-            (study_obj.audience_segmentation or {}).get("aspect_ratio")
-            if isinstance(study_obj.audience_segmentation, dict)
-            else None
-        ),
+        "launched_at": launched_at,
+        "created_at": launched_at,
+        "aspect_ratio": config.get("aspect_ratio"),
+        "study_config": {
+            "aspect_ratio": config.get("aspect_ratio") or "9:16",
+            "country": config.get("country") or "",
+            "number_of_respondents": config.get("number_of_respondents") or 0,
+        },
         "categories": [],
         "elements": [],
         "classification_questions": [],
@@ -236,7 +241,14 @@ def _cached_page_analysis(
         filters_dict if filters_are_active(filters_dict) else None,
         options,
     )
-    return cached if isinstance(cached, dict) and cached else None
+    if not isinstance(cached, dict) or not cached:
+        return None
+    # Old cached reports may predate the offline row snapshot. Load the
+    # dashboard inputs once in that case, rather than delaying the next export.
+    from app.services.offline_export import has_cached_offline_rows
+    if not has_cached_offline_rows(study_obj, unilever_format, study_data=_build_study_data_dict(study_obj)):
+        return None
+    return cached
 
 
 def _generate_study_analysis_json(
@@ -249,6 +261,15 @@ def _generate_study_analysis_json(
     unilever_format: bool = False,
 ) -> Dict[str, Any]:
     study_data = _build_study_data_dict(study_obj)
+    # Preserve the same unfiltered inputs while the dashboard is already
+    # loading them. HTML export must not repeat the dataframe/database work.
+    try:
+        from app.services.offline_export import get_cached_offline_rows, remember_offline_rows
+        if get_cached_offline_rows(study_obj, unilever_format, study_data=study_data) is None:
+            remember_offline_rows(study_obj, unilever_format, df, study_data=study_data)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug("Could not warm HTML export rows", exc_info=True)
     analysis_options = get_study_analysis_settings(db, study_obj.id, study=study_obj)
     analysis_service = StudyAnalysisService()
     started = time.perf_counter()
@@ -1747,6 +1768,52 @@ def _authorize_study_for_analysis(db: Session, study_id: UUID, current_user: Use
     return study_obj
 
 
+@router.get("/study/{study_id}/offline-analysis-source")
+def get_study_offline_analysis_source(
+    access: AnalyticsAccess = Depends(get_analytics_access),
+    db: Session = Depends(get_db),
+    include_report: bool = False,
+):
+    """Inputs for HTML export; reuse the live report instead of recalculating it."""
+    from app.services.offline_export import get_cached_offline_rows, remember_offline_rows
+
+    study = access.study
+    study_data = _build_study_data_dict(study)
+    viewer_email = analysis_viewer_email(db, access)
+    unilever_format = is_unilever_domain(viewer_email)
+    packed = get_cached_offline_rows(study, unilever_format, study_data=study_data)
+    if packed is None:
+        df, _ = _load_study_dataframe_for_analysis(db, study.id, viewer_email=viewer_email)
+        packed = remember_offline_rows(study, unilever_format, df, study_data=study_data)
+    snapshot = get_cached_analysis_settings_response(db, study.id, study=study)
+    questions = [{
+        "question_id": question.question_id,
+        "question_text": question.question_text,
+        "question_type": question.question_type,
+        "is_required": question.is_required == "Y",
+        "order": question.order,
+        "answer_options": question.answer_options or [],
+        "config": question.config or {},
+        "optional_classification_question": question.optional_classification_question,
+    } for question in sorted(study.classification_questions, key=lambda item: item.order)]
+    result = {
+        "study": study_data,
+        "rows": [],
+        "packedRows": packed,
+        "settings": snapshot["settings"],
+        "settingsSnapshot": snapshot,
+        "classificationQuestions": questions,
+    }
+    if include_report:
+        from app.services.offline_ppt import offline_report_source
+        exporter = access.user
+        if exporter is None:
+            from app.services.user import get_user_by_id
+            exporter = get_user_by_id(db, study.creator_id)
+        result["pptReport"] = offline_report_source(study, study_data, exporter)
+    return result
+
+
 @router.get("/study/{study_id}/analysis-json")
 def export_study_analysis_json(
     access: AnalyticsAccess = Depends(get_analytics_access),
@@ -2072,6 +2139,53 @@ def _analysis_has_scores(analysis: Any) -> bool:
     )
 
 
+def _build_appeal_ppt_response(
+    study_obj: Study,
+    analysis: Dict[str, Any],
+    prepared_by_name: Optional[str],
+    prepared_by_email: Optional[str],
+    source: str,
+):
+    """Render the one canonical Appeal deck for live and exported HTML clients."""
+    from app.services.appeal_report import DefaultReportError, build_appeal_pptx
+
+    try:
+        report = build_appeal_pptx(
+            study_obj=study_obj,
+            analysis=analysis,
+            prepared_by_name=prepared_by_name,
+            prepared_by_email=prepared_by_email,
+        )
+    except DefaultReportError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This report needs analytics with scored elements. "
+                "The study may still be collecting responses, or the current "
+                "filter matches no respondents. "
+                f"({str(exc)})"
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate the PowerPoint report: {exc}")
+
+    filename = report.filename or "Appeal Report.pptx"
+    headers = {
+        "Content-Disposition": _content_disposition(filename, "Appeal Report.pptx"),
+        "Access-Control-Expose-Headers": "Content-Disposition, X-Appeal-Source",
+        "X-Appeal-Source": source,
+    }
+    return StreamingResponse(
+        iter([report.content]),
+        media_type=report.media_type,
+        headers=headers,
+    )
+
+
 @router.post("/study/{study_id}/export-appeal-ppt")
 def export_study_appeal_ppt(
     payload: AppealPptExportPayload,
@@ -2086,8 +2200,6 @@ def export_study_appeal_ppt(
     optional filter body) only when the client does not supply it. Runs on a
     sync route, so FastAPI executes the heavy build in its threadpool.
     """
-    from app.services.appeal_report import DefaultReportError, build_appeal_pptx
-
     study_obj = access.study
     study_id = study_obj.id
     filters_dict = payload.filters.model_dump(exclude_none=True) if payload.filters else None
@@ -2129,47 +2241,17 @@ def export_study_appeal_ppt(
                 detail=f"Failed to prepare analytics for the report: {str(e)}",
             )
     print(f"appeal-ppt {study_id}: analytics source={source}")
+    exporter = access.user
+    if exporter is None:
+        from app.services.user import get_user_by_id
 
-    try:
-        exporter = access.user
-        if exporter is None:
-            from app.services.user import get_user_by_id
-
-            exporter = get_user_by_id(db, study_obj.creator_id)
-        report = build_appeal_pptx(
-            study_obj=study_obj,
-            analysis=analysis,
-            prepared_by_name=getattr(exporter, "name", None),
-            prepared_by_email=getattr(exporter, "email", None),
-        )
-    except DefaultReportError as exc:
-        # Analytics not ready, or a filter cohort of zero — nothing to chart.
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "This report needs analytics with scored elements. "
-                "The study may still be collecting responses, or the current "
-                "filter matches no respondents. "
-                f"({str(exc)})"
-            ),
-        )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to generate the PowerPoint report: {exc}")
-
-    filename = report.filename or "Appeal Report.pptx"
-    headers = {
-        "Content-Disposition": _content_disposition(filename, "Appeal Report.pptx"),
-        "Access-Control-Expose-Headers": "Content-Disposition, X-Appeal-Source",
-        "X-Appeal-Source": source,
-    }
-    return StreamingResponse(
-        iter([report.content]),
-        media_type=report.media_type,
-        headers=headers,
+        exporter = get_user_by_id(db, study_obj.creator_id)
+    return _build_appeal_ppt_response(
+        study_obj,
+        analysis,
+        getattr(exporter, "name", None),
+        getattr(exporter, "email", None),
+        source,
     )
 
 

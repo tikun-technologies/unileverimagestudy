@@ -93,6 +93,8 @@ def invalidate_study_cache(study_id: UUID | str) -> None:
     Call this when a study is updated, tasks are regenerated, or status changes.
     """
     study_id_str = str(study_id)
+    from app.services.offline_export import invalidate_offline_rows
+    invalidate_offline_rows(study_id_str)
     RedisCache.delete(f"study_config:public:{study_id_str}")
     RedisCache.delete(f"study_config:public_details:{study_id_str}")
     RedisCache.delete(f"study_config:basic:{study_id_str}")
@@ -118,6 +120,8 @@ def invalidate_assistant_analysis_cache(study_id: UUID | str) -> None:
     reset, synthetic respondent) so the assistant never serves stale numbers.
     """
     study_id_str = str(study_id)
+    from app.services.offline_export import invalidate_offline_rows
+    invalidate_offline_rows(study_id_str)
     RedisCache.delete_pattern(f"assistant:analysis:{study_id_str}:*")
     RedisCache.delete_pattern(f"assistant:query:{study_id_str}:*")
 

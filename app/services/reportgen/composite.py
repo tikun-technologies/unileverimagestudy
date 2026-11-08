@@ -3,11 +3,57 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections import OrderedDict
+from contextvars import ContextVar
+from functools import wraps
 
 from PIL import Image
 
 # Source artwork is 2480×3508. Width / height.
 PACK_ASPECT = 2480 / 3508
+
+_RENDER_CACHE = ContextVar("appeal_render_images", default=None)
+
+
+def image_render_cache(function):
+    """Bound decoded/resized layers to one report, including concurrent requests."""
+    @wraps(function)
+    def cached(*args, **kwargs):
+        cache = {"images": OrderedDict(), "bytes": 0, "frames": {}}
+        token = _RENDER_CACHE.set(cache)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            for image in cache["images"].values():
+                image.close()
+            _RENDER_CACHE.reset(token)
+    return cached
+
+
+def _source_key(path):
+    stat = path.stat()
+    return (str(path), stat.st_mtime_ns, stat.st_size)
+
+
+def _fitted_layer(path, size):
+    cache = _RENDER_CACHE.get()
+    key = (_source_key(path), size)
+    if cache is not None and key in cache["images"]:
+        cache["images"].move_to_end(key)
+        return cache["images"][key]
+    with Image.open(path) as source:
+        layer = _contain(source.convert("RGBA"), size)
+    if cache is not None:
+        cost = layer.width * layer.height * 4
+        # Backgrounds stay hot as each element is composited onto them. Bound
+        # the cache rather than retaining every large canvas for a study.
+        while cache["images"] and cache["bytes"] + cost > 64 * 1024 * 1024:
+            _, old = cache["images"].popitem(last=False)
+            cache["bytes"] -= old.width * old.height * 4
+            old.close()
+        cache["images"][key] = layer
+        cache["bytes"] += cost
+    return layer
 
 
 def composite_pack(
@@ -24,7 +70,7 @@ def composite_pack(
     if frame is not None:
         canvas = _crop_fraction(canvas, frame)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    canvas.convert("RGB").save(destination, format="PNG", optimize=True)
+    canvas.convert("RGB").save(destination, format="PNG", compress_level=1)
     return destination
 
 
@@ -60,9 +106,9 @@ def element_preview(
     elif frame is not None:
         canvas = _crop_fraction(canvas, frame)
     elif element_path and element_path.exists():
-        element = _contain(Image.open(element_path).convert("RGBA"), canvas.size)
+        element = _fitted_layer(element_path, canvas.size)
         canvas = _focus_crop(canvas, element, tight=tight)
-    canvas.convert("RGB").save(destination, format="PNG", optimize=True)
+    canvas.convert("RGB").save(destination, format="PNG", compress_level=1)
     return destination
 
 
@@ -73,6 +119,17 @@ def gallery_frame(element_paths: list[Path]) -> tuple[float, float, float, float
     element should be cropped on its own, because the artworks differ in shape.
     """
     paths = [path for path in element_paths if path and path.exists()]
+    cache = _RENDER_CACHE.get()
+    key = tuple(_source_key(path) for path in paths)
+    if cache is not None and key in cache["frames"]:
+        return cache["frames"][key]
+    result = _gallery_frame(paths)
+    if cache is not None:
+        cache["frames"][key] = result
+    return result
+
+
+def _gallery_frame(paths):
     if not paths:
         return None
     with Image.open(paths[0]) as sample:
@@ -202,7 +259,7 @@ def _stack(layer_paths: list[Path], width: int, aspect: float | None = None) -> 
     size = (width, height)
     canvas = Image.new("RGBA", size, (255, 255, 255, 255))
     for path in paths:
-        layer = _contain(Image.open(path).convert("RGBA"), size)
+        layer = _fitted_layer(path, size)
         canvas = Image.alpha_composite(canvas, layer)
     return canvas
 
