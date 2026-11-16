@@ -49,8 +49,8 @@ class DesignConfig:
     polish: bool = True             # exchange polishing after greedy build
 
     # --- QC Thresholds ---
-    max_attempts: int = 10
-    max_block_retries: int = 50
+    max_attempts: int = 3
+    max_block_retries: int = 1000
     max_vif: float = 10.0
     verbose: bool = False
 

@@ -78,6 +78,9 @@ class Settings(BaseSettings):
     RUN_API_BACKGROUND_SERVICES: bool = True
     
     # Task Generation Settings
+    # Off by default so production keeps the Python golden matrix. Set
+    # USE_RUST_GOLDEN_MATRIX=true in .env and restart the Celery worker to test Rust.
+    USE_RUST_GOLDEN_MATRIX: bool = False
     TASK_GENERATION_TIMEOUT: int = 12000  # 200 minutes timeout for task generation (Azure max is ~4-5 min for sync requests)
     MAX_RESPONDENTS_FOR_SYNC: int = 0  # Use async processing for studies with more than 4 respondents
     TASK_GENERATION_CHUNK_SIZE: int = 50  # Process respondents in smaller chunks for memory efficiency

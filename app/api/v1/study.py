@@ -2450,13 +2450,194 @@ def get_user_task_generation_jobs(
     ]
 
 
-@router.get("/generate-tasks/result/{job_id}")
-def get_task_generation_result(
-    job_id: str,
+@router.get("/{study_id}/tasks/export.csv")
+def export_task_matrix_csv(
+    study_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    """Get the full generated tasks once the background job is complete"""
+    """Stream the requested respondent matrix as CSV without a full JSON result.
+
+    Golden Matrix reserve respondents remain in storage, but exports stop at the
+    audience target. Normalized assignments are read with a server-side iterator
+    so response memory does not grow with the matrix size.
+    """
+    import re
+    from urllib.parse import quote
+
+    from sqlalchemy import distinct, func
+
+    from app.db.session import SessionLocal
+    from app.models.study_model import StudyCategory, StudyLayer, StudyTaskAssignment
+    from app.services.task_matrix_csv import discover_matrix_columns, stream_matrix_csv
+
+    if not _user_has_study_access(db, study_id, current_user.id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    study_row = db.execute(
+        select(
+            Study.title,
+            Study.study_type,
+            Study.audience_segmentation,
+            Study.phase_order,
+        ).where(Study.id == study_id)
+    ).first()
+    if not study_row:
+        raise HTTPException(status_code=404, detail="Study not found")
+
+    title, study_type_raw, audience_raw, phase_order_raw = study_row
+    study_type_value = getattr(study_type_raw, "value", study_type_raw)
+    study_type = str(study_type_value or "grid").lower()
+    audience = audience_raw if isinstance(audience_raw, dict) else {}
+    try:
+        requested_respondents = int(audience.get("number_of_respondents") or 0)
+    except (TypeError, ValueError):
+        requested_respondents = 0
+
+    generated_respondents = int(db.scalar(
+        select(func.count(distinct(StudyTaskAssignment.respondent_id))).where(
+            StudyTaskAssignment.study_id == study_id
+        )
+    ) or 0)
+    stored_respondents = generated_respondents
+
+    group_order: Dict[tuple, int] = {}
+    if study_type == "layer":
+        for name, order in db.execute(
+            select(StudyLayer.name, StudyLayer.order)
+            .where(StudyLayer.study_id == study_id)
+            .order_by(StudyLayer.order)
+        ).all():
+            group_order[(None, str(name))] = int(order or 0)
+    else:
+        for name, order, phase in db.execute(
+            select(StudyCategory.name, StudyCategory.order, StudyCategory.phase_type)
+            .where(StudyCategory.study_id == study_id)
+            .order_by(StudyCategory.order)
+        ).all():
+            phase_value = getattr(phase, "value", phase)
+            normalized_phase = str(phase_value).lower() if phase_value else None
+            group_order[(normalized_phase if study_type == "hybrid" else None, str(name))] = int(order or 0)
+
+    phase_order = phase_order_raw if isinstance(phase_order_raw, list) else []
+
+    if generated_respondents > 0:
+        export_target = requested_respondents if requested_respondents > 0 else generated_respondents
+        export_target = min(export_target, generated_respondents)
+        respondent_ids = list(db.scalars(
+            select(distinct(StudyTaskAssignment.respondent_id))
+            .where(StudyTaskAssignment.study_id == study_id)
+            .order_by(StudyTaskAssignment.respondent_id)
+            .limit(export_target)
+        ).all())
+        if not respondent_ids:
+            raise HTTPException(status_code=409, detail="No generated tasks are available for export")
+
+        assignment_stmt = (
+            select(StudyTaskAssignment)
+            .where(
+                StudyTaskAssignment.study_id == study_id,
+                StudyTaskAssignment.respondent_id.in_(respondent_ids),
+            )
+            .order_by(StudyTaskAssignment.respondent_id, StudyTaskAssignment.task_index)
+        )
+        # Every Golden Matrix block contains every element key. Inspecting the
+        # first exported respondent is therefore sufficient to build headers and
+        # avoids a full pre-scan before the first CSV bytes are sent.
+        discovery_stmt = (
+            select(StudyTaskAssignment)
+            .where(
+                StudyTaskAssignment.study_id == study_id,
+                StudyTaskAssignment.respondent_id == respondent_ids[0],
+            )
+            .order_by(StudyTaskAssignment.task_index)
+        )
+        discovery_rows = db.scalars(discovery_stmt).yield_per(250)
+        columns = discover_matrix_columns(
+            discovery_rows,
+            study_type=study_type,
+            group_order=group_order,
+            phase_order=phase_order,
+        )
+
+        def csv_stream():
+            stream_db = SessionLocal()
+            try:
+                rows = stream_db.scalars(assignment_stmt).yield_per(1000)
+                yield from stream_matrix_csv(rows, columns)
+            finally:
+                stream_db.close()
+
+        exported_respondents = len(respondent_ids)
+        body = csv_stream()
+    else:
+        # Compatibility for studies created before normalized task storage.
+        legacy_tasks = db.scalar(select(Study.tasks).where(Study.id == study_id)) or {}
+        if not isinstance(legacy_tasks, dict):
+            raise HTTPException(status_code=409, detail="No generated tasks are available for export")
+        respondent_keys = sorted(
+            (key for key in legacy_tasks if str(key).isdigit()),
+            key=lambda key: int(key),
+        )
+        stored_respondents = len(respondent_keys)
+        export_target = requested_respondents if requested_respondents > 0 else len(respondent_keys)
+        selected_keys = respondent_keys[:export_target]
+        legacy_rows = []
+        for key in selected_keys:
+            tasks = legacy_tasks.get(key) or []
+            if not isinstance(tasks, list):
+                tasks = [tasks]
+            for index, task in enumerate(tasks):
+                if not isinstance(task, dict):
+                    continue
+                legacy_rows.append({
+                    **task,
+                    "respondent_id": int(key),
+                    "task_index": int(task.get("task_index", index) or 0),
+                })
+        if not legacy_rows:
+            raise HTTPException(status_code=409, detail="No generated tasks are available for export")
+        columns = discover_matrix_columns(
+            legacy_rows,
+            study_type=study_type,
+            group_order=group_order,
+            phase_order=phase_order,
+        )
+        exported_respondents = len(selected_keys)
+        body = stream_matrix_csv(legacy_rows, columns)
+
+    safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", str(title or "study")).strip("._") or "study"
+    filename = f"{safe_base}_matrix.csv"
+    disposition = f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"
+    return StreamingResponse(
+        body,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": disposition,
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+            "X-Requested-Respondents": str(requested_respondents or exported_respondents),
+            "X-Exported-Respondents": str(exported_respondents),
+            "X-Generated-Respondents": str(stored_respondents),
+        },
+    )
+
+
+@router.get("/generate-tasks/result/{job_id}")
+def get_task_generation_result(
+    job_id: str,
+    preview_only: bool = Query(
+        False,
+        description="Return only the first respondent's tasks for the task-generation preview.",
+    ),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Get generated tasks once the background job is complete.
+
+    ``preview_only`` keeps the completion request small for the study builder. The
+    full matrix remains available for existing API consumers that omit the flag.
+    """
     from app.services.background_task_service import background_task_service
     
     job = background_task_service.get_job_status(job_id)
@@ -2487,11 +2668,46 @@ def get_task_generation_result(
 
     study_config = study_service.build_task_generation_result_config(study)
     layers = study_config.get("layers") or []
+    job_summary = job.result if isinstance(job.result, dict) else {}
 
     # Load tasks using TaskService
     from app.services.task_service import TaskService
     task_service = TaskService(db)
-    enriched_tasks = task_service.get_all_tasks_as_dict(UUID(job.study_id))
+    study_uuid = UUID(job.study_id)
+    if preview_only:
+        enriched_tasks = task_service.get_preview_tasks_as_dict(study_uuid) or {}
+        total_respondents = task_service.get_respondent_count(study_uuid)
+        total_tasks = task_service.get_task_count(study_uuid)
+        first_key = next((key for key in enriched_tasks if str(key).isdigit()), None)
+        first_bucket = enriched_tasks.get(first_key, []) if first_key is not None else []
+        tasks_per_respondent = len(first_bucket) if isinstance(first_bucket, list) else 0
+    else:
+        enriched_tasks = task_service.get_all_tasks_as_dict(study_uuid)
+        total_respondents = (
+            len([k for k in enriched_tasks if str(k).isdigit()])
+            if isinstance(enriched_tasks, dict)
+            else 0
+        )
+        total_tasks = sum(
+            len(task_list) if isinstance(task_list, list) else 1
+            for respondent_id, task_list in enriched_tasks.items()
+            if str(respondent_id).isdigit()
+        ) if isinstance(enriched_tasks, dict) else 0
+        first_key = next((key for key in enriched_tasks if str(key).isdigit()), None)
+        first_bucket = enriched_tasks.get(first_key, []) if first_key is not None else []
+        tasks_per_respondent = len(first_bucket) if isinstance(first_bucket, list) else 0
+
+    # The stored pool can be larger than the requested audience (the Golden
+    # Matrix keeps spare respondent blocks). Keep those two numbers distinct so
+    # the UI and CSV export use the requested audience size.
+    audience = study.audience_segmentation or {}
+    requested_respondents = audience.get("number_of_respondents")
+    try:
+        requested_respondents = int(requested_respondents)
+    except (TypeError, ValueError):
+        requested_respondents = total_respondents
+    if requested_respondents < 1:
+        requested_respondents = total_respondents
     
     # Enrich tasks with transform inside each non-null elements_shown_content entry
     try:
@@ -2522,11 +2738,20 @@ def get_task_generation_result(
         "job_id": job.job_id,
         "study_id": job.study_id,
         "status": job.status.value,
+        "matrix_engine": job_summary.get("matrix_engine"),
+        "algorithm": job_summary.get("algorithm"),
         "study_type": study_config.get("study_type"),
         "phase_order": study_config.get("phase_order"),
         "tasks": enriched_tasks,
         "metadata": {
-            "total_respondents": len([k for k in enriched_tasks if str(k).isdigit()]) if isinstance(enriched_tasks, dict) else 0,
+            "number_of_respondents": requested_respondents,
+            "total_respondents": total_respondents,
+            "generated_respondents": total_respondents,
+            "total_tasks": total_tasks,
+            "tasks_per_consumer": tasks_per_respondent,
+            "preview_only": preview_only,
+            "matrix_engine": job_summary.get("matrix_engine"),
+            "algorithm": job_summary.get("algorithm"),
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
             "message": "Task generation completed successfully"
         },

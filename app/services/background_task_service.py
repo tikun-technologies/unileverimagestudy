@@ -161,36 +161,55 @@ class BackgroundTaskService:
             job.status = JobStatus.PROCESSING
             job.message = "Generating tasks..."
             db.commit()
-            
-            # Process based on study type (task generation)
-            study_type = payload.get('study_type')
-            result = None
-            
-            if study_type in ('grid', 'text'):
-                result = await self._generate_grid_tasks_async(job, payload, db)
-            elif study_type == 'video':
-                result = await self._generate_video_tasks_async(job, payload, db)
-            elif study_type == 'layer':
-                result = await self._generate_layer_tasks_async(job, payload, db)
-            elif study_type == 'hybrid':
-                result = await self._generate_hybrid_tasks_async(job, payload, db)
-            else:
-                raise ValueError(f"Unsupported study type: {study_type}")
-            
-            # Use a fresh DB session for save phase (original session may be stale after long-running generation)
+
+            from app.services.job_progress_relay import JobProgressRelay
+
+            # Process based on study type (task generation). The relay stays open
+            # through the save so "Saving..." is the snapshot, then closes before
+            # the completed status is written.
+            with JobProgressRelay(job_id):
+                study_type = payload.get('study_type')
+                result = None
+
+                if study_type in ('grid', 'text'):
+                    result = await self._generate_grid_tasks_async(job, payload, db)
+                elif study_type == 'video':
+                    result = await self._generate_video_tasks_async(job, payload, db)
+                elif study_type == 'layer':
+                    result = await self._generate_layer_tasks_async(job, payload, db)
+                elif study_type == 'hybrid':
+                    result = await self._generate_hybrid_tasks_async(job, payload, db)
+                else:
+                    raise ValueError(f"Unsupported study type: {study_type}")
+
+                db_save = SessionLocal()
+                try:
+                    await self._save_results(job, payload, result, db_save)
+                    await self._launch_study(job, payload, db_save)
+                finally:
+                    db_save.close()
+
+            # Use a fresh DB session for the terminal status. The relay is closed,
+            # so this write cannot be overwritten by a progress snapshot.
             db_fresh = SessionLocal()
             try:
-                await self._save_results(job, payload, result, db_fresh)
-                await self._launch_study(job, payload, db_fresh)
                 job_fresh = db_fresh.query(Job).filter(Job.job_id == job_id).first()
-                if job_fresh:
+                if job_fresh and job_fresh.status == JobStatus.PROCESSING:
                     job_fresh.status = JobStatus.COMPLETED
                     job_fresh.completed_at = datetime.utcnow()
                     job_fresh.progress = 100.0
                     job_fresh.message = "Task generation completed successfully"
-                    job_fresh.result = None
+                    from app.services.task_generation_summary import compact_task_generation_summary
+
+                    job_fresh.result = compact_task_generation_summary(result, payload)
                     db_fresh.commit()
-                    
+
+                    logger.info(
+                        "Job %s completed with matrix_engine=%s",
+                        job_id,
+                        job_fresh.result.get("matrix_engine"),
+                    )
+
                     # Notify WebSocket subscribers of completion
                     job_progress_notifier.notify(job_id, {
                         "type": "completed",
@@ -206,7 +225,13 @@ class BackgroundTaskService:
                         study_id=job_fresh.study_id,
                         payload=payload,
                     )
-                logger.info(f"Job {job_id} completed successfully")
+                    logger.info(f"Job {job_id} completed successfully")
+                elif job_fresh is not None:
+                    logger.info(
+                        "Job %s generation finished but status is %s; leaving that status in place",
+                        job_id,
+                        job_fresh.status,
+                    )
             finally:
                 db_fresh.close()
             
@@ -219,13 +244,17 @@ class BackgroundTaskService:
                 pass
             try:
                 job_err = db_err.query(Job).filter(Job.job_id == job_id).first()
-                if job_err:
+                if job_err and job_err.status not in (
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                ):
                     job_err.status = JobStatus.FAILED
                     job_err.completed_at = datetime.utcnow()
                     job_err.error = str(e)
                     job_err.message = f"Study configuration error: {str(e)}"
                     db_err.commit()
-                    
+
                     # Notify WebSocket subscribers of failure
                     job_progress_notifier.notify(job_id, {
                         "type": "failed",
@@ -245,13 +274,17 @@ class BackgroundTaskService:
                 pass
             try:
                 job_err = db_err.query(Job).filter(Job.job_id == job_id).first()
-                if job_err:
+                if job_err and job_err.status not in (
+                    JobStatus.COMPLETED,
+                    JobStatus.FAILED,
+                    JobStatus.CANCELLED,
+                ):
                     job_err.status = JobStatus.FAILED
                     job_err.completed_at = datetime.utcnow()
                     job_err.error = str(e)
                     job_err.message = f"Task generation failed: {str(e)}"
                     db_err.commit()
-                    
+
                     # Notify WebSocket subscribers of failure
                     job_progress_notifier.notify(job_id, {
                         "type": "failed",
@@ -471,7 +504,12 @@ class BackgroundTaskService:
                 frac = max(0.0, min(1.0, done / max(1, N)))
                 current_progress = p_start + ((p_end - p_start) * frac)
                 message = f"Building respondents{f' ({phase_type})' if phase_type else ''} {done}/{N}..."
-                
+
+                from app.services.job_progress_relay import report_generation_progress
+
+                if report_generation_progress(job.job_id, current_progress, message):
+                    return
+
                 db_progress = SessionLocal()
                 try:
                     job_progress = db_progress.query(Job).filter(Job.job_id == job.job_id).first()
@@ -532,6 +570,10 @@ class BackgroundTaskService:
                     return False
                 if job_fresh.status == JobStatus.CANCELLED:
                     return False
+                from app.services.job_progress_relay import report_generation_progress
+
+                if report_generation_progress(job_id, progress, message):
+                    return True
                 if progress is not None:
                     job_fresh.progress = progress
                 job_fresh.message = message
@@ -657,7 +699,12 @@ class BackgroundTaskService:
                 frac = max(0.0, min(1.0, done / max(1, N)))
                 current_progress = p_start + ((p_end - p_start) * frac)
                 message = f"Building respondents {done}/{N}..."
-                
+
+                from app.services.job_progress_relay import report_generation_progress
+
+                if report_generation_progress(job_id, current_progress, message):
+                    return
+
                 # Update DB with fresh session
                 db_progress = SessionLocal()
                 try:
@@ -722,6 +769,9 @@ class BackgroundTaskService:
         try:
             job_post = db_post.query(Job).filter(Job.job_id == job_id).first()
             if job_post:
+                from app.services.job_progress_relay import report_generation_progress
+
+                report_generation_progress(job_id, 90.0, "Saving generated tasks...")
                 job_post.progress = 90.0
                 job_post.message = "Saving generated tasks..."
                 db_post.commit()
@@ -851,6 +901,9 @@ class BackgroundTaskService:
             job.completed_at = datetime.utcnow()
             job.message = "Job cancelled by user"
             db.commit()
+            from app.services.job_progress_relay import mark_generation_cancelled
+
+            mark_generation_cancelled(job_id)
             return True
         finally:
             db.close()

@@ -1,0 +1,1 @@
+D:\TikunTech\uniliverimagestudy\golden_matrix_rust\target\release\golden-matrix-rust.exe: D:\TikunTech\uniliverimagestudy\golden_matrix_rust\src\bin\stack_generate.rs D:\TikunTech\uniliverimagestudy\golden_matrix_rust\src\main.rs D:\TikunTech\uniliverimagestudy\golden_matrix_rust\src\numpy_compat.rs D:\TikunTech\uniliverimagestudy\golden_matrix_rust\src\openblas_compat.rs

@@ -1,4 +1,17 @@
-FROM python:3.11-slim AS builder
+FROM rust:1.85-slim-bookworm AS rust-builder
+
+WORKDIR /rust-build
+
+# Build the Golden Matrix executable for the Linux container. The Windows
+# executable from a developer machine must never be copied into production.
+COPY golden_matrix_rust/Cargo.toml golden_matrix_rust/Cargo.lock ./golden_matrix_rust/
+COPY golden_matrix_rust/src ./golden_matrix_rust/src
+
+WORKDIR /rust-build/golden_matrix_rust
+RUN cargo build --release --locked
+
+
+FROM python:3.11-slim-bookworm AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -23,7 +36,7 @@ RUN pip install --upgrade pip setuptools wheel \
     && pip install --no-cache-dir -r requirements-docker.txt
 
 
-FROM python:3.11-slim AS runtime
+FROM python:3.11-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -50,6 +63,10 @@ RUN groupadd --gid 10001 appuser \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY . .
+
+# Copy the Linux Rust binary built above. The Python caller discovers this
+# binary and the NumPy OpenBLAS shared library at runtime.
+COPY --from=rust-builder /rust-build/golden_matrix_rust/target/release/golden-matrix-rust /app/golden_matrix_rust/target/release/golden-matrix-rust
 
 RUN chown -R appuser:appuser /app
 

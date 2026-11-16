@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 MAX_RESPONDENTS_CAP = 1500
 
 
+def _use_rust_golden_matrix() -> bool:
+    """True only when USE_RUST_GOLDEN_MATRIX is set in the environment."""
+    from app.core.config import settings
+
+    return bool(settings.USE_RUST_GOLDEN_MATRIX)
+
+
 def _requested_to_generated_n(number_of_respondents: int) -> int:
     if number_of_respondents < 1:
         return 0
@@ -475,6 +482,29 @@ def _tasks_from_matrix_layer(
     return tasks_structure
 
 
+def _run_golden_matrix(config: DesignConfig, progress_callback, seed: Optional[int]):
+    """Run the Rust engine when USE_RUST_GOLDEN_MATRIX is set, otherwise Python."""
+    if _use_rust_golden_matrix():
+        from app.services.golden_matrix.rust_engine import generate_golden_matrix_rust
+
+        return generate_golden_matrix_rust(
+            config,
+            progress_callback=progress_callback,
+            rng_seed=seed,
+        )
+    return generate_golden_matrix(
+        config,
+        progress_callback=progress_callback,
+        rng_seed=seed,
+    )
+
+
+def _matrix_metadata() -> Dict[str, str]:
+    if _use_rust_golden_matrix():
+        return {"algorithm": "golden_matrix_rust", "matrix_engine": "rust"}
+    return {"algorithm": "golden_matrix", "matrix_engine": "python"}
+
+
 def _compact_report(report: Dict[str, Any]) -> Dict[str, Any]:
     out = {k: v for k, v in report.items() if k != "X"}
     pf = out.get("preflight")
@@ -520,7 +550,7 @@ def generate_grid_tasks_golden(
                 "number_of_respondents": number_of_respondents,
                 "exposure_tolerance_cv": exposure_tolerance_cv,
                 "capacity": 0,
-                "algorithm": "golden_matrix",
+                **_matrix_metadata(),
             },
         }
 
@@ -538,7 +568,7 @@ def generate_grid_tasks_golden(
                 "number_of_respondents": number_of_respondents,
                 "exposure_tolerance_cv": exposure_tolerance_cv,
                 "capacity": 0,
-                "algorithm": "golden_matrix",
+                **_matrix_metadata(),
             },
         }
 
@@ -546,14 +576,8 @@ def generate_grid_tasks_golden(
     T = config.tasks_per_respondent
 
     try:
-        _df, report = generate_golden_matrix(
-            config,
-            progress_callback=progress_callback,
-            rng_seed=seed,
-        )
-    except InfeasibleConfigError as e:
-        raise RuntimeError(str(e)) from e
-    except RDEError as e:
+        _df, report = _run_golden_matrix(config, progress_callback, seed)
+    except (InfeasibleConfigError, RDEError, RuntimeError) as e:
         raise RuntimeError(str(e)) from e
 
     X = report["X"]
@@ -570,7 +594,7 @@ def generate_grid_tasks_golden(
             "number_of_respondents": number_of_respondents,
             "exposure_tolerance_cv": exposure_tolerance_cv,
             "capacity": capacity,
-            "algorithm": "golden_matrix",
+            **_matrix_metadata(),
             "golden_report": _compact_report(report),
         },
     }
@@ -601,7 +625,7 @@ def generate_layer_tasks_golden(
                 "exposure_tolerance_pct": exposure_tolerance_pct,
                 "capacity": 0,
                 "background_image_url": None,
-                "algorithm": "golden_matrix",
+                **_matrix_metadata(),
             },
         }
 
@@ -620,7 +644,7 @@ def generate_layer_tasks_golden(
                 "exposure_tolerance_pct": exposure_tolerance_pct,
                 "capacity": 0,
                 "background_image_url": None,
-                "algorithm": "golden_matrix",
+                **_matrix_metadata(),
             },
         }
 
@@ -629,14 +653,8 @@ def generate_layer_tasks_golden(
     T = config.tasks_per_respondent
 
     try:
-        _df, report = generate_golden_matrix(
-            config,
-            progress_callback=progress_callback,
-            rng_seed=seed,
-        )
-    except InfeasibleConfigError as e:
-        raise RuntimeError(str(e)) from e
-    except RDEError as e:
+        _df, report = _run_golden_matrix(config, progress_callback, seed)
+    except (InfeasibleConfigError, RDEError, RuntimeError) as e:
         raise RuntimeError(str(e)) from e
 
     X = report["X"]
@@ -654,7 +672,7 @@ def generate_layer_tasks_golden(
             "exposure_tolerance_pct": exposure_tolerance_pct,
             "capacity": capacity,
             "background_image_url": None,
-            "algorithm": "golden_matrix",
+            **_matrix_metadata(),
             "design_constraints_count": len(design_constraints or []),
             "incompatible_pairs_count": len(incompatible_pairs),
             "skipped_constraint_refs": skipped_constraints,

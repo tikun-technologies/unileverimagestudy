@@ -188,6 +188,14 @@ class StackBuilder:
                 builder = RespondentBuilder(self.config, self.rng, skip_vif=self.skip_vif)
                 block = builder.build(self.global_exposures)
 
+                # Keep this respondent only when the block can identify every
+                # element. A short-rank block is rebuilt; earlier respondents stay.
+                block_rank = int(np.linalg.matrix_rank(block))
+                if block_rank < self.config.total_elements:
+                    raise BlockConstructionError(
+                        f"Respondent block rank {block_rank} < {self.config.total_elements}."
+                    )
+
                 block_hash = hash(block.tobytes())
                 if block_hash in self.seen_hashes:
                     raise BlockUniquenessError("Duplicate block.")

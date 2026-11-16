@@ -24,7 +24,16 @@ logger = logging.getLogger(__name__)
 
 
 def _update_job_progress(job_id: str, progress: float, message: str) -> None:
-    """Update job progress in DB and notify WebSocket subscribers via Redis."""
+    """Update job progress in DB and notify WebSocket subscribers via Redis.
+
+    Task generation registers a relay that publishes this immediately and
+    writes the job row on an interval. Other jobs keep the direct write.
+    """
+    from app.services.job_progress_relay import report_generation_progress
+
+    if report_generation_progress(job_id, progress, message):
+        return
+
     from app.db.session import SessionLocal
     from app.models.job_model import Job
     from app.websocket.job_notifier import job_progress_notifier
@@ -409,53 +418,71 @@ def generate_tasks_celery(
         except Exception:
             pass
 
-        study_type = payload.get("study_type")
-        result = None
+        from app.services.job_progress_relay import JobProgressRelay
 
-        if study_type in ("grid", "text"):
-            result = _generate_grid_tasks(job_id, payload)
-        elif study_type == "video":
-            result = _generate_video_tasks(job_id, payload)
-        elif study_type == "layer":
-            result = _generate_layer_tasks(job_id, payload)
-        elif study_type == "hybrid":
-            result = _generate_hybrid_tasks(job_id, payload)
-        else:
-            raise ValueError(f"Unsupported study type: {study_type}")
+        with JobProgressRelay(job_id):
+            study_type = payload.get("study_type")
+            result = None
 
-        _save_results(job_id, study_id, user_id, payload, result)
-        _launch_study(job_id, study_id, user_id, payload)
+            if study_type in ("grid", "text"):
+                result = _generate_grid_tasks(job_id, payload)
+            elif study_type == "video":
+                result = _generate_video_tasks(job_id, payload)
+            elif study_type == "layer":
+                result = _generate_layer_tasks(job_id, payload)
+            elif study_type == "hybrid":
+                result = _generate_hybrid_tasks(job_id, payload)
+            else:
+                raise ValueError(f"Unsupported study type: {study_type}")
+
+            _update_job_progress(job_id, 90.0, "Saving generated tasks...")
+            _save_results(job_id, study_id, user_id, payload, result)
+            _launch_study(job_id, study_id, user_id, payload)
 
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.job_id == job_id).first()
-            if job:
+            if job and job.status == JobStatus.PROCESSING:
                 job.status = JobStatus.COMPLETED
                 job.completed_at = datetime.utcnow()
                 job.progress = 100.0
                 job.message = "Task generation completed successfully"
-                job.result = None
+                from app.services.task_generation_summary import compact_task_generation_summary
+
+                job.result = compact_task_generation_summary(result, payload)
                 db.commit()
 
-            job_progress_notifier.notify(
-                job_id,
-                {
-                    "type": "completed",
-                    "progress": 100.0,
-                    "message": "Task generation completed successfully",
-                },
-            )
+                logger.info(
+                    "Job %s completed with matrix_engine=%s",
+                    job_id,
+                    job.result.get("matrix_engine"),
+                )
 
-            from app.services.job_notification_service import send_task_generation_complete_email_for_job
+                job_progress_notifier.notify(
+                    job_id,
+                    {
+                        "type": "completed",
+                        "progress": 100.0,
+                        "message": "Task generation completed successfully",
+                    },
+                )
 
-            send_task_generation_complete_email_for_job(
-                db,
-                user_id=user_id,
-                study_id=study_id,
-                payload=payload,
-            )
+                from app.services.job_notification_service import send_task_generation_complete_email_for_job
 
-            logger.info(f"Job {job_id} completed successfully")
+                send_task_generation_complete_email_for_job(
+                    db,
+                    user_id=user_id,
+                    study_id=study_id,
+                    payload=payload,
+                )
+
+                logger.info(f"Job {job_id} completed successfully")
+            elif job is not None:
+                logger.info(
+                    "Job %s generation finished but status is %s; leaving that status in place",
+                    job_id,
+                    job.status,
+                )
         finally:
             try:
                 db.close()
@@ -468,17 +495,21 @@ def generate_tasks_celery(
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.job_id == job_id).first()
-            if job:
+            if job and job.status not in (
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            ):
                 job.status = JobStatus.FAILED
                 job.completed_at = datetime.utcnow()
                 job.error = str(e)
                 job.message = f"Study configuration error: {str(e)}"
                 db.commit()
 
-            job_progress_notifier.notify(
-                job_id,
-                {"type": "failed", "error": str(e), "message": f"Study configuration error: {str(e)}"},
-            )
+                job_progress_notifier.notify(
+                    job_id,
+                    {"type": "failed", "error": str(e), "message": f"Study configuration error: {str(e)}"},
+                )
             logger.error(f"Job {job_id} failed due to study configuration: {e}")
         finally:
             try:
@@ -493,17 +524,21 @@ def generate_tasks_celery(
         db = SessionLocal()
         try:
             job = db.query(Job).filter(Job.job_id == job_id).first()
-            if job:
+            if job and job.status not in (
+                JobStatus.COMPLETED,
+                JobStatus.FAILED,
+                JobStatus.CANCELLED,
+            ):
                 job.status = JobStatus.FAILED
                 job.completed_at = datetime.utcnow()
                 job.error = str(e)
                 job.message = f"Task generation failed: {str(e)}"
                 db.commit()
 
-            job_progress_notifier.notify(
-                job_id,
-                {"type": "failed", "error": str(e), "message": f"Task generation failed: {str(e)}"},
-            )
+                job_progress_notifier.notify(
+                    job_id,
+                    {"type": "failed", "error": str(e), "message": f"Task generation failed: {str(e)}"},
+                )
             logger.error(f"Job {job_id} failed: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
         finally:

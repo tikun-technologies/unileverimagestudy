@@ -19,7 +19,8 @@ def _stamp_video_metadata(result: Dict[str, Any]) -> Dict[str, Any]:
     metadata = dict(result.get("metadata") or {})
     metadata["study_type"] = "video"
     metadata["generator"] = "video_matrix"
-    metadata["algorithm"] = "grid_golden_temporary"
+    if metadata.get("matrix_engine") != "rust":
+        metadata["algorithm"] = "grid_golden_temporary"
     return {**result, "metadata": metadata}
 
 

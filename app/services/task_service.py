@@ -336,7 +336,7 @@ class TaskService:
             self.db.execute(
                 delete(StudyTaskAssignment).where(StudyTaskAssignment.study_id == study_id)
             )
-            
+
             count = 0
             batch = []
             BATCH_SIZE = 5000
@@ -375,7 +375,7 @@ class TaskService:
             logger.error(f"Could not save task assignments for study {study_id}: {e}")
             self.db.rollback()
             raise RuntimeError(f"Failed to save task assignments for study {study_id}") from e
-    
+
     def delete_tasks(self, study_id: UUID) -> int:
         """Delete all task assignments for a study."""
         try:
